@@ -18,8 +18,6 @@ message NodeHealth {
 
 // Aggregated management snapshot across radio and core services.
 message SystemOverview {
-  // Current BSC/BTS radio-access status.
-  bsc.v1.SystemStatus bsc_status = 1;
   // Health state for each managed node.
   repeated NodeHealth nodes = 2;
 }

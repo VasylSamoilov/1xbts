@@ -717,6 +717,7 @@ impl Bsc {
             mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi),
             tag: pending.a1_tag,
             mobile_identity_esn: event.esn.map(cdma_ios::MobileIdentity::Esn),
+            mobile_identity_meid: event.meid.as_deref().and_then(meid_identity_from_hex),
             slot_cycle_index: event.slot_cycle_index.map(cdma_ios::SlotCycleIndex),
             authentication_response_parameter: None,
             authentication_confirmation_parameter: None,
@@ -842,6 +843,7 @@ impl Bsc {
             mobile_identity_imsi: mobile_identity,
             tag: Some(cdma_ios::Tag(call_id as u32)),
             mobile_identity_esn: ms.esn.map(cdma_ios::MobileIdentity::Esn),
+            mobile_identity_meid: ms.meid.as_deref().and_then(meid_identity_from_hex),
             slot_cycle_index: Some(cdma_ios::SlotCycleIndex(ms.slot_cycle_index)),
             authentication_response_parameter: None,
             authentication_confirmation_parameter: None,
@@ -947,7 +949,6 @@ impl Bsc {
             .map(|value| value.0)
             .unwrap_or_else(|| mobile.traffic_service_option_or(3));
 
-        let circuit_id = request.circuit_identity_code.to_packed();
         let calling_party = request
             .ms_information_records
             .as_ref()
@@ -961,6 +962,18 @@ impl Bsc {
             } => Some((session_id, leg_role)),
             _ => None,
         };
+        let circuit_id = if voice_assignment.is_some() {
+            let Some(circuit_identity_code) = request.circuit_identity_code else {
+                warn!(
+                    "BSC: A1 Assignment Request call_id={} omitted CIC for a voice assignment",
+                    call_id
+                );
+                return;
+            };
+            Some(circuit_identity_code.to_packed())
+        } else {
+            None
+        };
         let serving_cell = mobile.serving_cell;
         let existing_voice_walsh = voice_assignment.and_then(|(session_id, leg_role)| {
             let walsh = mobile.existing_voice_walsh_for_assignment(
@@ -971,14 +984,9 @@ impl Bsc {
             Some((serving_cell?, walsh))
         });
 
-        if let Some((cell, walsh_code)) = existing_voice_walsh {
-            let Some((session_id, leg_role)) = voice_assignment else {
-                warn!(
-                    "BSC: non-voice A1 Assignment Request unexpectedly matched existing voice traffic call_id={}",
-                    call_id
-                );
-                return;
-            };
+        if let (Some((cell, walsh_code)), Some((session_id, leg_role)), Some(circuit_id)) =
+            (existing_voice_walsh, voice_assignment, circuit_id)
+        {
             self.mobiles.update_tc(cell, walsh_code, |_, tc| {
                 tc.msc_circuit_id = Some(circuit_id);
                 tc.voice_session_id = Some(session_id);
@@ -1080,15 +1088,15 @@ impl Bsc {
             return;
         }
 
-        let assigned_circuit = voice_assignment.is_some()
-            && self
-                .mobiles
+        let assigned_circuit = circuit_id.filter(|&circuit_id| {
+            self.mobiles
                 .update(&pending.fwd_address, |ms| {
                     ms.set_msc_circuit_id(circuit_id).is_some()
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+        });
 
-        if assigned_circuit {
+        if let Some(circuit_id) = assigned_circuit {
             if let Some(bearer) = self.config.msc_voice_bearer.as_ref() {
                 let msc_remote = request.a2p_bearer_session_params.map(|params| {
                     std::net::SocketAddr::new(
@@ -1383,6 +1391,19 @@ fn extract_calling_party_number_record(
     }
 }
 
+/// The BSC observes the MEID from the air in printed order, so the bytes are
+/// packed most-significant first.
+pub(crate) fn meid_identity_from_hex(meid: &str) -> Option<cdma_ios::MobileIdentity> {
+    if meid.len() != 14 || !meid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut digits = [0u8; 7];
+    for (index, byte) in digits.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&meid[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(cdma_ios::MobileIdentity::Meid(digits))
+}
+
 fn complete_layer3_information_from_origination(
     bsc: &Bsc,
     fwd_address: &MsAddress,
@@ -1416,6 +1437,11 @@ fn complete_layer3_information_from_origination(
         called_party_bcd_number,
         tag: None,
         mobile_identity_esn: event.esn.or(mobile.esn).map(cdma_ios::MobileIdentity::Esn),
+        mobile_identity_meid: event
+            .meid
+            .as_deref()
+            .or(mobile.meid.as_deref())
+            .and_then(meid_identity_from_hex),
         slot_cycle_index: Some(cdma_ios::SlotCycleIndex(
             origination
                 .map(|origination| origination.slot_cycle_index)
@@ -1629,7 +1655,7 @@ mod tests {
     use cdma_common::access::{
         AccessMessage, AccessMessageHeader, OriginationMessage, PageResponseMessage,
     };
-    use cdma_common::consts::{SERVICE_OPTION_EVRC_A, SERVICE_OPTION_HIGH_RATE_PACKET_DATA};
+    use cdma_common::consts::{SERVICE_OPTION_EVRC_A, SERVICE_OPTION_PACKET_DATA_RC3};
     use cdma_common::events::AccessChannelEvent;
     use cdma_common::lac::message_types::MessageId;
     use tokio::time::timeout;
@@ -2021,22 +2047,29 @@ mod tests {
         )
     }
 
-    fn assignment_request_message(call_id: u64, circuit_id: u16) -> EncodedA1Message {
+    fn assignment_request_message(
+        call_id: u64,
+        circuit_id: Option<u16>,
+        service_option: cdma_ios::ServiceOption,
+    ) -> EncodedA1Message {
         EncodedA1Message::from_message_for_call(
             &cdma_ios::Message::new(
                 cdma_ios::MessageType::AssignmentRequest,
                 cdma_ios::AssignmentRequestMessage {
-                    channel_type: cdma_ios::ChannelType {
-                        speech_or_data_indicator: 0x01,
-                        channel_rate_and_type: 0x08,
-                        coding: 0x05,
+                    channel_type: if super::is_packet_data_so(service_option.0) {
+                        cdma_ios::ChannelType::packet_data()
+                    } else {
+                        cdma_ios::ChannelType {
+                            speech_or_data_indicator: cdma_ios::ChannelType::SPEECH_OR_DATA_SPEECH,
+                            channel_rate_and_type: cdma_ios::ChannelType::RATE_FULL_RATE_TCH_BM,
+                            coding: cdma_ios::ChannelType::CODING_QCELP_13K,
+                        }
                     },
-                    circuit_identity_code: cdma_ios::CircuitIdentityCode {
-                        pcm_multiplexer: (circuit_id >> 5) & 0x07ff,
-                        timeslot: (circuit_id & 0x1f) as u8,
-                    },
+                    circuit_identity_code: circuit_id.map(|value| {
+                        cdma_ios::CircuitIdentityCode::decode(&value.to_be_bytes()).unwrap()
+                    }),
                     encryption_information: None,
-                    service_option: Some(cdma_ios::ServiceOption::EVRC_A),
+                    service_option: Some(service_option),
                     signals: Vec::new(),
                     ms_information_records: None,
                     priority: None,
@@ -2083,15 +2116,19 @@ mod tests {
             },
         );
 
-        bsc.handle_incoming_a1_message(assignment_request_message(call_id, circuit_id))
-            .await;
+        bsc.handle_incoming_a1_message(assignment_request_message(
+            call_id,
+            Some(circuit_id),
+            cdma_ios::ServiceOption::EVRC_A,
+        ))
+        .await;
 
         let tc = bsc.mobiles[0]
             .find_traffic_channel_by_walsh(walsh_code)
             .unwrap();
         assert_eq!(tc.msc_circuit_id, Some(circuit_id));
         assert_eq!(tc.a1_call_id, Some(call_id));
-        assert_eq!(tc.service_option, SERVICE_OPTION_HIGH_RATE_PACKET_DATA);
+        assert_eq!(tc.service_option, SERVICE_OPTION_PACKET_DATA_RC3);
         assert_eq!(tc.voice_service_option, Some(SERVICE_OPTION_EVRC_A));
         assert!(tc.is_waiting_service_response());
 
@@ -2108,6 +2145,58 @@ mod tests {
             .map(|connection| connection.service_option)
             .collect();
         assert_eq!(service_options, vec![SERVICE_OPTION_EVRC_A]);
+    }
+
+    #[tokio::test]
+    async fn assignment_request_requires_cic_only_for_voice() {
+        for service_option in [
+            cdma_ios::ServiceOption::HIGH_RATE_PACKET_DATA,
+            cdma_ios::ServiceOption::EVRC_A,
+        ] {
+            let (mut bsc, _traffic_rx, old_walsh) =
+                test_bsc_with_active_traffic_channel(SERVICE_OPTION_PACKET_DATA_RC3).await;
+            let call_id = 77;
+            let is_packet = super::is_packet_data_so(service_option.0);
+            let kind = if is_packet {
+                PendingA1AssignmentKind::PacketData { service_ref_id: 2 }
+            } else {
+                PendingA1AssignmentKind::Voice {
+                    session_id: Uuid::new_v4(),
+                    leg_role: VoiceLegRole::Caller,
+                    renegotiate_from_so: None,
+                }
+            };
+            let fwd_address = bsc.mobiles[0].fwd_address.clone();
+            bsc.a1.push_pending_assignment(
+                call_id,
+                PendingA1Assignment {
+                    fwd_address,
+                    ack_msg_seq: 0,
+                    requested_tx_time: None,
+                    tx_deadline: None,
+                    kind,
+                    bind_existing_traffic: false,
+                },
+            );
+            bsc.handle_incoming_a1_message(assignment_request_message(
+                call_id,
+                None,
+                service_option,
+            ))
+            .await;
+
+            let channel = bsc.mobiles[0].traffic_channel().unwrap();
+            assert_eq!(channel.msc_circuit_id, None);
+            if is_packet {
+                assert_eq!(channel.a1_call_id, Some(call_id));
+                assert_eq!(channel.service_option, SERVICE_OPTION_PACKET_DATA_RC3);
+                assert_eq!(channel.service_ref_id, 2);
+                assert_eq!(channel.voice_session_id, None);
+            } else {
+                assert_eq!(channel.walsh_code, old_walsh);
+                assert_eq!(channel.a1_call_id, None);
+            }
+        }
     }
 
     #[tokio::test]

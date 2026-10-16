@@ -6,7 +6,7 @@ use cdma_common::access::{
     SERVICE_RESPONSE_PURPOSE_REJECT, ServiceConfigRecord, ServiceResponseMessage,
 };
 use cdma_common::channel::TrafficRate;
-use cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA;
+use cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3;
 use cdma_common::error::Error;
 use cdma_common::lac::{
     MessageControlStatusBlock,
@@ -78,7 +78,7 @@ pub(crate) fn voice_service_option_for_channel(tc: &super::TrafficChannelInfo) -
 }
 
 fn rlp_blob_for_service_option(service_option: u16) -> Option<Vec<u8>> {
-    if service_option == SERVICE_OPTION_HIGH_RATE_PACKET_DATA {
+    if service_option == SERVICE_OPTION_PACKET_DATA_RC3 {
         Some(SO33_RLP3_SYNC_BLOB.to_vec())
     } else {
         None

@@ -1,7 +1,8 @@
 use cdma_a11::{
-    AuthenticationExtension, AuthenticationExtensionType, CapabilitiesInfo, Message, Nvse,
-    PcfEnabledFeatureNvse, RegistrationRequest, SessionSpecificExtension, UdpFrame,
-    UnverifiedDecodeReason, decode_unverified, encode,
+    A11Framing, A11SecurityAssociation, A11SecurityConfig, AuthenticationExtension,
+    AuthenticationExtensionType, CapabilitiesInfo, Message, Nvse, PcfEnabledFeatureNvse,
+    RegistrationRequest, SessionSpecificExtension, UdpFrame, UnverifiedDecodeReason,
+    decode_unverified, encode,
 };
 
 fn session() -> SessionSpecificExtension {
@@ -151,6 +152,54 @@ fn rejects_invalid_embedded_message_bytes() {
         UdpFrame::decode_unverified(&encoded, UnverifiedDecodeReason::TestFixture).unwrap_err(),
         cdma_a11::Error::UnknownMessageType(0xff)
     );
+}
+
+fn test_security() -> A11SecurityAssociation {
+    A11SecurityAssociation::from_config(&A11SecurityConfig {
+        spi: 0x1234,
+        shared_secret_hex: "737065632d6131312d736563726574".to_string(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn bare_framing_roundtrips_without_length_prefix() {
+    let frame = UdpFrame::new(request_message());
+    let encoded = frame.encode_with(A11Framing::Bare).unwrap();
+
+    assert_eq!(encoded, encode(&frame.message).unwrap());
+
+    let decoded = UdpFrame::decode_unverified_with(
+        &encoded,
+        UnverifiedDecodeReason::TestFixture,
+        A11Framing::Bare,
+    )
+    .unwrap();
+    assert_eq!(decoded, frame);
+}
+
+#[test]
+fn length_prefixed_differs_from_bare_only_by_prefix() {
+    let frame = UdpFrame::new(request_message());
+    let bare = frame.encode_with(A11Framing::Bare).unwrap();
+    let prefixed = frame.encode_with(A11Framing::LengthPrefixed).unwrap();
+
+    assert_eq!(prefixed.len(), bare.len() + 2);
+    assert_eq!(&prefixed[..2], &(bare.len() as u16).to_be_bytes());
+    assert_eq!(&prefixed[2..], &bare[..]);
+}
+
+#[test]
+fn bare_framing_verifies_authenticator() {
+    let security = test_security();
+    let mut message = request_message();
+    security.sign_message(&mut message).unwrap();
+
+    let frame = UdpFrame::new(message.clone());
+    let encoded = frame.encode_with(A11Framing::Bare).unwrap();
+
+    let verified = UdpFrame::decode_verified_with(&encoded, &security, A11Framing::Bare).unwrap();
+    assert_eq!(verified.message.message(), &message);
 }
 
 #[test]

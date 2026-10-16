@@ -38,7 +38,7 @@ export async function GET(request: Request) {
     return Response.json(GetSessionsResponse.toJSON(result));
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return Response.json({ error: msg });
   } finally {
     clearTimeout(timeout);
   }

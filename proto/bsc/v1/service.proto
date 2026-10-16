@@ -3,18 +3,6 @@ package bsc.v1;
 
 import "google/protobuf/empty.proto";
 
-// ─── System ─────────────────────────────────────────────────────
-
-// Current serving-cell status and identity.
-message SystemStatus {
-  bool running = 1;
-  uint32 sid = 2;
-  uint32 nid = 3;
-  uint32 base_id = 4;
-  uint32 pilot_pn = 5;
-  uint32 reg_zone = 6;
-}
-
 // ─── TX Metrics ─────────────────────────────────────────────────
 
 // Forward-link transmit loop metrics.
@@ -1140,11 +1128,8 @@ message ChannelList {
 
 // ─── Service ────────────────────────────────────────────────────
 
-// Management and telemetry service for the BSC/BTS: serving-cell status,
-// channel and power configuration, and live network events.
+// Legacy management and telemetry service for the BSC/BTS.
 service BscService {
-  // Returns current serving-cell status and identity.
-  rpc GetSystemStatus(google.protobuf.Empty) returns (SystemStatus);
   // Returns active BTS radio and overhead configuration.
   rpc GetConfig(google.protobuf.Empty) returns (BtsConfig);
 

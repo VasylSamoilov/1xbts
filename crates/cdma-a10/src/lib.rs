@@ -22,7 +22,7 @@ pub use cdma_a8::{
 };
 
 /// A10 bearer endpoint binding between the PCF and PDSN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BearerEndpoint {
     /// Local IPv4 address for the bearer socket.
     pub local_ipv4: [u8; 4],

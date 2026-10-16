@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use cdma_common::access::AccessMessage;
 use cdma_common::consts::{
-    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_PACKET_DATA_RC3,
 };
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::{
@@ -40,8 +40,9 @@ use super::bts_management_proto::bts_management_service_server::{
     BtsManagementService, BtsManagementServiceServer,
 };
 use super::bts_management_proto::{
-    BtsAttachState as ProtoBtsAttachState, BtsList, BtsSummary, CellRequest, EnrollRequest,
-    EnrollResponse, ReversePowerControlEntry, ReversePowerControlList, ReversePowerControlRequest,
+    BtsAttachState as ProtoBtsAttachState, BtsList, BtsSummary, CellCapability, CellKind,
+    CellRequest, EnrollRequest, EnrollResponse, ReversePowerControlEntry, ReversePowerControlList,
+    ReversePowerControlRequest,
 };
 use super::management_proto::management_facade_service_server::{
     ManagementFacadeService, ManagementFacadeServiceServer,
@@ -1424,27 +1425,6 @@ type GrpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl BscService for BscServiceImpl {
-    async fn get_system_status(
-        &self,
-        _: Request<()>,
-    ) -> Result<Response<proto::SystemStatus>, Status> {
-        // The BSC is up whatever the cell count, so report that regardless.
-        // Fill per-cell identity only for a sole enrolled cell — with several,
-        // the per-cell list carries identity and these stay zero.
-        let params = self.state.bts.sole_entry().map(|entry| entry.params());
-        let overhead = params.as_ref().map(|params| &params.overhead);
-        Ok(Response::new(proto::SystemStatus {
-            running: true,
-            sid: overhead.map_or(0, |oh| u32::from(oh.sid)),
-            nid: overhead.map_or(0, |oh| u32::from(oh.nid)),
-            base_id: overhead.map_or(0, |oh| u32::from(oh.base_id)),
-            pilot_pn: params
-                .as_ref()
-                .map_or(0, |params| params.pilot_offset as u32),
-            reg_zone: overhead.map_or(0, |oh| u32::from(oh.reg_zone)),
-        }))
-    }
-
     async fn get_config(&self, _: Request<()>) -> Result<Response<proto::BtsConfig>, Status> {
         <Self as BtsManagementService>::get_bts_config(self, any_cell()).await
     }
@@ -1749,7 +1729,7 @@ impl BscService for BscServiceImpl {
         let service_option = match req.service_option {
             value if value == u32::from(SERVICE_OPTION_PACKET_DATA) => SERVICE_OPTION_PACKET_DATA,
             value if value == u32::from(SERVICE_OPTION_ASYNC_DATA) => SERVICE_OPTION_ASYNC_DATA,
-            _ => SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+            _ => SERVICE_OPTION_PACKET_DATA_RC3,
         };
 
         self.state
@@ -1775,16 +1755,8 @@ impl BscService for BscServiceImpl {
 impl ManagementFacadeService for BscServiceImpl {
     async fn get_system_overview(
         &self,
-        request: Request<()>,
+        _: Request<()>,
     ) -> Result<Response<SystemOverview>, Status> {
-        // Node health matters most when no cell resolves — a BTS down, or
-        // several enrolled — which is exactly when per-cell system status
-        // refuses. The identity block is therefore optional, not a
-        // precondition for the whole overview.
-        let status = <Self as BscService>::get_system_status(self, request)
-            .await
-            .ok()
-            .map(|response| response.into_inner());
         let mut nodes: Vec<NodeHealth> = self
             .state
             .bts
@@ -1805,10 +1777,7 @@ impl ManagementFacadeService for BscServiceImpl {
             healthy: true,
             message: "running".into(),
         });
-        Ok(Response::new(SystemOverview {
-            bsc_status: status,
-            nodes,
-        }))
+        Ok(Response::new(SystemOverview { nodes }))
     }
 
     type StreamSystemEventsStream = GrpcStream<ManagementEvent>;
@@ -1945,7 +1914,7 @@ impl BtsManagementService for BscServiceImpl {
                             .filter(|m| m.serving_cell.or(default_cell) == Some(summary.cell))
                             .count() as u32;
                         BtsSummary {
-                            peer_id: peer.peer_id,
+                            peer_id: peer.peer_id.clone(),
                             management_endpoint: peer.oam_endpoint,
                             cell: Some(to_proto_cell_id(summary.cell)),
                             state: to_proto_attach_state(summary.state) as i32,
@@ -1959,10 +1928,18 @@ impl BtsManagementService for BscServiceImpl {
                             an_grpc_addr: summary.an_grpc_addr.clone(),
                             served_mobiles: Some(served_mobiles),
                             status_detail: summary.status_detail.clone(),
+                            kind: CellKind::Sdr as i32,
+                            name: None,
+                            capabilities: vec![
+                                CellCapability::RadioMetrics as i32,
+                                CellCapability::IqCapture as i32,
+                                CellCapability::PowerControl as i32,
+                            ],
+                            software_version: None,
                         }
                     }
                     None => BtsSummary {
-                        peer_id: peer.peer_id,
+                        peer_id: peer.peer_id.clone(),
                         management_endpoint: peer.oam_endpoint,
                         cell: None,
                         state: to_proto_attach_state(peer.state) as i32,
@@ -1976,6 +1953,10 @@ impl BtsManagementService for BscServiceImpl {
                         an_grpc_addr: None,
                         served_mobiles: None,
                         status_detail: peer.status_detail,
+                        kind: CellKind::Sdr as i32,
+                        name: None,
+                        capabilities: Vec::new(),
+                        software_version: None,
                     },
                 },
             )
@@ -1983,12 +1964,9 @@ impl BtsManagementService for BscServiceImpl {
         Ok(Response::new(BtsList { bts }))
     }
 
-    async fn get_bts_status(
-        &self,
-        request: Request<CellRequest>,
-    ) -> Result<Response<proto::SystemStatus>, Status> {
+    async fn check_health(&self, request: Request<CellRequest>) -> Result<Response<()>, Status> {
         let (cell, mut client) = self.oam_for_request(request.into_inner())?;
-        client.get_bts_status(cell_request(cell)).await
+        client.check_health(cell_request(cell)).await
     }
 
     async fn get_bts_config(
@@ -2144,13 +2122,6 @@ impl BtsManagementService for BscServiceImpl {
 
 #[tonic::async_trait]
 impl BscManagementService for BscServiceImpl {
-    async fn get_bsc_status(
-        &self,
-        request: Request<()>,
-    ) -> Result<Response<proto::SystemStatus>, Status> {
-        <Self as BscService>::get_system_status(self, request).await
-    }
-
     async fn list_mobiles(
         &self,
         request: Request<()>,

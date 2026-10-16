@@ -204,6 +204,8 @@ pub struct MobileIpConfig {
     pub auth_mode: MobileIpAuthMode,
     pub mn_ha_security: Option<Box<MobileIpSecurityAssociation>>,
     pub allow_unverified_mn_aaa: bool,
+    /// Allow Simple IP fallback on an MN-HA SPI mismatch.
+    pub mn_ha_fallback_to_simple_ip: bool,
 }
 
 impl Default for MobileIpConfig {
@@ -220,6 +222,7 @@ impl Default for MobileIpConfig {
             auth_mode: MobileIpAuthMode::Insecure,
             mn_ha_security: None,
             allow_unverified_mn_aaa: false,
+            mn_ha_fallback_to_simple_ip: false,
         }
     }
 }
@@ -622,6 +625,11 @@ impl MobileIpSession {
             };
         }
         if authentication.spi != security.spi {
+            if self.config.mn_ha_fallback_to_simple_ip {
+                return RegistrationAuthentication::InfrastructureRequired(
+                    "MN-HA SPI does not select the configured security association",
+                );
+            }
             return RegistrationAuthentication::Rejected {
                 code: RRP_CODE_HA_MOBILE_NODE_AUTH_FAILED,
                 reason: "MN-HA SPI does not select the configured security association",
@@ -1893,5 +1901,50 @@ mod tests {
             session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME,),
             MobileIpPacketResult::AuthenticationRequired
         );
+    }
+
+    fn mismatched_spi_config(mn_ha_fallback_to_simple_ip: bool) -> MobileIpConfig {
+        MobileIpConfig {
+            enabled: true,
+            auth_mode: MobileIpAuthMode::MnHa,
+            // A different SPI than the RRQ carries, so no configured SA matches.
+            mn_ha_security: Some(Box::new(MobileIpSecurityAssociation::new(
+                4321,
+                b"secret".to_vec(),
+            ))),
+            mn_ha_fallback_to_simple_ip,
+            ..MobileIpConfig::default()
+        }
+    }
+
+    #[test]
+    fn mn_ha_spi_mismatch_without_fallback_is_rejected() {
+        let payload = sprint_authenticated_rrq_payload();
+        let rrq = parse_registration_request(&payload).unwrap();
+        let mut session = MobileIpSession::new(mismatched_spi_config(false));
+        session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
+        let result =
+            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME);
+        let MobileIpPacketResult::Reply(reply) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(
+            registration_reply_payload(&reply)[MIP_RRP_CODE_OFFSET],
+            RRP_CODE_HA_MOBILE_NODE_AUTH_FAILED
+        );
+        assert!(session.binding().is_none());
+    }
+
+    #[test]
+    fn mn_ha_spi_mismatch_with_fallback_degrades_to_simple_ip() {
+        let payload = sprint_authenticated_rrq_payload();
+        let rrq = parse_registration_request(&payload).unwrap();
+        let mut session = MobileIpSession::new(mismatched_spi_config(true));
+        session.issue_challenge(rrq.mn_fa_challenge().unwrap().to_vec());
+        assert_eq!(
+            session.handle_ipv4_packet(&registration_request_packet(&payload), TEST_ASSIGNED_HOME),
+            MobileIpPacketResult::AuthenticationRequired
+        );
+        assert!(session.binding().is_none());
     }
 }

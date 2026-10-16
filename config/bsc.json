@@ -1,4 +1,5 @@
 {
+  "events_endpoint": "http://127.0.0.1:17023",
   "traffic_assignment": {
     "supported_for_rcs": [1, 2, 3],
     "supported_rev_rcs": [1, 2, 3],

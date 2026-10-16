@@ -97,7 +97,7 @@ async fn attach_peer_forever(
                         // which also means the link is gone.
                         _ = link_down.changed() => break "Abis link closed",
                         _ = tokio::time::sleep(LIVENESS_POLL) => {
-                            let probe = oam.get_bts_status(CellRequest { cell: None, peer_id: None });
+                            let probe = oam.check_health(CellRequest { cell: None, peer_id: None });
                             match tokio::time::timeout(OAM_REQUEST_TIMEOUT, probe).await {
                                 Ok(Ok(_)) => {}
                                 Ok(Err(e)) => {

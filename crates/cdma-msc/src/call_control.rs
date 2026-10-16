@@ -307,6 +307,7 @@ mod tests {
             mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
             tag: Some(Tag(0x01020304)),
             mobile_identity_esn: Some(MobileIdentity::Esn(0x11223344)),
+            mobile_identity_meid: None,
             slot_cycle_index: Some(SlotCycleIndex(0x05)),
             authentication_response_parameter: Some(AuthenticationResponseParameter([
                 0x10, 0x20, 0x30, 0x40,
@@ -349,10 +350,10 @@ mod tests {
                 channel_rate_and_type: 0x08,
                 coding: 0x05,
             },
-            circuit_identity_code: CircuitIdentityCode {
+            circuit_identity_code: Some(CircuitIdentityCode {
                 pcm_multiplexer: 0x0123,
                 timeslot: 0x1a,
-            },
+            }),
             encryption_information: None,
             service_option: Some(ServiceOption(0x0003)),
             signals: Vec::new(),

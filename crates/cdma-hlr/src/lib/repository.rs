@@ -165,6 +165,25 @@ pub trait HlrRepository: Send + Sync {
         firstchp: Option<u16>,
     ) -> Result<(), String>;
 
+    async fn set_subscriber_a_key(
+        &self,
+        _identity: &MobileIdentityKey,
+        _a_key: Option<Vec<u8>>,
+        _ssd_a: Option<Vec<u8>>,
+        _ssd_b: Option<Vec<u8>>,
+        _auth_algo: AuthAlgorithm,
+    ) -> Result<(), String> {
+        Err("set_subscriber_a_key is not supported by this repository".into())
+    }
+
+    /// Never returns the A-key or SSD material itself.
+    async fn get_subscriber_auth_state(
+        &self,
+        _identity: &MobileIdentityKey,
+    ) -> Result<Option<IdentityAuthState>, String> {
+        Ok(None)
+    }
+
     // OTASP session history
     /// Persists a completed OTASP session. Called by MSC when a session
     /// ends. The `events_proto` blob is `events.v1.OtaspRecordedEvents`
@@ -420,6 +439,21 @@ fn identity_key_to_proto(value: &MobileIdentityKey) -> proto::MobileIdentityKey 
         imsi: Some(value.imsi().to_string()),
         esn: value.esn(),
         meid: value.meid().map(ToOwned::to_owned),
+    }
+}
+
+fn auth_algo_to_proto(algo: AuthAlgorithm) -> i32 {
+    let variant = match algo {
+        AuthAlgorithm::None => proto::AuthAlgorithm::None,
+        AuthAlgorithm::Cave => proto::AuthAlgorithm::Cave,
+    };
+    variant as i32
+}
+
+fn auth_algo_from_proto(value: i32) -> AuthAlgorithm {
+    match proto::AuthAlgorithm::try_from(value) {
+        Ok(proto::AuthAlgorithm::Cave) => AuthAlgorithm::Cave,
+        _ => AuthAlgorithm::None,
     }
 }
 
@@ -1083,6 +1117,58 @@ impl HlrRepository for GrpcHlrRepository {
             .map_err(|status| format!("HLR SetSubscriberFirstchpOverride: {status}"))
     }
 
+    async fn set_subscriber_a_key(
+        &self,
+        identity: &MobileIdentityKey,
+        a_key: Option<Vec<u8>>,
+        ssd_a: Option<Vec<u8>>,
+        ssd_b: Option<Vec<u8>>,
+        auth_algo: AuthAlgorithm,
+    ) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .set_subscriber_a_key(proto::SetSubscriberAKeyRequest {
+                identity: Some(identity_key_to_proto(identity)),
+                a_key,
+                ssd_a,
+                ssd_b,
+                auth_algo: auth_algo_to_proto(auth_algo),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| format!("HLR SetSubscriberAKey: {status}"))
+    }
+
+    async fn get_subscriber_auth_state(
+        &self,
+        identity: &MobileIdentityKey,
+    ) -> Result<Option<IdentityAuthState>, String> {
+        let mut client = self.client();
+        let resp = match client
+            .get_subscriber_auth_state(proto::GetSubscriberAuthStateRequest {
+                identity: Some(identity_key_to_proto(identity)),
+            })
+            .await
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if status.code() == Code::NotFound => return Ok(None),
+            Err(status) => return Err(format!("HLR GetSubscriberAuthState: {status}")),
+        };
+        Ok(Some(IdentityAuthState {
+            subscriber_identity_id: Uuid::parse_str(&resp.subscriber_identity_id)
+                .map_err(|e| format!("invalid subscriber_identity_id: {e}"))?,
+            credentials_provisioned: resp.credentials_provisioned,
+            ssd_provisioned: resp.ssd_provisioned,
+            auth_algo: auth_algo_from_proto(resp.auth_algo),
+            auth_count: resp.auth_count as u8,
+            auth_failure_count: resp.auth_failure_count,
+            last_auth_at: resp
+                .last_auth_at
+                .map(|ts| timestamp_to_datetime(Some(ts)))
+                .transpose()?,
+        }))
+    }
+
     async fn save_otasp_session(&self, row: &OtaspSessionRow) -> Result<(), String> {
         let mut client = self.client();
         let summary = otasp_session_summary_to_proto(row);
@@ -1303,6 +1389,43 @@ async fn check_hardware_identity_unique(
 }
 
 pub(crate) const VALIDATION_FAILED_PREFIX: &str = "VALIDATION_FAILED: ";
+
+async fn resolve_identity_row_id(
+    pool: &sqlx::PgPool,
+    identity: &MobileIdentityKey,
+) -> Result<Option<Uuid>, String> {
+    let row: Option<(Uuid,)> = match identity {
+        MobileIdentityKey::ImsiEsn { imsi, esn } => sqlx::query_as(
+            "SELECT subscriber_identity_id FROM subscriber_identities \
+             WHERE imsi = $1 AND esn = $2 LIMIT 1",
+        )
+        .bind(imsi)
+        .bind(*esn as i64)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("resolve_identity_row_id: {e}"))?,
+        MobileIdentityKey::ImsiMeid { imsi, meid } => sqlx::query_as(
+            "SELECT subscriber_identity_id FROM subscriber_identities \
+             WHERE imsi = $1 AND meid = $2 LIMIT 1",
+        )
+        .bind(imsi)
+        .bind(meid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("resolve_identity_row_id: {e}"))?,
+        MobileIdentityKey::ImsiEsnMeid { imsi, esn, meid } => sqlx::query_as(
+            "SELECT subscriber_identity_id FROM subscriber_identities \
+             WHERE imsi = $1 AND esn = $2 AND meid = $3 LIMIT 1",
+        )
+        .bind(imsi)
+        .bind(*esn as i64)
+        .bind(meid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("resolve_identity_row_id: {e}"))?,
+    };
+    Ok(row.map(|r| r.0))
+}
 
 async fn select_mobile_seen_by_key(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -2401,6 +2524,77 @@ impl HlrRepository for PostgresHlrRepository {
         Ok(())
     }
 
+    async fn set_subscriber_a_key(
+        &self,
+        identity: &MobileIdentityKey,
+        a_key: Option<Vec<u8>>,
+        ssd_a: Option<Vec<u8>>,
+        ssd_b: Option<Vec<u8>>,
+        auth_algo: AuthAlgorithm,
+    ) -> Result<(), String> {
+        for key in [&a_key, &ssd_a, &ssd_b].into_iter().flatten() {
+            validate_auth_key(key)?;
+        }
+        // Clearing the A-key resets the identity to unauthenticated: drop
+        // the SSD halves and running challenge/counter state along with it.
+        let (ssd_a, ssd_b, algo) = if a_key.is_none() {
+            (None, None, AuthAlgorithm::None)
+        } else {
+            (ssd_a, ssd_b, auth_algo)
+        };
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Err("identity not found".into());
+        };
+        sqlx::query(
+            r#"
+            UPDATE subscriber_identities SET
+                a_key = $2,
+                ssd_a = $3,
+                ssd_b = $4,
+                auth_algo = $5,
+                auth_count = CASE WHEN $2 IS NULL THEN 0 ELSE auth_count END,
+                auth_failure_count = CASE WHEN $2 IS NULL THEN 0 ELSE auth_failure_count END,
+                randssd = CASE WHEN $2 IS NULL THEN NULL ELSE randssd END,
+                pending_rand = CASE WHEN $2 IS NULL THEN NULL ELSE pending_rand END,
+                pending_randu = CASE WHEN $2 IS NULL THEN NULL ELSE pending_randu END
+            WHERE subscriber_identity_id = $1
+            "#,
+        )
+        .bind(identity_id)
+        .bind(a_key)
+        .bind(ssd_a)
+        .bind(ssd_b)
+        .bind(algo.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("set_subscriber_a_key: {e}"))?;
+        Ok(())
+    }
+
+    async fn get_subscriber_auth_state(
+        &self,
+        identity: &MobileIdentityKey,
+    ) -> Result<Option<IdentityAuthState>, String> {
+        let Some(identity_id) = resolve_identity_row_id(&self.pool, identity).await? else {
+            return Ok(None);
+        };
+        let row = sqlx::query_as::<_, AuthStateRow>(
+            r#"
+            SELECT subscriber_identity_id,
+                (a_key IS NOT NULL) AS credentials_provisioned,
+                (ssd_a IS NOT NULL AND ssd_b IS NOT NULL) AS ssd_provisioned,
+                auth_algo, auth_count, auth_failure_count, last_auth_at
+            FROM subscriber_identities
+            WHERE subscriber_identity_id = $1
+            "#,
+        )
+        .bind(identity_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("get_subscriber_auth_state: {e}"))?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     async fn save_otasp_session(&self, row: &OtaspSessionRow) -> Result<(), String> {
         sqlx::query(
             "INSERT INTO otasp_sessions (
@@ -2567,6 +2761,33 @@ impl From<IdentityRow> for SubscriberIdentity {
             is_primary: r.is_primary,
             created_at: r.created_at,
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AuthStateRow {
+    subscriber_identity_id: Uuid,
+    credentials_provisioned: bool,
+    ssd_provisioned: bool,
+    auth_algo: String,
+    auth_count: i16,
+    auth_failure_count: i32,
+    last_auth_at: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<AuthStateRow> for IdentityAuthState {
+    type Error = String;
+
+    fn try_from(r: AuthStateRow) -> Result<Self, Self::Error> {
+        Ok(IdentityAuthState {
+            subscriber_identity_id: r.subscriber_identity_id,
+            credentials_provisioned: r.credentials_provisioned,
+            ssd_provisioned: r.ssd_provisioned,
+            auth_algo: AuthAlgorithm::from_str(&r.auth_algo)?,
+            auth_count: r.auth_count as u8,
+            auth_failure_count: r.auth_failure_count as u32,
+            last_auth_at: r.last_auth_at,
+        })
     }
 }
 

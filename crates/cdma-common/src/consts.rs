@@ -22,7 +22,7 @@ pub const SERVICE_OPTION_ASYNC_DATA: u16 = 12;
 pub const SERVICE_OPTION_OTASP: u16 = 18;
 
 /// SO33: High-rate packet data service.
-pub const SERVICE_OPTION_HIGH_RATE_PACKET_DATA: u16 = 33;
+pub const SERVICE_OPTION_PACKET_DATA_RC3: u16 = 33;
 
 /// SO68: EVRC-B narrowband.
 pub const SERVICE_OPTION_EVRC_B: u16 = 68;

@@ -14,7 +14,7 @@ pub use procedure::{
     ClearReason, Direction, ProcedureEvent, SessionKey, SessionProcedureTable, SessionSnapshot,
     SessionState,
 };
-pub use transport::{UdpEndpoint, UdpFrame, VerifiedUdpFrame};
+pub use transport::{A11_STANDARD_UDP_PORT, A11Framing, UdpEndpoint, UdpFrame, VerifiedUdpFrame};
 
 const THREEGPP2_VENDOR_ID: u32 = 0x0000_159f;
 const PROTOCOL_TYPE_UNSTRUCTURED_BYTE_STREAM: u16 = 0x8881;
@@ -84,8 +84,8 @@ impl A11SecurityAssociation {
     pub fn sign_message(&self, message: &mut Message) -> Result<()> {
         let extension_type = required_authentication_type_for_message(message);
         set_message_authentication(message, self.placeholder_authentication(extension_type))?;
-        let zeroed_wire = encode(message)?;
-        let authenticator = self.compute_authenticator(&zeroed_wire);
+        let wire = encode(message)?;
+        let authenticator = self.compute_authenticator(authenticated_wire_prefix(&wire)?);
         set_message_authentication(
             message,
             AuthenticationExtension {
@@ -96,10 +96,10 @@ impl A11SecurityAssociation {
         )
     }
 
-    fn compute_authenticator(&self, zeroed_wire: &[u8]) -> Vec<u8> {
+    fn compute_authenticator(&self, authenticated_wire: &[u8]) -> Vec<u8> {
         let mut md5 = Md5::new();
         md5.update(&self.shared_secret);
-        md5.update(zeroed_wire);
+        md5.update(authenticated_wire);
         md5.update(&self.shared_secret);
         md5.finalize().to_vec()
     }
@@ -111,8 +111,10 @@ pub struct A11TransportConfig {
     /// Local UDP socket used by this node's A11 endpoint.
     pub bind_addr: SocketAddr,
     /// Peer UDP socket. Production deployments normally use destination port
-    /// 699; an unprivileged loopback port works for local single-host testing.
+    /// 699. An unprivileged loopback port works for local single-host testing.
     pub peer_addr: SocketAddr,
+    #[serde(default)]
+    pub framing: A11Framing,
 }
 
 impl A11TransportConfig {
@@ -120,6 +122,7 @@ impl A11TransportConfig {
         Self {
             bind_addr,
             peer_addr,
+            framing: A11Framing::LengthPrefixed,
         }
     }
 
@@ -127,7 +130,7 @@ impl A11TransportConfig {
         if self.bind_addr.ip().is_unspecified() {
             return Err(format!("{label}: bind_addr must not use an unspecified IP"));
         }
-        if self.peer_addr.ip().is_unspecified() {
+        if self.peer_addr.port() != 0 && self.peer_addr.ip().is_unspecified() {
             return Err(format!("{label}: peer_addr must not use an unspecified IP"));
         }
         if self.bind_addr == self.peer_addr {
@@ -294,6 +297,58 @@ impl AuthenticationExtension {
 pub struct RawExtension {
     pub extension_type: u8,
     pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalVendorExtension {
+    pub reserved: u8,
+    pub value: Vec<u8>,
+}
+
+impl CriticalVendorExtension {
+    pub const TYPE: u8 = 0x26;
+    const HEADER_LENGTH: usize = 4;
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let length =
+            u16::try_from(self.value.len()).map_err(|_| Error::InvalidExtensionLength {
+                expected_min: u16::MAX as usize,
+                actual: self.value.len(),
+            })?;
+        let mut out = Vec::with_capacity(Self::HEADER_LENGTH + self.value.len());
+        out.push(Self::TYPE);
+        out.push(self.reserved);
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&self.value);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() < Self::HEADER_LENGTH {
+            return Err(Error::Truncated {
+                needed: Self::HEADER_LENGTH,
+                actual: input.len(),
+            });
+        }
+        if input[0] != Self::TYPE {
+            return Err(Error::InvalidValue {
+                context: "cvse.type",
+                reason: "A.S0017 CVSE must use element type 0x26",
+            });
+        }
+        let length = u16::from_be_bytes([input[2], input[3]]) as usize;
+        let needed = Self::HEADER_LENGTH + length;
+        if input.len() != needed {
+            return Err(Error::Truncated {
+                needed,
+                actual: input.len(),
+            });
+        }
+        Ok(Self {
+            reserved: input[1],
+            value: input[Self::HEADER_LENGTH..].to_vec(),
+        })
+    }
 }
 
 impl RawExtension {
@@ -670,6 +725,7 @@ impl Nvse {
 pub enum Extension {
     SessionSpecific(SessionSpecificExtension),
     Authentication(AuthenticationExtension),
+    CriticalVendor(CriticalVendorExtension),
     Nvse(Nvse),
     Raw(RawExtension),
 }
@@ -680,6 +736,7 @@ impl Extension {
         match self {
             Self::SessionSpecific(_) => SessionSpecificExtension::TYPE,
             Self::Authentication(extension) => extension.extension_type as u8,
+            Self::CriticalVendor(_) => CriticalVendorExtension::TYPE,
             Self::Nvse(_) => Nvse::TYPE,
             Self::Raw(extension) => extension.extension_type,
         }
@@ -690,6 +747,7 @@ impl Extension {
         match self {
             Self::SessionSpecific(extension) => extension.encode(),
             Self::Authentication(extension) => extension.encode(),
+            Self::CriticalVendor(extension) => extension.encode(),
             Self::Nvse(extension) => extension.encode(),
             Self::Raw(extension) => extension.encode(),
         }
@@ -704,14 +762,29 @@ impl Extension {
             });
         }
         let extension_type = input[0];
-        let length = input[1] as usize;
-        if input.len() != 2 + length {
+        let header_length = if extension_type == CriticalVendorExtension::TYPE {
+            CriticalVendorExtension::HEADER_LENGTH
+        } else {
+            2
+        };
+        if input.len() < header_length {
             return Err(Error::Truncated {
-                needed: 2 + length,
+                needed: header_length,
                 actual: input.len(),
             });
         }
-        let value = &input[2..];
+        let length = if extension_type == CriticalVendorExtension::TYPE {
+            u16::from_be_bytes([input[2], input[3]]) as usize
+        } else {
+            input[1] as usize
+        };
+        if input.len() != header_length + length {
+            return Err(Error::Truncated {
+                needed: header_length + length,
+                actual: input.len(),
+            });
+        }
+        let value = &input[header_length..];
         match extension_type {
             SessionSpecificExtension::TYPE => {
                 let (extension, used) = SessionSpecificExtension::decode(input)?;
@@ -727,6 +800,9 @@ impl Extension {
                 extension_type,
                 value,
             )?)),
+            CriticalVendorExtension::TYPE => Ok(Self::CriticalVendor(
+                CriticalVendorExtension::decode(input)?,
+            )),
             0x86 => Ok(Self::Nvse(Nvse::decode(input)?)),
             _ => Ok(Self::Raw(RawExtension {
                 extension_type,
@@ -1014,7 +1090,7 @@ where
 impl AuthenticationVerifier for A11SecurityAssociation {
     fn verify_authentication(
         &self,
-        _wire_bytes: &[u8],
+        wire_bytes: &[u8],
         message: &Message,
         authentication: &AuthenticationExtension,
     ) -> Result<()> {
@@ -1024,16 +1100,19 @@ impl AuthenticationVerifier for A11SecurityAssociation {
                 reason: "unexpected security parameter index",
             });
         }
-        let mut zeroed = message.clone();
-        set_message_authentication(
-            &mut zeroed,
-            AuthenticationExtension {
-                extension_type: authentication.extension_type,
-                security_parameter_index: authentication.security_parameter_index,
-                authenticator: vec![0; A11_AUTHENTICATOR_BYTES],
-            },
-        )?;
-        let expected = self.compute_authenticator(&encode(&zeroed)?);
+        if authentication.extension_type != required_authentication_type_for_message(message) {
+            return Err(Error::AuthenticationRejected {
+                context: "a11.authentication",
+                reason: "unexpected authentication extension type",
+            });
+        }
+        if authentication.authenticator.len() != A11_AUTHENTICATOR_BYTES {
+            return Err(Error::AuthenticationRejected {
+                context: "a11.authentication",
+                reason: "invalid authenticator length",
+            });
+        }
+        let expected = self.compute_authenticator(authenticated_wire_prefix(wire_bytes)?);
         if !constant_time_eq(&expected, &authentication.authenticator) {
             return Err(Error::AuthenticationRejected {
                 context: "a11.authentication",
@@ -1042,6 +1121,17 @@ impl AuthenticationVerifier for A11SecurityAssociation {
         }
         Ok(())
     }
+}
+
+fn authenticated_wire_prefix(wire_bytes: &[u8]) -> Result<&[u8]> {
+    let authenticated_len = wire_bytes
+        .len()
+        .checked_sub(A11_AUTHENTICATOR_BYTES)
+        .ok_or(Error::Truncated {
+            needed: A11_AUTHENTICATOR_BYTES,
+            actual: wire_bytes.len(),
+        })?;
+    Ok(&wire_bytes[..authenticated_len])
 }
 
 /// A decoded A11 message whose required authenticator has been accepted by a verifier.
@@ -1623,8 +1713,22 @@ fn collect_extensions(input: &[u8]) -> Result<Vec<Extension>> {
                 actual: input.len(),
             });
         }
-        let length = input[offset + 1] as usize;
-        let end = offset + 2 + length;
+        let extension_type = input[offset];
+        let (header_length, length) = if extension_type == CriticalVendorExtension::TYPE {
+            if input.len() - offset < CriticalVendorExtension::HEADER_LENGTH {
+                return Err(Error::Truncated {
+                    needed: offset + CriticalVendorExtension::HEADER_LENGTH,
+                    actual: input.len(),
+                });
+            }
+            (
+                CriticalVendorExtension::HEADER_LENGTH,
+                u16::from_be_bytes([input[offset + 2], input[offset + 3]]) as usize,
+            )
+        } else {
+            (2, input[offset + 1] as usize)
+        };
+        let end = offset + header_length + length;
         if input.len() < end {
             return Err(Error::Truncated {
                 needed: end,
@@ -1647,6 +1751,7 @@ fn collect_extensions(input: &[u8]) -> Result<Vec<Extension>> {
                     });
                 }
             }
+            Extension::CriticalVendor(_) => {}
             Extension::Nvse(nvse) => {
                 let key = nvse.application_key();
                 if !nvse_keys.insert(key) {
@@ -1958,6 +2063,7 @@ fn validate_extensions(extensions: &[Extension], message_type: MessageType) -> R
                     return Err(Error::DuplicateExtension { extension_type });
                 }
             }
+            Extension::CriticalVendor(_) => {}
             Extension::Nvse(nvse) => {
                 let key = nvse.application_key();
                 if !nvse_keys.insert(key) {

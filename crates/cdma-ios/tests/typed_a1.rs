@@ -148,10 +148,10 @@ fn assignment_request_roundtrip() {
             channel_rate_and_type: 0x08,
             coding: 0x05,
         },
-        circuit_identity_code: CircuitIdentityCode {
+        circuit_identity_code: Some(CircuitIdentityCode {
             pcm_multiplexer: 0x0123,
             timeslot: 0x1a,
-        },
+        }),
         encryption_information: Some(EncryptionInformation {
             parameters: vec![
                 EncryptionParameter {
@@ -168,7 +168,7 @@ fn assignment_request_roundtrip() {
                 },
             ],
         }),
-        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
+        service_option: Some(ServiceOption::EVRC_A),
         signals: vec![
             Signal {
                 signal_value: 0x10,
@@ -197,6 +197,30 @@ fn assignment_request_roundtrip() {
         a2p_bearer_session_params: None,
         a2p_bearer_format_params: None,
     };
+    let encoded = message.encode().unwrap();
+    assert_eq!(AssignmentRequestMessage::decode(&encoded).unwrap(), message);
+}
+
+#[test]
+fn packet_assignment_request_omits_circuit_identity_code() {
+    let message = AssignmentRequestMessage {
+        channel_type: ChannelType {
+            speech_or_data_indicator: 0x01,
+            channel_rate_and_type: 0x08,
+            coding: 0x05,
+        },
+        circuit_identity_code: None,
+        encryption_information: None,
+        service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
+        signals: vec![],
+        ms_information_records: None,
+        priority: None,
+        paca_timestamp: None,
+        quality_of_service_parameters: None,
+        a2p_bearer_session_params: None,
+        a2p_bearer_format_params: None,
+    };
+
     let encoded = message.encode().unwrap();
     assert_eq!(AssignmentRequestMessage::decode(&encoded).unwrap(), message);
 }
@@ -247,10 +271,10 @@ fn assignment_request_with_a2p_bearer_format_roundtrip() {
             channel_rate_and_type: 0x08,
             coding: 0x05,
         },
-        circuit_identity_code: CircuitIdentityCode {
+        circuit_identity_code: Some(CircuitIdentityCode {
             pcm_multiplexer: 0x0001,
             timeslot: 0x01,
-        },
+        }),
         encryption_information: None,
         service_option: Some(ServiceOption(0x0003)),
         signals: vec![],
@@ -1077,6 +1101,9 @@ fn cm_service_request_roundtrip() {
         called_party_bcd_number: Some(cdma_ios::CalledPartyBcdNumber(vec![0x91, 0x21, 0x43])),
         tag: Some(Tag(0x01020304)),
         mobile_identity_esn: Some(MobileIdentity::Esn(0x11223344)),
+        mobile_identity_meid: Some(MobileIdentity::Meid([
+            0xa0, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+        ])),
         slot_cycle_index: Some(SlotCycleIndex(0x05)),
         authentication_response_parameter: Some(AuthenticationResponseParameter([
             0x10, 0x20, 0x30, 0x40,
@@ -1128,6 +1155,9 @@ fn paging_response_roundtrip() {
         mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
         tag: Some(Tag(0x01020304)),
         mobile_identity_esn: Some(MobileIdentity::Esn(0x11223344)),
+        mobile_identity_meid: Some(MobileIdentity::Meid([
+            0xa0, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+        ])),
         slot_cycle_index: Some(SlotCycleIndex(0x05)),
         authentication_response_parameter: Some(AuthenticationResponseParameter([
             0x10, 0x20, 0x30, 0x40,
@@ -1183,6 +1213,9 @@ fn location_updating_request_roundtrip() {
         ])),
         registration_type: Some(RegistrationType(0x01)),
         mobile_identity_esn: Some(MobileIdentity::Esn(0x11223344)),
+        mobile_identity_meid: Some(MobileIdentity::Meid([
+            0xa0, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78,
+        ])),
         slot_cycle_index: Some(SlotCycleIndex(0x05)),
         authentication_response_parameter: Some(AuthenticationResponseParameter([
             0x10, 0x20, 0x30, 0x40,
@@ -1715,4 +1748,51 @@ fn adds_deliver_ack_roundtrip_failure() {
     let encoded = msg.encode().unwrap();
     let decoded = AddsDeliverAckMessage::decode(&encoded).unwrap();
     assert_eq!(decoded, msg);
+}
+
+use cdma_ios::femto_interface_msg::{
+    Discriminator, MSG_TYPE_ASSIGNMENT_COMPLETE, MSG_TYPE_CM_SERVICE_REQUEST,
+    MSG_TYPE_LOCATION_UPDATING_ACCEPT, MSG_TYPE_LOCATION_UPDATING_REQUEST,
+    MSG_TYPE_PAGING_RESPONSE, message_type_name,
+};
+
+#[test]
+fn message_type_0x02_is_named_by_its_discriminator() {
+    assert_eq!(
+        MSG_TYPE_ASSIGNMENT_COMPLETE,
+        MSG_TYPE_LOCATION_UPDATING_ACCEPT
+    );
+    assert_eq!(
+        message_type_name(
+            MSG_TYPE_LOCATION_UPDATING_ACCEPT,
+            Some(Discriminator::Bsmap)
+        ),
+        Some("Assignment Complete")
+    );
+    assert_eq!(
+        message_type_name(MSG_TYPE_LOCATION_UPDATING_ACCEPT, Some(Discriminator::Dtap)),
+        Some("Location Updating Accept")
+    );
+}
+
+#[test]
+fn message_type_0x02_without_a_discriminator_is_not_guessed() {
+    assert_eq!(
+        message_type_name(MSG_TYPE_LOCATION_UPDATING_ACCEPT, None),
+        None
+    );
+}
+
+#[test]
+fn unambiguous_message_types_are_named_without_a_discriminator() {
+    for (message_type, name) in [
+        (
+            MSG_TYPE_LOCATION_UPDATING_REQUEST,
+            "Location Updating Request",
+        ),
+        (MSG_TYPE_CM_SERVICE_REQUEST, "CM Service Request"),
+        (MSG_TYPE_PAGING_RESPONSE, "Paging Response"),
+    ] {
+        assert_eq!(message_type_name(message_type, None), Some(name));
+    }
 }

@@ -903,6 +903,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-a12"
+version = "0.1.0"
+dependencies = [
+ "cdma-hlr",
+ "log",
+ "md-5",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "cdma-a21"
 version = "0.1.0"
 dependencies = [
@@ -973,6 +985,7 @@ dependencies = [
  "cdma-bsc",
  "cdma-bts",
  "cdma-common",
+ "cdma-events",
  "cdma-hlr",
  "cdma-ios",
  "cdma-msc",
@@ -987,6 +1000,7 @@ dependencies = [
  "hound",
  "itertools 0.14.0",
  "log",
+ "lru",
  "num",
  "num-complex",
  "parking_lot",
@@ -1052,6 +1066,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-cave"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "cdma-common"
 version = "0.1.0"
 dependencies = [
@@ -1069,6 +1090,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-cwmp"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "md-5",
+ "quick-xml",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cdma-events"
 version = "0.1.0"
 dependencies = [
@@ -1076,6 +1107,7 @@ dependencies = [
  "async-trait",
  "cdma-common",
  "cdma-hlr",
+ "cdma-ios",
  "clap",
  "log",
  "lru",
@@ -1090,6 +1122,34 @@ dependencies = [
  "tonic-build",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "cdma-femto"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cdma-cave",
+ "cdma-common",
+ "cdma-cwmp",
+ "cdma-events",
+ "cdma-ios",
+ "cdma-sip",
+ "env_logger",
+ "hyper",
+ "hyper-util",
+ "log",
+ "md-5",
+ "prost",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower",
 ]
 
 [[package]]
@@ -1267,11 +1327,14 @@ dependencies = [
  "base64",
  "cdma-a10",
  "cdma-a11",
+ "cdma-a12",
  "cdma-a8",
  "cdma-common",
  "cdma-events",
+ "cdma-hlr",
  "cdma-packet",
  "clap",
+ "env_logger",
  "log",
  "prost-types",
  "serde",
@@ -1301,6 +1364,15 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "cdma-sip"
+version = "0.1.0"
+dependencies = [
+ "md-5",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

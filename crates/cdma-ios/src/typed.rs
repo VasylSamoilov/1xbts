@@ -668,6 +668,7 @@ pub struct CmServiceRequestMessage {
     pub called_party_bcd_number: Option<CalledPartyBcdNumber>,
     pub tag: Option<Tag>,
     pub mobile_identity_esn: Option<MobileIdentity>,
+    pub mobile_identity_meid: Option<MobileIdentity>,
     pub slot_cycle_index: Option<SlotCycleIndex>,
     pub authentication_response_parameter: Option<AuthenticationResponseParameter>,
     pub authentication_confirmation_parameter: Option<AuthenticationConfirmationParameter>,
@@ -723,6 +724,16 @@ impl CmServiceRequestMessage {
                 });
             }
             push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &esn)?;
+        }
+        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
+            let meid = mobile_identity_meid.encode()?;
+            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "CM Service Request",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
         }
         if let Some(slot_cycle_index) = self.slot_cycle_index {
             push_fixed(&mut out, IE_SLOT_CYCLE_INDEX, &[slot_cycle_index.encode()?]);
@@ -846,6 +857,7 @@ impl CmServiceRequestMessage {
         let mut called_party_bcd_number = None;
         let mut tag = None;
         let mut mobile_identity_esn = None;
+        let mut mobile_identity_meid = None;
         let mut slot_cycle_index = None;
         let mut authentication_response_parameter = None;
         let mut authentication_confirmation_parameter = None;
@@ -887,18 +899,26 @@ impl CmServiceRequestMessage {
                     let (id, payload, consumed) = decode_tlv(&rest[offset..])?;
                     debug_assert_eq!(id, IE_MOBILE_IDENTITY);
                     let identity = MobileIdentity::decode(payload)?;
-                    if !matches!(identity, MobileIdentity::Esn(_)) {
-                        return Err(Error::InvalidValue {
-                            context: "CM Service Request",
-                            reason: "ESN field must contain ESN mobile identity",
-                        });
+                    match identity {
+                        identity @ MobileIdentity::Esn(_) => set_once(
+                            &mut mobile_identity_esn,
+                            identity,
+                            CM_SERVICE_REQUEST,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        identity @ MobileIdentity::Meid(_) => set_once(
+                            &mut mobile_identity_meid,
+                            identity,
+                            CM_SERVICE_REQUEST,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        MobileIdentity::Imsi(_) => {
+                            return Err(Error::InvalidValue {
+                                context: "CM Service Request",
+                                reason: "additional mobile identity must contain ESN or MEID",
+                            });
+                        }
                     }
-                    set_once(
-                        &mut mobile_identity_esn,
-                        identity,
-                        CM_SERVICE_REQUEST,
-                        IE_MOBILE_IDENTITY,
-                    )?;
                     offset += consumed;
                 }
                 IE_SLOT_CYCLE_INDEX => {
@@ -1071,6 +1091,7 @@ impl CmServiceRequestMessage {
             called_party_bcd_number,
             tag,
             mobile_identity_esn,
+            mobile_identity_meid,
             slot_cycle_index,
             authentication_response_parameter,
             authentication_confirmation_parameter,
@@ -1098,6 +1119,7 @@ pub struct PagingResponseMessage {
     pub mobile_identity_imsi: MobileIdentity,
     pub tag: Option<Tag>,
     pub mobile_identity_esn: Option<MobileIdentity>,
+    pub mobile_identity_meid: Option<MobileIdentity>,
     pub slot_cycle_index: Option<SlotCycleIndex>,
     pub authentication_response_parameter: Option<AuthenticationResponseParameter>,
     pub authentication_confirmation_parameter: Option<AuthenticationConfirmationParameter>,
@@ -1142,6 +1164,16 @@ impl PagingResponseMessage {
                 });
             }
             push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &esn)?;
+        }
+        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
+            let meid = mobile_identity_meid.encode()?;
+            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "Paging Response",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
         }
         if let Some(slot_cycle_index) = self.slot_cycle_index {
             push_fixed(&mut out, IE_SLOT_CYCLE_INDEX, &[slot_cycle_index.encode()?]);
@@ -1244,6 +1276,7 @@ impl PagingResponseMessage {
         offset += consumed;
         let mut tag = None;
         let mut mobile_identity_esn = None;
+        let mut mobile_identity_meid = None;
         let mut slot_cycle_index = None;
         let mut authentication_response_parameter = None;
         let mut authentication_confirmation_parameter = None;
@@ -1271,18 +1304,26 @@ impl PagingResponseMessage {
                 IE_MOBILE_IDENTITY => {
                     let (_, payload, consumed) = decode_tlv(&rest[offset..])?;
                     let identity = MobileIdentity::decode(payload)?;
-                    if !matches!(identity, MobileIdentity::Esn(_)) {
-                        return Err(Error::InvalidValue {
-                            context: "Paging Response",
-                            reason: "ESN field must contain ESN mobile identity",
-                        });
+                    match identity {
+                        identity @ MobileIdentity::Esn(_) => set_once(
+                            &mut mobile_identity_esn,
+                            identity,
+                            PAGING_RESPONSE,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        identity @ MobileIdentity::Meid(_) => set_once(
+                            &mut mobile_identity_meid,
+                            identity,
+                            PAGING_RESPONSE,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        MobileIdentity::Imsi(_) => {
+                            return Err(Error::InvalidValue {
+                                context: "Paging Response",
+                                reason: "additional mobile identity must contain ESN or MEID",
+                            });
+                        }
                     }
-                    set_once(
-                        &mut mobile_identity_esn,
-                        identity,
-                        PAGING_RESPONSE,
-                        IE_MOBILE_IDENTITY,
-                    )?;
                     offset += consumed;
                 }
                 IE_SLOT_CYCLE_INDEX => {
@@ -1424,6 +1465,7 @@ impl PagingResponseMessage {
             mobile_identity_imsi,
             tag,
             mobile_identity_esn,
+            mobile_identity_meid,
             slot_cycle_index,
             authentication_response_parameter,
             authentication_confirmation_parameter,
@@ -1924,6 +1966,25 @@ pub struct ChannelType {
 }
 
 impl ChannelType {
+    /// A.S0014 Table 4.2.6-1 Speech.
+    pub const SPEECH_OR_DATA_SPEECH: u8 = 0x01;
+    /// A.S0014 Table 4.2.6-1 Data.
+    pub const SPEECH_OR_DATA_DATA: u8 = 0x02;
+    /// A.S0014 Table 4.2.6-2 Full rate TCH channel Bm.
+    pub const RATE_FULL_RATE_TCH_BM: u8 = 0x08;
+    /// A.S0014 Table 4.2.6-3 13 kb/s vocoder.
+    pub const CODING_QCELP_13K: u8 = 0x05;
+    /// A.S0014 Table 4.2.6-4 non-transparent data (T/NT bit).
+    pub const CODING_DATA_NON_TRANSPARENT: u8 = 0x40;
+
+    pub const fn packet_data() -> Self {
+        Self {
+            speech_or_data_indicator: Self::SPEECH_OR_DATA_DATA,
+            channel_rate_and_type: Self::RATE_FULL_RATE_TCH_BM,
+            coding: Self::CODING_DATA_NON_TRANSPARENT,
+        }
+    }
+
     /// Encodes the channel-type payload.
     pub const fn encode(self) -> [u8; 3] {
         [
@@ -2917,6 +2978,7 @@ pub struct LocationUpdatingRequestMessage {
     pub classmark_information_type_2: Option<ClassmarkInformationType2>,
     pub registration_type: Option<RegistrationType>,
     pub mobile_identity_esn: Option<MobileIdentity>,
+    pub mobile_identity_meid: Option<MobileIdentity>,
     pub slot_cycle_index: Option<SlotCycleIndex>,
     pub authentication_response_parameter: Option<AuthenticationResponseParameter>,
     pub authentication_confirmation_parameter: Option<AuthenticationConfirmationParameter>,
@@ -2965,6 +3027,16 @@ impl LocationUpdatingRequestMessage {
                 });
             }
             push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &esn)?;
+        }
+        if let Some(mobile_identity_meid) = &self.mobile_identity_meid {
+            let meid = mobile_identity_meid.encode()?;
+            if !matches!(mobile_identity_meid, MobileIdentity::Meid(_)) {
+                return Err(Error::InvalidValue {
+                    context: "Location Updating Request",
+                    reason: "MEID field must contain MEID mobile identity",
+                });
+            }
+            push_l3_tlv(&mut out, IE_MOBILE_IDENTITY, &meid)?;
         }
         if let Some(slot_cycle_index) = self.slot_cycle_index {
             push_fixed(&mut out, IE_SLOT_CYCLE_INDEX, &[slot_cycle_index.encode()?]);
@@ -3036,6 +3108,7 @@ impl LocationUpdatingRequestMessage {
         let mut classmark_information_type_2 = None;
         let mut registration_type = None;
         let mut mobile_identity_esn = None;
+        let mut mobile_identity_meid = None;
         let mut slot_cycle_index = None;
         let mut authentication_response_parameter = None;
         let mut authentication_confirmation_parameter = None;
@@ -3078,18 +3151,26 @@ impl LocationUpdatingRequestMessage {
                 IE_MOBILE_IDENTITY => {
                     let (_, payload, consumed) = decode_tlv(&rest[offset..])?;
                     let identity = MobileIdentity::decode(payload)?;
-                    if !matches!(identity, MobileIdentity::Esn(_)) {
-                        return Err(Error::InvalidValue {
-                            context: "Location Updating Request",
-                            reason: "ESN field must contain ESN mobile identity",
-                        });
+                    match identity {
+                        identity @ MobileIdentity::Esn(_) => set_once(
+                            &mut mobile_identity_esn,
+                            identity,
+                            LOCATION_UPDATING_REQUEST,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        identity @ MobileIdentity::Meid(_) => set_once(
+                            &mut mobile_identity_meid,
+                            identity,
+                            LOCATION_UPDATING_REQUEST,
+                            IE_MOBILE_IDENTITY,
+                        )?,
+                        MobileIdentity::Imsi(_) => {
+                            return Err(Error::InvalidValue {
+                                context: "Location Updating Request",
+                                reason: "additional mobile identity must contain ESN or MEID",
+                            });
+                        }
                     }
-                    set_once(
-                        &mut mobile_identity_esn,
-                        identity,
-                        LOCATION_UPDATING_REQUEST,
-                        IE_MOBILE_IDENTITY,
-                    )?;
                     offset += consumed;
                 }
                 IE_SLOT_CYCLE_INDEX => {
@@ -3186,6 +3267,7 @@ impl LocationUpdatingRequestMessage {
             classmark_information_type_2,
             registration_type,
             mobile_identity_esn,
+            mobile_identity_meid,
             slot_cycle_index,
             authentication_response_parameter,
             authentication_confirmation_parameter,
@@ -3406,7 +3488,7 @@ impl PagingRequestMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentRequestMessage {
     pub channel_type: ChannelType,
-    pub circuit_identity_code: CircuitIdentityCode,
+    pub circuit_identity_code: Option<CircuitIdentityCode>,
     pub encryption_information: Option<EncryptionInformation>,
     pub service_option: Option<ServiceOption>,
     pub signals: Vec<Signal>,
@@ -3423,11 +3505,13 @@ impl AssignmentRequestMessage {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         push_tlv(&mut body, IE_CHANNEL_TYPE, &self.channel_type.encode())?;
-        push_fixed(
-            &mut body,
-            IE_CIRCUIT_IDENTITY_CODE,
-            &self.circuit_identity_code.encode()?,
-        );
+        if let Some(circuit_identity_code) = self.circuit_identity_code {
+            push_fixed(
+                &mut body,
+                IE_CIRCUIT_IDENTITY_CODE,
+                &circuit_identity_code.encode()?,
+            );
+        }
         if let Some(encryption_information) = &self.encryption_information {
             let payload = encryption_information.encode()?;
             push_tlv(&mut body, IE_ENCRYPTION_INFORMATION, &payload)?;
@@ -3594,10 +3678,7 @@ impl AssignmentRequestMessage {
                 message_type: ASSIGNMENT_REQUEST,
                 id: IE_CHANNEL_TYPE,
             })?,
-            circuit_identity_code: circuit_identity_code.ok_or(Error::MissingRequiredElement {
-                message_type: ASSIGNMENT_REQUEST,
-                id: IE_CIRCUIT_IDENTITY_CODE,
-            })?,
+            circuit_identity_code,
             encryption_information,
             service_option,
             signals,
@@ -7800,5 +7881,44 @@ impl AddsDeliverAckMessage {
             }
         }
         Ok(Self { tag, cause })
+    }
+}
+
+/// A.S0001 §3.1 gives every A1 message a message-discrimination octet that says
+/// how the rest of the frame is laid out. This reads that framing rather than
+/// consulting a table keyed on [`crate::MessageType`], whose discriminants are
+/// project-local routing tags and not A1 Message Type Values: the message type
+/// reported here is always the octet the encoder actually wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct A1Frame {
+    pub bsmap: bool,
+    /// The A1 Message Type Value (A.S0001 Table 3.1.1-1 for BSMAP,
+    /// Table 3.1.2-1 for DTAP).
+    pub message_type: u8,
+    /// The Layer 3 SDU. A BSMAP message keeps its discrimination and length
+    /// octets. A DTAP message starts at the protocol discriminator, with the
+    /// A1 link header dropped. This is the same convention
+    /// [`crate::femto_interface_msg::FemtoInterfaceMsg::to_layer3_sdu`] uses for
+    /// an Fx2-carried body, so both observation paths render identically.
+    pub sdu: Vec<u8>,
+}
+
+pub fn split_a1_frame(payload: &[u8]) -> Option<A1Frame> {
+    match payload.first().copied()? {
+        // BSMAP: [discrimination=0x00][LI][message type][IEs...]
+        BSMAP_MESSAGE_DISCRIMINATION => Some(A1Frame {
+            bsmap: true,
+            message_type: *payload.get(2)?,
+            sdu: payload.to_vec(),
+        }),
+        // A1 DTAP: [discrimination=0x01][DLCI][LI][protocol discriminator]
+        // [reserved][message type][IEs...]. The first three octets are A1 link
+        // framing, not part of the Layer 3 SDU.
+        A1_DTAP_MESSAGE_DISCRIMINATION => Some(A1Frame {
+            bsmap: false,
+            message_type: *payload.get(5)?,
+            sdu: payload.get(3..)?.to_vec(),
+        }),
+        _ => None,
     }
 }

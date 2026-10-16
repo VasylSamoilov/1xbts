@@ -835,10 +835,10 @@ mod tests {
                             channel_rate_and_type: 0x08,
                             coding: 0x05,
                         },
-                        circuit_identity_code: cdma_ios::CircuitIdentityCode {
+                        circuit_identity_code: Some(cdma_ios::CircuitIdentityCode {
                             pcm_multiplexer: 0x0123,
                             timeslot: 0x1a,
-                        },
+                        }),
                         encryption_information: None,
                         service_option: Some(cdma_ios::ServiceOption(0x0003)),
                         signals: Vec::new(),

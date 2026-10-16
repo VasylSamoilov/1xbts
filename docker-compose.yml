@@ -3,7 +3,7 @@ services:
     image: postgres:17
     container_name: 1xbts-postgres
     ports:
-      - "45432:5432"
+      - "127.0.0.1:45432:5432"
     environment:
       POSTGRES_DB: 1xbts
       POSTGRES_USER: 1xbts
@@ -29,6 +29,8 @@ services:
       HLR_GRPC_ADDRESS: ${HLR_GRPC_ADDRESS:-127.0.0.1:17019}
       SMSC_GRPC_ADDRESS: ${SMSC_GRPC_ADDRESS:-127.0.0.1:17020}
       EVENTS_GRPC_ADDRESS: ${EVENTS_GRPC_ADDRESS:-127.0.0.1:17023}
+      NODE_OPTIONS: "--max-old-space-size=768"
+      WATCHPACK_POLLING: "true"
     volumes:
       - ./1xbts-web:/app
       - 1xbts-web-node-modules:/app/node_modules
@@ -54,9 +56,13 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
     ports:
-      - "17012:17012/tcp"
-      - "${SPEEDTEST_PORT:-5656}:80/tcp"
+      - "127.0.0.1:17012:17012/tcp"
+      - "127.0.0.1:${SPEEDTEST_PORT:-5656}:80/tcp"
     environment:
       FOU_LISTEN_PORT: "17010"
       FOU_REMOTE_PORT: "17011"
@@ -124,7 +130,106 @@ services:
       - mbuni-store:/var/spool/mbuni
     restart: unless-stopped
 
+  # `femto` runs the full femtocell edge. `femto-segw-only` runs just the SeGW.
+  femto-segw-config:
+    image: 1xbts-femto
+    build:
+      context: .
+      dockerfile: docker/femto/Dockerfile
+    container_name: 1xbts-femto-segw-config
+    profiles: ["femto", "femto-segw-only"]
+    entrypoint: ["/usr/local/bin/cdma-femto-segw-config"]
+    environment:
+      # Reads the same unified config as femto-core, deriving SeGW connections
+      # from its `sites`.
+      FEMTO_CONFIG: "/config/femto.json"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - ./config:/config:ro
+      - ./config/femto-segw/swanctl:/etc/1xbts/swanctl
+    restart: unless-stopped
+
+  femto-segw:
+    build:
+      context: .
+      dockerfile: docker/femto/segw.Dockerfile
+    container_name: 1xbts-femto-segw
+    profiles: ["femto", "femto-segw-only"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Only IKE and NAT-T are public. Device-facing services use addresses inside
+    # the tunnel because femto-core shares this network namespace.
+    ports:
+      - "0.0.0.0:500:500/udp"
+      - "0.0.0.0:4500:4500/udp"
+    # A fixed address on femto-edge so the host route to the FAP pool survives
+    # container recreates.
+    networks:
+      default: {}
+      femto-edge:
+        ipv4_address: "${FEMTO_SEGW_EDGE_IP:-172.31.0.2}"
+    environment:
+      FEMTO_SERVICE_IP: "${FEMTO_SERVICE_IP:-10.56.0.2}"
+      FEMTO_DNS_IP: "${FEMTO_DNS_IP:-10.56.0.2}"
+      FEMTO_DNS_DOMAIN: "${FEMTO_DNS_DOMAIN:-femto.local.1xbts.org}"
+      FEMTO_ACS_DOMAIN: "${FEMTO_ACS_DOMAIN:-fsmhdm.femto.spcsdns.net}"
+      FEMTO_SIP_DOMAIN: "${FEMTO_SIP_DOMAIN:-fap.airave2.ims.spcsdns.net}"
+    volumes:
+      - ./config/femto-segw/swanctl:/etc/swanctl:ro
+    # femto-core shares this netns, so its host.docker.internal mapping (used to
+    # reach the host-run event bus / MSC / HLR gRPC) is declared here.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - femto-segw-config
+    restart: unless-stopped
+
+  femto-core:
+    image: 1xbts-femto
+    build:
+      context: .
+      dockerfile: docker/femto/Dockerfile
+    container_name: 1xbts-femto-core
+    profiles: ["femto"]
+    # Share the SeGW's network namespace so decrypted traffic is local.
+    network_mode: "service:femto-segw"
+    environment:
+      FEMTO_CONFIG: "/config/femto.json"
+      RUST_LOG: "${RUST_LOG:-info}"
+      EVENTS_GRPC_ADDR: "${EVENTS_GRPC_ADDR:-host.docker.internal:17023}"
+      MSC_GRPC_ADDR: "${MSC_GRPC_ADDR:-host.docker.internal:17017}"
+      HLR_GRPC_ADDR: "${HLR_GRPC_ADDR:-host.docker.internal:17019}"
+      FEMTO_STATE_DIR: "/var/lib/1xbts/femto"
+    volumes:
+      # Mount the directory, not the file, so atomic-save edits reach ReloadConfig.
+      - ./config:/config:ro
+      - femto-state:/var/lib/1xbts/femto
+    depends_on:
+      - femto-segw
+    restart: unless-stopped
+
+  femto-management-proxy:
+    image: alpine/socat
+    container_name: 1xbts-femto-management-proxy
+    profiles: ["femto"]
+    command: "tcp-listen:17024,fork,reuseaddr tcp-connect:femto-segw:17024"
+    ports:
+      - "127.0.0.1:17024:17024"
+    depends_on:
+      - femto-segw
+      - femto-core
+    restart: unless-stopped
+
+networks:
+  femto-edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "${FEMTO_EDGE_SUBNET:-172.31.0.0/24}"
+
 volumes:
+  femto-state:
   postgres-data:
   1xbts-web-node-modules:
   1xbts-web-pnpm-store:

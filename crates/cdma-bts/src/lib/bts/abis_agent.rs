@@ -1320,7 +1320,7 @@ mod tests {
         A3ConnectAckInformation, AirInterfaceMessagePayload, CdmaServingOneWayDelay,
         Layer2AckRequestResults, MobileIdentity, ServiceOption,
     };
-    use cdma_common::consts::{SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_SMS};
+    use cdma_common::consts::{SERVICE_OPTION_PACKET_DATA_RC3, SERVICE_OPTION_SMS};
 
     fn test_config() -> AbisAgentConfig {
         AbisAgentConfig {
@@ -1937,7 +1937,7 @@ mod tests {
         let setup_msg = make_bts_setup_with_so(
             ccr,
             0xDEAD,
-            Some(ServiceOption(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)),
+            Some(ServiceOption(SERVICE_OPTION_PACKET_DATA_RC3)),
         );
         let _ = agent.handle_message(&setup_msg);
         let walsh_code = agent.walsh_code_for(&ccr).unwrap();
@@ -2008,7 +2008,7 @@ mod tests {
         let setup_msg = make_bts_setup_with_so(
             ccr,
             0xDEAD,
-            Some(ServiceOption(SERVICE_OPTION_HIGH_RATE_PACKET_DATA)),
+            Some(ServiceOption(SERVICE_OPTION_PACKET_DATA_RC3)),
         );
 
         let (responses, _events) = agent.handle_message(&setup_msg);

@@ -110,6 +110,33 @@ fn identity_to_proto(i: &model::SubscriberIdentity) -> proto::SubscriberIdentity
     }
 }
 
+fn auth_algo_from_wire(value: i32) -> model::AuthAlgorithm {
+    match proto::AuthAlgorithm::try_from(value) {
+        Ok(proto::AuthAlgorithm::Cave) => model::AuthAlgorithm::Cave,
+        _ => model::AuthAlgorithm::None,
+    }
+}
+
+fn auth_algo_to_wire(algo: model::AuthAlgorithm) -> i32 {
+    let variant = match algo {
+        model::AuthAlgorithm::None => proto::AuthAlgorithm::None,
+        model::AuthAlgorithm::Cave => proto::AuthAlgorithm::Cave,
+    };
+    variant as i32
+}
+
+fn non_empty_key(field: &str, value: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, Status> {
+    match value {
+        None => Ok(None),
+        Some(bytes) if bytes.is_empty() => Ok(None),
+        Some(bytes) => {
+            model::validate_auth_key(&bytes)
+                .map_err(|e| Status::invalid_argument(format!("invalid {field}: {e}")))?;
+            Ok(Some(bytes))
+        }
+    }
+}
+
 fn binding_to_proto(b: &model::RegistrationBinding) -> proto::RegistrationBinding {
     proto::RegistrationBinding {
         subscriber_id: b.subscriber_id.to_string(),
@@ -932,6 +959,51 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         Ok(Response::new(()))
     }
 
+    async fn set_subscriber_a_key(
+        &self,
+        request: Request<proto::SetSubscriberAKeyRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let a_key = non_empty_key("a_key", req.a_key)?;
+        let ssd_a = non_empty_key("ssd_a", req.ssd_a)?;
+        let ssd_b = non_empty_key("ssd_b", req.ssd_b)?;
+        let requested = auth_algo_from_wire(req.auth_algo);
+        let auth_algo = if a_key.is_some() && requested == model::AuthAlgorithm::None {
+            model::AuthAlgorithm::Cave
+        } else {
+            requested
+        };
+        self.repo
+            .set_subscriber_a_key(&identity, a_key, ssd_a, ssd_b, auth_algo)
+            .await
+            .map_err(map_repo_error)?;
+        Ok(Response::new(()))
+    }
+
+    async fn get_subscriber_auth_state(
+        &self,
+        request: Request<proto::GetSubscriberAuthStateRequest>,
+    ) -> Result<Response<proto::GetSubscriberAuthStateResponse>, Status> {
+        let req = request.into_inner();
+        let identity = parse_identity_key(req.identity)?;
+        let state = self
+            .repo
+            .get_subscriber_auth_state(&identity)
+            .await
+            .map_err(map_repo_error)?
+            .ok_or_else(|| Status::not_found("identity not found"))?;
+        Ok(Response::new(proto::GetSubscriberAuthStateResponse {
+            subscriber_identity_id: state.subscriber_identity_id.to_string(),
+            credentials_provisioned: state.credentials_provisioned,
+            ssd_provisioned: state.ssd_provisioned,
+            auth_algo: auth_algo_to_wire(state.auth_algo),
+            auth_count: u32::from(state.auth_count),
+            auth_failure_count: state.auth_failure_count,
+            last_auth_at: state.last_auth_at.map(datetime_to_timestamp),
+        }))
+    }
+
     // ─── OTASP session history ──────────────────────────────────
 
     async fn save_otasp_session(
@@ -1393,6 +1465,22 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
+        async fn set_subscriber_a_key(
+            &self,
+            _: &model::MobileIdentityKey,
+            _: Option<Vec<u8>>,
+            _: Option<Vec<u8>>,
+            _: Option<Vec<u8>>,
+            _: model::AuthAlgorithm,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn get_subscriber_auth_state(
+            &self,
+            _: &model::MobileIdentityKey,
+        ) -> Result<Option<model::IdentityAuthState>, String> {
+            Ok(None)
+        }
         async fn save_otasp_session(
             &self,
             _: &crate::model::OtaspSessionRow,
@@ -1484,6 +1572,63 @@ mod tests {
             ))
             .await;
         assert_eq!(resp.unwrap_err().code(), Code::InvalidArgument);
+    }
+
+    fn sample_identity() -> proto::MobileIdentityKey {
+        proto::MobileIdentityKey {
+            imsi: Some("123456789012345".to_string()),
+            esn: Some(0x1234_5678),
+            meid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_a_key_accepts_valid_key_and_clear() {
+        let svc = HlrServiceImpl::new(Arc::new(StubRepo::default()));
+        svc.set_subscriber_a_key(Request::new(proto::SetSubscriberAKeyRequest {
+            identity: Some(sample_identity()),
+            a_key: Some(vec![0u8; 8]),
+            ssd_a: None,
+            ssd_b: None,
+            auth_algo: proto::AuthAlgorithm::Cave as i32,
+        }))
+        .await
+        .unwrap();
+        svc.set_subscriber_a_key(Request::new(proto::SetSubscriberAKeyRequest {
+            identity: Some(sample_identity()),
+            a_key: Some(Vec::new()),
+            ssd_a: None,
+            ssd_b: None,
+            auth_algo: proto::AuthAlgorithm::Unspecified as i32,
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_a_key_rejects_wrong_length() {
+        let svc = HlrServiceImpl::new(Arc::new(StubRepo::default()));
+        let resp = svc
+            .set_subscriber_a_key(Request::new(proto::SetSubscriberAKeyRequest {
+                identity: Some(sample_identity()),
+                a_key: Some(vec![0u8; 7]),
+                ssd_a: None,
+                ssd_b: None,
+                auth_algo: proto::AuthAlgorithm::Cave as i32,
+            }))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_auth_state_unknown_identity_is_not_found() {
+        let svc = HlrServiceImpl::new(Arc::new(StubRepo::default()));
+        let resp = svc
+            .get_subscriber_auth_state(Request::new(proto::GetSubscriberAuthStateRequest {
+                identity: Some(sample_identity()),
+            }))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), Code::NotFound);
     }
 
     #[tokio::test]

@@ -254,13 +254,20 @@ impl VoicePolicySnapshot {
         self.supported_service_options.contains(&service_option)
     }
 
-    /// Returns the preferred MT voice service option for MSC-originated paging.
+    /// Preferred MT voice service option for MSC-originated paging. Prefers EVRC-A
+    /// (SO 3), the universal baseline codec, when policy permits, else the first supported option with a codec.
     pub fn default_mobile_terminated_service_option(&self) -> u16 {
+        if self
+            .supported_service_options
+            .contains(&cdma_common::consts::SERVICE_OPTION_EVRC_A)
+        {
+            return cdma_common::consts::SERVICE_OPTION_EVRC_A;
+        }
         self.supported_service_options
             .iter()
             .copied()
             .find(|so| cdma_voice::VoiceCodec::from_service_option(*so).is_some())
-            .unwrap_or(3)
+            .unwrap_or(cdma_common::consts::SERVICE_OPTION_EVRC_A)
     }
 
     /// Evaluate an MO voice origination and return the MSC-owned routing
@@ -710,12 +717,25 @@ mod tests {
     }
 
     #[test]
-    fn shipped_msc_config_prefers_qcelp13() {
+    fn shipped_msc_config_prefers_evrc() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/msc.json");
         let cfg: MscNodeConfig =
             serde_json::from_slice(&std::fs::read(path).expect("read config/msc.json"))
                 .expect("parse config/msc.json");
-        assert_eq!(cfg.voice.default_mobile_terminated_service_option(), 32768);
+        assert_eq!(
+            cfg.voice.default_mobile_terminated_service_option(),
+            cdma_common::consts::SERVICE_OPTION_EVRC_A
+        );
+    }
+
+    #[test]
+    fn mt_default_falls_back_to_first_codec_when_evrc_absent() {
+        let mut cfg = VoiceConfig::default();
+        cfg.supported_service_options = vec![cdma_common::consts::SERVICE_OPTION_QCELP13, 68];
+        assert_eq!(
+            cfg.default_mobile_terminated_service_option(),
+            cdma_common::consts::SERVICE_OPTION_QCELP13
+        );
     }
 
     #[test]

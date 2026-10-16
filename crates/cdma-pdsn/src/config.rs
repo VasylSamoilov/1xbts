@@ -77,6 +77,8 @@ pub struct PacketMobileIpConfig {
     pub mn_ha_secret_base64: Option<String>,
     /// Accept MN-AAA credentials without an external AAA verification result.
     pub allow_unverified_mn_aaa: bool,
+    /// Allow Simple IP fallback on an MN-HA SPI mismatch.
+    pub mn_ha_fallback_to_simple_ip: bool,
     /// Optional CIDR for the home-address pool. Defaults to the packet `/24`.
     pub home_address_pool: Option<String>,
 }
@@ -104,6 +106,10 @@ impl std::fmt::Debug for PacketMobileIpConfig {
                 &self.mn_ha_secret_base64.as_ref().map(|_| "<redacted>"),
             )
             .field("allow_unverified_mn_aaa", &self.allow_unverified_mn_aaa)
+            .field(
+                "mn_ha_fallback_to_simple_ip",
+                &self.mn_ha_fallback_to_simple_ip,
+            )
             .field("home_address_pool", &self.home_address_pool)
             .finish()
     }
@@ -123,6 +129,7 @@ impl Default for PacketMobileIpConfig {
             mn_ha_spi: None,
             mn_ha_secret_base64: None,
             allow_unverified_mn_aaa: false,
+            mn_ha_fallback_to_simple_ip: defaults.mn_ha_fallback_to_simple_ip,
             home_address_pool: None,
         }
     }
@@ -217,6 +224,7 @@ impl PacketMobileIpConfig {
             },
             mn_ha_security,
             allow_unverified_mn_aaa: self.allow_unverified_mn_aaa,
+            mn_ha_fallback_to_simple_ip: self.mn_ha_fallback_to_simple_ip,
         })
     }
 
@@ -335,8 +343,10 @@ pub struct PdsnNodeConfig {
     /// A11 signaling endpoint toward the PCF.
     #[serde(default = "default_a11")]
     pub a11: A11TransportConfig,
-    /// A11 PCF/PDSN security association.
     pub a11_security: A11SecurityConfig,
+    /// A peer whose SPI matches none of these falls back to `a11_security`.
+    #[serde(default)]
+    pub a11_peers: Vec<A11PeerSecurityConfig>,
     /// Legacy packet-data transport (TUN or FOU). Will be superseded by
     /// the A10 GRE bearer.
     #[serde(default)]
@@ -349,6 +359,10 @@ pub struct PdsnNodeConfig {
     /// set, PDSN publishes packet-session bind/unbind events to the bus.
     #[serde(default)]
     pub events_endpoint: Option<String>,
+    #[serde(default)]
+    pub a12: cdma_a12::A12Config,
+    #[serde(default)]
+    pub hlr_endpoint: Option<String>,
 }
 
 impl PdsnNodeConfig {
@@ -361,6 +375,18 @@ impl PdsnNodeConfig {
             .map_err(|error| error.to_string())?;
         self.a11.validate("pdsn.a11")?;
         self.a11_security.validate("pdsn.a11_security")?;
+        let mut seen_spi = std::collections::HashSet::new();
+        seen_spi.insert(self.a11_security.spi);
+        for (index, peer) in self.a11_peers.iter().enumerate() {
+            let label = format!("pdsn.a11_peers[{index}]");
+            peer.security.validate(&label)?;
+            if !seen_spi.insert(peer.security.spi) {
+                return Err(format!(
+                    "{label}.spi {} is already used by another A11 association",
+                    peer.security.spi
+                ));
+            }
+        }
         self.packet.validate()?;
         if self.packet.mobile_ip.enabled
             && u64::from(self.packet.mobile_ip.registration_lifetime_secs)
@@ -380,6 +406,16 @@ impl PdsnNodeConfig {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(cfg)
     }
+}
+
+/// The SPI is how a peer names the association it signs with, so every peer
+/// needs its own. `feid` only labels the peer in logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A11PeerSecurityConfig {
+    #[serde(flatten)]
+    pub security: A11SecurityConfig,
+    #[serde(default)]
+    pub feid: Option<String>,
 }
 
 #[cfg(test)]
@@ -418,9 +454,12 @@ mod tests {
             a10_bearer: default_a10_bearer(),
             a11: default_a11(),
             a11_security: test_a11_security_config(),
+            a11_peers: Vec::new(),
             packet: PacketTransportConfig::default(),
             ppp_session_timeout_secs: DEFAULT_PPP_SESSION_TIMEOUT_SECS,
             events_endpoint: None,
+            a12: cdma_a12::A12Config::default(),
+            hlr_endpoint: None,
         }
     }
 
@@ -508,7 +547,8 @@ mod tests {
                 "a10_bearer": { "mode": "raw_gre" },
                 "a11": {
                     "bind_addr": "127.0.0.1:6992",
-                    "peer_addr": "127.0.0.1:6991"
+                    "peer_addr": "0.0.0.0:0",
+                    "framing": "bare"
                 },
                 "packet": { "transport": "fou_tcp", "fou_remote": "127.0.0.1:17012" }
             }"#,
@@ -517,6 +557,7 @@ mod tests {
             .expect("raw GRE A10 with unprivileged A11 should validate");
         assert!(cfg.a10_bearer.udp_bind_addr.is_none());
         assert_eq!(cfg.a11.bind_addr, "127.0.0.1:6992".parse().unwrap());
+        assert_eq!(cfg.a11.framing, cdma_a11::A11Framing::Bare);
     }
 
     #[test]

@@ -1,0 +1,17 @@
+[package]
+name = "cdma-sip"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SIP message codec, transactions, and UDP transport for the femtocell IMS/FCS."
+
+[dependencies]
+thiserror = "2"
+md-5 = "0.10"
+tokio = { version = "1", features = ["rt", "net", "macros", "sync"] }
+
+[lints]
+workspace = true

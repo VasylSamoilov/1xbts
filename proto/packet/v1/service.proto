@@ -32,11 +32,11 @@ enum AccessTechnology {
   ACCESS_TECHNOLOGY_HRPD = 2;
 }
 
-// Origin of the HRPD A11 MN ID used for bearer registration.
-enum HrpdMnIdSource {
-  HRPD_MN_ID_SOURCE_UNSPECIFIED = 0;
-  HRPD_MN_ID_SOURCE_A11 = 1;
-  HRPD_MN_ID_SOURCE_DERIVED_HARDWARE = 2;
+// Origin of the A11 MN ID used for bearer registration.
+enum MnIdSource {
+  MN_ID_SOURCE_UNSPECIFIED = 0;
+  MN_ID_SOURCE_A11 = 1;
+  MN_ID_SOURCE_DERIVED_HARDWARE = 2;
 }
 
 // One RLP traffic frame moving between the radio stack and packet engine.
@@ -73,9 +73,9 @@ message OpenSessionRequest {
   string meid = 9;
   // HRPD A11 MN ID used for bearer registration. This may be an IMSI-format
   // value derived for A11 and must not be displayed as a subscriber IMSI.
-  string hrpd_mn_id = 10;
-  // Origin of hrpd_mn_id.
-  HrpdMnIdSource hrpd_mn_id_source = 11;
+  string mn_id = 10;
+  // Origin of mn_id.
+  MnIdSource mn_id_source = 11;
   // Authoritative subscriber IMSI when resolved by HLR/A12/roaming data.
   string subscriber_imsi = 12;
 }
@@ -199,9 +199,9 @@ message PacketSessionInfo {
   string meid = 32;
   // HRPD A11 MN ID used for bearer registration. This is not necessarily a
   // subscriber IMSI.
-  string hrpd_mn_id = 33;
-  // Origin of hrpd_mn_id.
-  HrpdMnIdSource hrpd_mn_id_source = 34;
+  string mn_id = 33;
+  // Origin of mn_id.
+  MnIdSource mn_id_source = 34;
   // Authoritative subscriber IMSI when resolved.
   string subscriber_imsi = 35;
 }

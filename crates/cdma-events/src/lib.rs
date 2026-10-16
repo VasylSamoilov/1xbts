@@ -11,6 +11,7 @@ pub mod proto {
     tonic::include_proto!("events.v1");
 }
 
+pub mod a1;
 mod enricher;
 pub mod node;
 mod node_config;

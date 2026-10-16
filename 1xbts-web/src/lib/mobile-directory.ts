@@ -20,8 +20,8 @@ export interface PacketSessionDirectoryFields {
   subscriberId?: string;
   imsi?: string;
   meid?: string;
-  hrpdMnId?: string;
-  hrpdMnIdSource?: string;
+  mnId?: string;
+  mnIdSource?: string;
   subscriberImsi?: string;
   esn?: number;
   trafficWalshCode?: number;

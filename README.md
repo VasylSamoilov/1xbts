@@ -90,9 +90,11 @@ Common packages (always required):
 
 ```sh
 sudo apt-get install -y \
-    build-essential pkg-config protobuf-compiler libssl-dev \
+    build-essential pkg-config protobuf-compiler libprotobuf-dev libssl-dev \
     libclang-dev libre-dev
 ```
+
+On Ubuntu, `libre-dev` may be too old for the voice gateway's SIP registration support. Install the current libre version described in the Building from Source guide before building the core.
 
 Then add the packages for whichever SDR backend(s) you plan to enable:
 
@@ -175,6 +177,42 @@ Default service ports are listed in `docs/PORTS.md`. If port 3000 is already in
 use, set `ONEXBTS_WEB_PORT`, for example `ONEXBTS_WEB_PORT=3001 docker compose up 1xbts-web`.
 Use `--build` after pulling repo updates so Compose rebuilds images that copy
 local files, such as `fou-nat` and `speedtest`.
+
+### Femtocell Profiles
+
+Femtocell containers are disabled during a normal `docker compose up`. Both
+profiles use `config/femto.json` and its `config/femto.local.json` overlay for
+the SeGW and femtocell core. Create the local overlay from the example:
+
+```sh
+cp config/femto.local.json.example config/femto.local.json
+```
+
+Configure each FAP under `sites` in the local overlay, including its identity,
+credentials, and radio settings. The SeGW connections are derived from those
+sites. The `segw` block controls the FAP address pool, tunnel DNS address, and
+generated StrongSwan configuration directory.
+
+Start the supporting containers and femtocell edge, including StrongSwan,
+ACS, SIP/FCS, packet ingress, and the management proxy, with:
+
+```sh
+docker compose --profile femto up -d --build
+```
+
+Compose does not start the shared network core. For a femtocell-only
+installation, follow the Femtocell Setup guide to add the femtocell to the MSC,
+configure the PDSN and host return route, and run the shared core without an SDR.
+
+To terminate FAP IPsec on this host while running the femtocell core elsewhere,
+start only StrongSwan, tunnel DNS, and the SeGW configuration controller:
+
+```sh
+docker compose --profile femto-segw-only up -d --build femto-segw
+```
+
+The SeGW-only profile assigns FAP virtual addresses and terminates the tunnel.
+Routing decrypted traffic to a remote core is deployment-specific.
 The packet-data speed test is available on the host at `http://localhost:5656`
 by default, and from mobile packet-data clients at `http://speed/` or
 `http://speed.local.1xbts.org/`.

@@ -1,0 +1,60 @@
+syntax = "proto3";
+package femto_management.v1;
+
+import "bts_management/v1/service.proto";
+
+service FemtoManagementService {
+  rpc GetFemtoCellStatus(bts_management.v1.CellRequest) returns (FemtoCellStatus);
+  rpc SetFemtoRadioAdministrativeState(SetFemtoRadioAdministrativeStateRequest) returns (FemtoCommandResponse);
+  rpc RequestProvisioningSync(bts_management.v1.CellRequest) returns (FemtoCommandResponse);
+  rpc RebootFemtocell(bts_management.v1.CellRequest) returns (FemtoCommandResponse);
+  // Re-read the femtocell config and hot-swap the provisioning state (FAP
+  // profiles, sites, definitions) without restarting.
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+}
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {
+  bool reloaded = 1;
+  string message = 2;
+  uint32 fap_count = 3;
+  uint32 site_count = 4;
+}
+
+enum FemtoRadioAdministrativeState {
+  FEMTO_RADIO_ADMINISTRATIVE_STATE_UNSPECIFIED = 0;
+  FEMTO_RADIO_ADMINISTRATIVE_STATE_DISABLED = 1;
+  FEMTO_RADIO_ADMINISTRATIVE_STATE_ENABLED = 2;
+}
+
+message SetFemtoRadioAdministrativeStateRequest {
+  bts_management.v1.CellRequest cell = 1;
+  FemtoRadioAdministrativeState state = 2;
+}
+
+message FemtoCommandResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message FemtoCellStatus {
+  bts_management.v1.CellRequest cell = 1;
+  string feid = 2;
+  string profile = 3;
+  optional string inner_peer_address = 4;
+  optional string sip_public_identity = 5;
+  bool sip_registered = 6;
+  optional uint64 sip_expires_at_ms = 7;
+  bool acs_configured = 8;
+  bool acs_provisioned = 9;
+  optional uint64 last_acs_inform_ms = 10;
+  optional string gps_status = 11;
+  optional string timing_status = 12;
+  optional string location_validation_status = 13;
+  optional string radio_operational_state = 14;
+  optional bool ipsec_established = 15;
+  uint64 last_updated_ms = 16;
+  optional double gps_latitude = 17;
+  optional double gps_longitude = 18;
+}

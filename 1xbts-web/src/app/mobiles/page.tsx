@@ -32,6 +32,8 @@ interface MobileInfo {
   subscriberId?: string;
   trafficWalshCode?: number;
   trafficServiceOption?: number;
+  baseStation: string;
+  baseStations: string[];
   trafficPower?: {
     forwardRadioConfig: number;
     reverseRadioConfig: number;

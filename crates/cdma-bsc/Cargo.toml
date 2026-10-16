@@ -12,6 +12,8 @@ description = "BSC, mobility, paging, SMS, traffic, packet-data, and management 
 test-utils = []
 
 [dependencies]
+cdma-events = { path = "../cdma-events" }
+lru = "0.12"
 thiserror = "1"
 cdma-abis = { path = "../cdma-abis" }
 cdma-a8 = { path = "../cdma-a8" }

@@ -181,7 +181,7 @@
             "psist_15": 0,
             "msg_psist": 0,
             "reg_psist": 0,
-            "probe_pn_ran": 9,
+            "probe_pn_ran": 0,
             "acc_tmo": 3,
             "probe_bkoff": 0,
             "bkoff": 0,

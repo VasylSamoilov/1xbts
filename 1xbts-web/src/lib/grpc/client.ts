@@ -48,9 +48,10 @@ export async function waitForManagementReady(timeoutMs = MSC_GRPC_READY_TIMEOUT_
   await waitForChannelReady(mscChannel, new Date(Date.now() + timeoutMs));
 }
 
-// Generic gRPC -> HTTP status mapping for API route error responses.
-// Reads `ClientError.code` (the structured status from the server);
-// anything that isn't a ClientError is treated as an upstream failure.
+export async function waitForMscReady(timeoutMs = MSC_GRPC_READY_TIMEOUT_MS) {
+  await waitForChannelReady(mscChannel, new Date(Date.now() + timeoutMs));
+}
+
 export function grpcErrorStatus(err: unknown): number {
   if (err instanceof ClientError) {
     switch (err.code) {

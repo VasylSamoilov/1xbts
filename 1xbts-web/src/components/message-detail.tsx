@@ -1,6 +1,7 @@
 "use client";
 
-import type { ReactNode } from "react";
+import Link from "next/link";
+import { useState, type ReactNode } from "react";
 import type {
   AccessDataBurst,
   AccessEvent,
@@ -41,6 +42,17 @@ import {
   hrpdSessionReasonToJSON,
   hrpdTrafficReasonToJSON,
 } from "@/lib/proto/events/v1/an";
+import { cellLabel } from "@/lib/cell";
+import {
+  a1DecodedIe,
+  a1DirectionLabel,
+  a1DiscriminatorLabel,
+  a1NodeHref,
+  a1TypeName,
+  addsBurstLabel,
+  formatHexOctets,
+  type A1LogEvent,
+} from "@/lib/a1-event";
 export { shouldHideAccessEvent } from "@/lib/access-event-filter";
 
 function smsSummary(
@@ -95,6 +107,19 @@ function Field({ label, value }: { label: string; value?: ReactNode | null }) {
     <span>
       {label}: {value}
     </span>
+  );
+}
+
+type A1NodeMatchList = Parameters<typeof a1NodeHref>[0];
+
+function maybeLink(href: string | null, content: ReactNode): ReactNode {
+  if (!href) {
+    return content;
+  }
+  return (
+    <Link href={href} className="text-accent-green hover:underline">
+      {content}
+    </Link>
   );
 }
 
@@ -1095,6 +1120,131 @@ function HrpdDecodedMessages({ messages }: { messages: HrpdDecodedMessage[] }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+export function LaneBadge({ lane }: { lane: "L3" | "A1" }) {
+  return (
+    <span
+      className={`font-mono text-[10px] leading-none px-1 py-0.5 rounded shrink-0 w-7 text-center ${
+        lane === "A1"
+          ? "bg-badge-purple-bg text-badge-purple-text"
+          : "bg-surface-raised text-muted"
+      }`}
+      title={
+        lane === "A1"
+          ? "A1 — IOS DTAP/BSMAP signaling between the access network and the MSC (A.S0014)"
+          : "L3 — air-interface Layer 3, as transmitted by the mobile"
+      }
+    >
+      {lane}
+    </span>
+  );
+}
+
+export function A1Detail({
+  event,
+  cells = [],
+}: {
+  event: A1LogEvent;
+  cells?: A1NodeMatchList;
+}) {
+  const discriminator = a1DiscriminatorLabel(event.discriminator);
+  const identity = event.mobileIdentity;
+  const [showBytes, setShowBytes] = useState(false);
+  const decodedCount = event.informationElements.filter((ie) =>
+    a1DecodedIe(ie),
+  ).length;
+  const peerHref = event.peerId ? a1NodeHref(cells, { peerId: event.peerId }) : null;
+  const cellHref = event.cell ? a1NodeHref(cells, { cell: event.cell }) : null;
+  return (
+    <div className="space-y-1">
+      <FieldGrid>
+        <Field label="Direction" value={a1DirectionLabel(event.direction)} />
+        <Field label="Discriminator" value={discriminator || null} />
+        <Field label="Message Type" value={a1TypeName(event)} />
+        <Field
+          label="Peer"
+          value={
+            event.peerId
+              ? maybeLink(peerHref, <span className="font-mono">{event.peerId}</span>)
+              : null
+          }
+        />
+        <Field
+          label="Cell"
+          value={event.cell ? maybeLink(cellHref, cellLabel(event.cell)) : null}
+        />
+        <Field label="IMSI" value={identity?.imsi || null} />
+        <Field
+          label="ESN"
+          value={identity?.esn ? formatHex(identity.esn, 8) : null}
+        />
+        <Field label="MEID" value={identity?.meid || null} />
+        <Field label="SDU Length" value={`${event.sduLengthBytes} bytes`} />
+        {event.adds && (
+          <Field
+            label="ADDS"
+            value={`${addsBurstLabel(event.adds.burstType)} (0x${event.adds.burstTypeValue
+              .toString(16)
+              .toUpperCase()
+              .padStart(2, "0")}), ${event.adds.payloadLengthBytes} bytes`}
+          />
+        )}
+        <Field label="A1 Call" value={event.a1CallId !== "0" ? event.a1CallId : null} />
+        <Field label="SIP Call-ID" value={event.sipCallId || null} />
+        <Field label="Content-Type" value={event.contentType || null} />
+        <Field label="Peer Address" value={event.peer || null} />
+      </FieldGrid>
+
+      {event.sduHex && (
+        <div className="text-xs text-muted break-all font-mono">
+          SDU_HEX: {formatHexOctets(event.sduHex)}
+        </div>
+      )}
+
+      {event.informationElements.length > 0 && (
+        <div className="space-y-0.5 pt-1">
+          <div className="text-secondary font-medium text-xs">
+            Information Elements ({event.informationElements.length})
+            {decodedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowBytes((shown) => !shown)}
+                className="ml-2 font-normal text-accent-green hover:underline"
+              >
+                {showBytes ? "hide bytes" : "show bytes"}
+              </button>
+            )}
+          </div>
+          {event.informationElements.map((ie, index) => {
+            const decoded = a1DecodedIe(ie);
+            const bytes = !decoded || showBytes;
+            return (
+              <div
+                key={`${ie.iei}-${index}`}
+                className="text-xs font-mono flex gap-2 items-baseline"
+              >
+                <span className="text-accent-amber shrink-0 w-10">
+                  {formatHex(ie.iei)}
+                </span>
+                <span className="text-secondary shrink-0 w-56 truncate">
+                  {ie.name || "unmodelled"}
+                </span>
+                <span className="break-all">
+                  {decoded && <span className="text-primary">{decoded}</span>}
+                  {bytes && (
+                    <span className={decoded ? "text-muted ml-2" : "text-muted"}>
+                      {formatHexOctets(ie.contentHex)}
+                    </span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

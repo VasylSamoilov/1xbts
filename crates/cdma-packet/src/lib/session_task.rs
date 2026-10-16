@@ -31,10 +31,10 @@ pub struct SessionMetadata {
     pub esn: Option<u32>,
     /// MEID of the handset, if known at session-open time.
     pub meid: Option<String>,
-    /// HRPD A11 MN ID used to register the A10 bearer. This can be an
+    /// A11 MN ID used to register the A10 bearer. This can be an
     /// IMSI-format fallback and is not necessarily a subscriber IMSI.
-    pub hrpd_mn_id: Option<String>,
-    pub hrpd_mn_id_source: Option<String>,
+    pub mn_id: Option<String>,
+    pub mn_id_source: Option<String>,
     /// Authoritative subscriber IMSI, if separately resolved.
     pub subscriber_imsi: Option<String>,
     pub traffic_walsh_code: u32,
@@ -63,8 +63,8 @@ pub struct SessionStatus {
     pub imsi: String,
     pub esn: u32,
     pub meid: String,
-    pub hrpd_mn_id: String,
-    pub hrpd_mn_id_source: String,
+    pub mn_id: String,
+    pub mn_id_source: String,
     pub subscriber_imsi: String,
     pub traffic_walsh_code: u32,
     pub rlp_state: String,
@@ -101,7 +101,7 @@ pub struct PppSessionCacheExpired {
 
 #[derive(Debug, Clone)]
 pub enum PppSessionCacheLookup {
-    Hit(PppSessionCacheHit),
+    Hit(Box<PppSessionCacheHit>),
     Expired(PppSessionCacheExpired),
     Miss,
 }
@@ -140,12 +140,12 @@ impl PppSessionStore {
                 idle_for,
             });
         }
-        PppSessionCacheLookup::Hit(PppSessionCacheHit {
+        PppSessionCacheLookup::Hit(Box::new(PppSessionCacheHit {
             state: cached.state.clone(),
             allocation_key: cached.allocation_key.clone(),
             peer_ip: cached.state.ipcp.config.peer_ip,
             idle_for,
-        })
+        }))
     }
 
     pub fn store(
@@ -233,8 +233,8 @@ impl SessionStatus {
             imsi: metadata.imsi.unwrap_or_default(),
             esn: metadata.esn.unwrap_or_default(),
             meid: metadata.meid.unwrap_or_default(),
-            hrpd_mn_id: metadata.hrpd_mn_id.unwrap_or_default(),
-            hrpd_mn_id_source: metadata.hrpd_mn_id_source.unwrap_or_default(),
+            mn_id: metadata.mn_id.unwrap_or_default(),
+            mn_id_source: metadata.mn_id_source.unwrap_or_default(),
             subscriber_imsi: metadata.subscriber_imsi.unwrap_or_default(),
             traffic_walsh_code: metadata.traffic_walsh_code,
             rlp_state: "sync".into(),
@@ -534,8 +534,8 @@ pub async fn run_session(
             imsi: metadata.imsi.clone(),
             esn: metadata.esn,
             meid: metadata.meid.clone(),
-            hrpd_mn_id: metadata.hrpd_mn_id.clone(),
-            hrpd_mn_id_source: metadata.hrpd_mn_id_source.clone(),
+            mn_id: metadata.mn_id.clone(),
+            mn_id_source: metadata.mn_id_source.clone(),
             subscriber_imsi: metadata.subscriber_imsi.clone(),
             peer_ip: bind_peer_ip,
             our_ip: bind_our_ip,
@@ -807,8 +807,8 @@ pub async fn run_session(
             imsi: metadata.imsi.clone(),
             esn: metadata.esn,
             meid: metadata.meid.clone(),
-            hrpd_mn_id: metadata.hrpd_mn_id.clone(),
-            hrpd_mn_id_source: metadata.hrpd_mn_id_source.clone(),
+            mn_id: metadata.mn_id.clone(),
+            mn_id_source: metadata.mn_id_source.clone(),
             subscriber_imsi: metadata.subscriber_imsi.clone(),
             peer_ip: bind_peer_ip,
             reason: crate::session_lifecycle::UnbindReason::UplinkClosed,
@@ -837,10 +837,7 @@ fn session_allocation_key(
 
 pub fn ppp_identity_key(metadata: &SessionMetadata) -> Option<String> {
     if metadata.access_technology == "HRPD"
-        && let Some(mn_id) = metadata
-            .hrpd_mn_id
-            .as_deref()
-            .filter(|value| !value.is_empty())
+        && let Some(mn_id) = metadata.mn_id.as_deref().filter(|value| !value.is_empty())
     {
         return Some(format!("hrpd-mn-id:{mn_id}"));
     }
@@ -1347,7 +1344,7 @@ mod tests {
     fn hrpd_ppp_identity_uses_mn_id_without_claiming_imsi() {
         let metadata = SessionMetadata {
             access_technology: "HRPD".to_string(),
-            hrpd_mn_id: Some("310556898017332".to_string()),
+            mn_id: Some("310556898017332".to_string()),
             imsi: None,
             ..SessionMetadata::default()
         };

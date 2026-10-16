@@ -25,7 +25,8 @@ import { radioConfigPairName } from "@/lib/radio-config";
 import { serviceOptionName } from "@/lib/service-option";
 import { useBtsList } from "@/lib/use-bts-list";
 import type { BtsConfig, TrafficChannelPower } from "@/lib/proto/bsc/v1/service";
-import type { ReversePowerControlEntry } from "@/lib/proto/bts_management/v1/service";
+import { CellKind, type ReversePowerControlEntry } from "@/lib/proto/bts_management/v1/service";
+import type { FemtoCellStatus } from "@/lib/proto/femto_management/v1/service";
 
 interface ServedMobile {
   address: string;
@@ -54,6 +55,41 @@ function mobileLabel(mobile: ServedMobile): string {
   if (mobile.esn != null) return `ESN ${formatEsn(mobile.esn)}`;
   if (mobile.meid) return `MEID ${formatMeid(mobile.meid)}`;
   return mobile.address;
+}
+
+function FemtoLocationMap({ latitude, longitude }: { latitude: number; longitude: number }) {
+  const latitudeDelta = 0.008;
+  const longitudeDelta = 0.012;
+  const bounds = [
+    longitude - longitudeDelta,
+    latitude - latitudeDelta,
+    longitude + longitudeDelta,
+    latitude + latitudeDelta,
+  ].join(",");
+  const marker = `${latitude},${longitude}`;
+  const mapUrl = `https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(bounds)}&layer=mapnik&marker=${encodeURIComponent(marker)}`;
+  const detailUrl = `https://www.openstreetmap.org/?mlat=${encodeURIComponent(latitude)}&mlon=${encodeURIComponent(longitude)}#map=15/${encodeURIComponent(latitude)}/${encodeURIComponent(longitude)}`;
+
+  return (
+    <div className="mt-4 overflow-hidden rounded-lg border border-border">
+      <iframe
+        title="Femtocell GPS location"
+        src={mapUrl}
+        className="h-64 w-full bg-surface-solid"
+        loading="lazy"
+      />
+      <div className="border-t border-border px-3 py-2 text-right">
+        <a
+          href={detailUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="text-xs text-accent-green hover:text-accent-green"
+        >
+          Open larger map &rarr;
+        </a>
+      </div>
+    </div>
+  );
 }
 
 export default function BtsDetailPage({
@@ -87,8 +123,45 @@ export default function BtsDetailPage({
   const [powerDrafts, setPowerDrafts] = useState<Record<number, string>>({});
   const [mutatingWalsh, setMutatingWalsh] = useState<number | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  const [femtoStatus, setFemtoStatus] = useState<FemtoCellStatus | null>(null);
+  const [femtoCommandStatus, setFemtoCommandStatus] = useState<string | null>(null);
+  const [femtoCommandPending, setFemtoCommandPending] = useState<string | null>(null);
+  const isFemto = summary?.kind === CellKind.CELL_KIND_FEMTOCELL;
 
   useEffect(() => {
+    if (!isFemto || !baseStation) return;
+    const query = new URLSearchParams({ baseStation, peerId });
+    const load = () => void fetch(`/api/femtocells/status?${query}`, { cache: "no-store" })
+      .then((response) => response.json())
+      .then((status) => { if (!status.error) setFemtoStatus(status); });
+    load();
+    const interval = setInterval(load, 5000);
+    return () => clearInterval(interval);
+  }, [isFemto, baseStation, peerId]);
+
+  const femtoAction = useCallback(async (action: "enable" | "disable" | "sync" | "reboot") => {
+    if (!baseStation) return;
+    setMutationError(null);
+    setFemtoCommandStatus(null);
+    setFemtoCommandPending(action);
+    try {
+      const response = await fetch("/api/femtocells/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseStation, peerId, action }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "femtocell operation failed");
+      setFemtoCommandStatus(result.message || "Command sent");
+    } catch (error) {
+      setMutationError(error instanceof Error ? error.message : "femtocell operation failed");
+    } finally {
+      setFemtoCommandPending(null);
+    }
+  }, [baseStation, peerId]);
+
+  useEffect(() => {
+    if (!summary || isFemto) return;
     let cancelled = false;
     fetch(peerHref("/api/bts-config", peerId, baseStation), { cache: "no-store" })
       .then((r) => r.json())
@@ -110,18 +183,20 @@ export default function BtsDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [peerId, baseStation]);
+  }, [peerId, baseStation, summary, isFemto]);
 
   useEffect(() => {
+    if (!summary || isFemto) return;
     const es = new EventSource(peerHref("/api/radio-metrics", peerId, baseStation));
     es.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (!data.error) setMetrics(data);
     };
     return () => es.close();
-  }, [peerId, baseStation]);
+  }, [peerId, baseStation, summary, isFemto]);
 
   const loadPowerControls = useCallback(async () => {
+    if (!summary || isFemto) return;
     try {
       const res = await fetch(peerHref("/api/bts/reverse-power-controls", peerId, baseStation), {
         cache: "no-store",
@@ -132,7 +207,7 @@ export default function BtsDetailPage({
     } catch {
       setPowerControls([]);
     }
-  }, [peerId, baseStation]);
+  }, [peerId, baseStation, summary, isFemto]);
 
   useEffect(() => {
     let cancelled = false;
@@ -206,7 +281,9 @@ export default function BtsDetailPage({
         <Link href="/bts" className="text-sm text-muted hover:text-secondary">
           &larr; Cells
         </Link>
-        <h1 className="text-lg font-bold">{cell ? cellTitle(cell) : peerId}</h1>
+        <h1 className="text-lg font-bold">
+          {summary?.name || (cell ? cellTitle(cell) : peerId)}
+        </h1>
         {summary && (
           <span
             className={`text-xs px-2 py-0.5 rounded ${attachStateBadgeClass(summary.state)}`}
@@ -236,6 +313,7 @@ export default function BtsDetailPage({
             <Stat label="CDMA Channel" value={String(summary.cdmaChannel)} mono />
             <Stat label="SID" value={String(summary.sid)} mono />
             <Stat label="NID" value={String(summary.nid)} mono />
+            <Stat label="Software Version" value={summary.softwareVersion || "-"} mono />
             <Stat label="EV-DO" value={summary.evdoEnabled ? "Enabled" : "Off"} />
             <Stat
               label="Served Mobiles"
@@ -246,19 +324,75 @@ export default function BtsDetailPage({
         </Card>
       )}
 
+      {isFemto && femtoStatus && (
+        <Card title="Femtocell">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-x-6">
+            <Stat label="FEID" value={femtoStatus.feid} mono />
+            <Stat label="Profile" value={femtoStatus.profile} />
+            <Stat label="Version" value={summary?.softwareVersion || "-"} mono />
+            <Stat label="Inner Address" value={femtoStatus.innerPeerAddress || "-"} mono />
+            <Stat label="SIP" value={femtoStatus.sipRegistered ? "Registered" : "Not registered"} />
+            <Stat label="ACS" value={femtoStatus.acsProvisioned ? "Provisioned" : "Pending"} />
+            <Stat label="GPS lock" value={femtoStatus.gpsStatus || "Unknown"} />
+            <Stat
+              label="Radio timing synchronization"
+              value={femtoStatus.timingStatus || "Unknown"}
+            />
+            <Stat
+              label="GPS coordinates"
+              value={
+                femtoStatus.gpsLatitude != null && femtoStatus.gpsLongitude != null
+                  ? `${femtoStatus.gpsLatitude.toFixed(6)}, ${femtoStatus.gpsLongitude.toFixed(6)}`
+                  : "Unavailable"
+              }
+              mono
+            />
+            <Stat label="Radio" value={femtoStatus.radioOperationalState || "-"} />
+          </div>
+          {femtoStatus.gpsLatitude != null && femtoStatus.gpsLongitude != null && (
+            <FemtoLocationMap
+              latitude={femtoStatus.gpsLatitude}
+              longitude={femtoStatus.gpsLongitude}
+            />
+          )}
+          {mutationError && <p className="text-accent-red text-sm mt-3">{mutationError}</p>}
+          {femtoCommandStatus && (
+            <p className="mt-3 rounded border border-accent-green/30 bg-accent-green/10 px-3 py-2 text-sm text-accent-green">
+              {femtoCommandStatus}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 mt-4">
+            {(["sync", "enable", "disable", "reboot"] as const).map((action) => (
+              <button
+                key={action}
+                className="rounded border border-border px-3 py-1.5 text-xs text-secondary hover:border-accent-green hover:text-accent-green"
+                disabled={femtoCommandPending !== null}
+                onClick={() => void femtoAction(action)}
+              >
+                {femtoCommandPending === action
+                  ? "Sending..."
+                  : action === "sync"
+                    ? "Force provisioning sync"
+                    : `${action[0].toUpperCase()}${action.slice(1)} femtocell`}
+              </button>
+            ))}
+          </div>
+        </Card>
+      )}
+
       {configError && (
         <div className="rounded-lg border border-accent-amber/20 bg-accent-amber-bg p-4 text-accent-amber text-sm">
           {configError}
         </div>
       )}
 
-      {config && <BtsConfigCards config={config} />}
+      {!isFemto && config && <BtsConfigCards config={config} />}
 
-      <IqCaptureCard peerId={peerId} />
+      {!isFemto && <IqCaptureCard peerId={peerId} />}
 
-      <RadioMetricsCards metrics={metrics} />
+      {!isFemto && <RadioMetricsCards metrics={metrics} />}
 
-      <Card title={`Reverse Power Control (${powerControls.length})`}>
+      {!isFemto && <Card title={`Reverse Power Control (${powerControls.length})`}>
         {mutationError && (
           <p className="text-accent-red text-sm mb-2">{mutationError}</p>
         )}
@@ -300,7 +434,7 @@ export default function BtsDetailPage({
             </table>
           </div>
         )}
-      </Card>
+      </Card>}
 
       <Card title={`Mobiles on this Cell (${servedMobiles.length})`}>
         {servedMobiles.length === 0 ? (

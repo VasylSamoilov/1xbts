@@ -264,21 +264,17 @@ impl MediaService {
         );
     }
 
-    pub(crate) fn handle_due_delayed_wav_starts(
-        &mut self,
-        circuits: &CircuitService,
-        voice_bearer: Option<&Arc<VoiceBearerManager>>,
-    ) {
+    pub(crate) fn drain_due_wav_starts(&mut self) -> Vec<CallId> {
         let now = tokio::time::Instant::now();
         let due: Vec<CallId> = self
             .delayed_wav_starts
             .iter()
             .filter_map(|(call_id, deadline)| (*deadline <= now).then_some(*call_id))
             .collect();
-        for call_id in due {
-            self.delayed_wav_starts.remove(&call_id);
-            self.start_media_for_call(call_id, circuits, voice_bearer);
+        for call_id in &due {
+            self.delayed_wav_starts.remove(call_id);
         }
+        due
     }
 
     /// Start media sourcing for a connected call.
@@ -529,6 +525,17 @@ mod tests {
         voice_bearer::VOICE_RTP_PAYLOAD_TYPE,
     };
     use std::net::Ipv4Addr;
+
+    #[tokio::test]
+    async fn drain_due_wav_starts_returns_each_call_once() {
+        let mut media = MediaService::new();
+        let call_id = CallId(7);
+        media
+            .delayed_wav_starts
+            .insert(call_id, tokio::time::Instant::now());
+        assert_eq!(media.drain_due_wav_starts(), vec![call_id]);
+        assert!(media.drain_due_wav_starts().is_empty());
+    }
 
     #[tokio::test]
     async fn qcelp_wav_feeder_delivers_rate_set_two_frames() {

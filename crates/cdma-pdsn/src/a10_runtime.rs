@@ -1,8 +1,9 @@
 //! PDSN side of the A10 bearer.
 //!
-//! One UDP-encapsulated GRE socket serves every PCF. Each session keeps its
-//! own return address: seeded from the A11 registration, then replaced by the
-//! source of the session's uplink packets whenever the two differ.
+//! One GRE socket serves every PCF, delivered either as raw IP protocol 47 or
+//! encapsulated in UDP. The GRE bytes are identical in both modes. Each session
+//! keeps its own return address: seeded from the A11 registration, then replaced
+//! by the source of the session's uplink packets whenever the two differ.
 
 use std::{
     collections::HashMap,
@@ -12,10 +13,82 @@ use std::{
 use cdma_common::error::Error;
 use log::{info, warn};
 
-const HRPD_BEARER_MAX_DATAGRAMS_PER_PASS: usize = 64;
-const HRPD_BEARER_EVENT_QUEUE_DEPTH: usize = 256;
+const A10_BEARER_MAX_DATAGRAMS_PER_PASS: usize = 64;
 
-enum HrpdPdsnA10Command {
+/// Raw GRE carries no ports, so a peer's port is meaningless there and is
+/// reported as zero. Everything above this only reads the peer's address.
+pub enum A10Bearer {
+    Udp(cdma_a8::TokioUdpGreEndpoint),
+    Raw(cdma_a8::TokioRawGreSocket),
+}
+
+impl A10Bearer {
+    /// `local_ipv4` is the bearer's own address, which raw GRE needs because
+    /// its config carries none.
+    pub fn bind(
+        config: cdma_a10::BearerTransportConfig,
+        local_ipv4: [u8; 4],
+        label: &str,
+    ) -> Result<Self, Error> {
+        match config.mode {
+            cdma_a10::BearerTransportMode::UdpEncapsulatedGre => {
+                let endpoint = cdma_a8::UdpGreEndpoint::bind_multi_peer(config, label)
+                    .map_err(|err| Error::from(format!("{label} bind failed: {err}")))?
+                    .into_tokio()
+                    .map_err(|err| Error::from(format!("{label} Tokio setup failed: {err}")))?;
+                Ok(Self::Udp(endpoint))
+            }
+            cdma_a10::BearerTransportMode::RawGre => {
+                let local = IpAddr::V4(std::net::Ipv4Addr::from(local_ipv4));
+                let socket = cdma_a8::TokioRawGreSocket::bind(local, label)
+                    .map_err(|err| Error::from(format!("{label} bind failed: {err}")))?;
+                Ok(Self::Raw(socket))
+            }
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Udp(_) => "udp_encapsulated_gre",
+            Self::Raw(_) => "raw_gre",
+        }
+    }
+
+    async fn readable(&self) -> std::io::Result<()> {
+        match self {
+            Self::Udp(endpoint) => endpoint.readable().await,
+            Self::Raw(socket) => socket.readable().await,
+        }
+    }
+
+    fn try_recv_wire(&self, buf: &mut [u8], label: &str) -> Option<(Vec<u8>, SocketAddr)> {
+        match self {
+            Self::Udp(endpoint) => recv_udp_gre_packet(endpoint, buf, label),
+            Self::Raw(socket) => match socket.try_recv_wire_packet(buf) {
+                Ok((wire, from)) => Some((wire, SocketAddr::new(from, 0))),
+                Err(cdma_a8::Error::RawTransport(err)) if is_recv_timeout(&err) => None,
+                Err(err) => {
+                    warn!("{label}: receive failed: {err}");
+                    None
+                }
+            },
+        }
+    }
+
+    async fn send_wire_to(
+        &self,
+        wire_bytes: &[u8],
+        peer: SocketAddr,
+    ) -> Result<usize, cdma_a8::Error> {
+        match self {
+            Self::Udp(endpoint) => endpoint.send_wire_packet_to(wire_bytes, peer).await,
+            Self::Raw(socket) => socket.send_wire_packet_to(peer.ip(), wire_bytes).await,
+        }
+    }
+}
+const A10_BEARER_EVENT_QUEUE_DEPTH: usize = 256;
+
+enum PdsnA10Command {
     Register {
         key: cdma_a11::SessionKey,
         bearer: cdma_a10::BearerSession,
@@ -28,7 +101,7 @@ enum HrpdPdsnA10Command {
     },
 }
 
-enum HrpdPdsnA10DownlinkEvent {
+enum PdsnA10DownlinkEvent {
     Payload {
         session_id: u32,
         registration_id: u64,
@@ -41,11 +114,11 @@ enum HrpdPdsnA10DownlinkEvent {
 }
 
 #[derive(Clone)]
-pub struct HrpdPdsnA10Runtime {
-    tx: tokio::sync::mpsc::UnboundedSender<HrpdPdsnA10Command>,
+pub struct PdsnA10Runtime {
+    tx: tokio::sync::mpsc::UnboundedSender<PdsnA10Command>,
 }
 
-impl HrpdPdsnA10Runtime {
+impl PdsnA10Runtime {
     /// Installs a session whose downlink goes to `peer` until an uplink packet
     /// arrives from somewhere else.
     pub fn register(
@@ -58,7 +131,7 @@ impl HrpdPdsnA10Runtime {
     ) {
         if self
             .tx
-            .send(HrpdPdsnA10Command::Register {
+            .send(PdsnA10Command::Register {
                 key,
                 bearer,
                 peer,
@@ -67,24 +140,26 @@ impl HrpdPdsnA10Runtime {
             })
             .is_err()
         {
-            warn!("HRPD PDSN A10 runtime stopped before session registration");
+            warn!("PDSN A10 runtime stopped before session registration");
         }
     }
 
     /// Removes a session and its learned return address.
     pub fn release(&self, key: cdma_a11::SessionKey) {
-        if self.tx.send(HrpdPdsnA10Command::Release { key }).is_err() {
-            warn!("HRPD PDSN A10 runtime stopped before session release");
+        if self.tx.send(PdsnA10Command::Release { key }).is_err() {
+            warn!("PDSN A10 runtime stopped before session release");
         }
     }
 }
 
-struct HrpdPdsnA10Session {
+struct PdsnA10Session {
     key: cdma_a11::SessionKey,
     registration_id: u64,
     /// Where this session's downlink is sent.
     peer: SocketAddr,
     uplink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    downlink_ready: bool,
+    logged_downlink_hold: bool,
 }
 
 /// Return address for a session that is being registered again.
@@ -92,7 +167,7 @@ struct HrpdPdsnA10Session {
 /// A refresh from the same PCF must not undo what its uplink packets taught
 /// us, so the learned address survives when the seed names the same host.
 fn peer_for_registration(
-    existing: Option<&HrpdPdsnA10Session>,
+    existing: Option<&PdsnA10Session>,
     key: cdma_a11::SessionKey,
     seed: SocketAddr,
 ) -> SocketAddr {
@@ -102,15 +177,15 @@ fn peer_for_registration(
     }
 }
 
-fn apply_hrpd_pdsn_a10_command(
-    command: HrpdPdsnA10Command,
+fn apply_pdsn_a10_command(
+    command: PdsnA10Command,
     table: &mut cdma_a10::BearerTable,
-    sessions: &mut HashMap<u32, HrpdPdsnA10Session>,
-    downlink_event_tx: &tokio::sync::mpsc::Sender<HrpdPdsnA10DownlinkEvent>,
+    sessions: &mut HashMap<u32, PdsnA10Session>,
+    downlink_event_tx: &tokio::sync::mpsc::Sender<PdsnA10DownlinkEvent>,
     next_registration_id: &mut u64,
 ) {
     match command {
-        HrpdPdsnA10Command::Register {
+        PdsnA10Command::Register {
             key,
             bearer,
             peer,
@@ -120,21 +195,27 @@ fn apply_hrpd_pdsn_a10_command(
             Ok(outcome) => {
                 let registration_id = *next_registration_id;
                 *next_registration_id = next_registration_id.wrapping_add(1);
-                let peer = peer_for_registration(sessions.get(&key.pcf_session_id), key, peer);
+                let existing = sessions.get(&key.pcf_session_id);
+                let peer = peer_for_registration(existing, key, peer);
+                let downlink_ready = existing
+                    .filter(|session| session.key == key)
+                    .is_some_and(|session| session.downlink_ready);
                 sessions.insert(
                     key.pcf_session_id,
-                    HrpdPdsnA10Session {
+                    PdsnA10Session {
                         key,
                         registration_id,
                         peer,
                         uplink_tx,
+                        downlink_ready,
+                        logged_downlink_hold: false,
                     },
                 );
                 let task_event_tx = downlink_event_tx.clone();
                 tokio::spawn(async move {
                     while let Some(payload) = downlink_rx.recv().await {
                         if task_event_tx
-                            .send(HrpdPdsnA10DownlinkEvent::Payload {
+                            .send(PdsnA10DownlinkEvent::Payload {
                                 session_id: key.pcf_session_id,
                                 registration_id,
                                 payload,
@@ -146,17 +227,17 @@ fn apply_hrpd_pdsn_a10_command(
                         }
                     }
                     let _ = task_event_tx
-                        .send(HrpdPdsnA10DownlinkEvent::Closed {
+                        .send(PdsnA10DownlinkEvent::Closed {
                             session_id: key.pcf_session_id,
                             registration_id,
                         })
                         .await;
                 });
-                info!("HRPD PDSN A10: registered key={key:?} peer={peer} outcome={outcome:?}");
+                info!("PDSN A10: registered key={key:?} peer={peer} outcome={outcome:?}");
             }
-            Err(err) => warn!("HRPD PDSN A10: failed to register key={key:?}: {err}"),
+            Err(err) => warn!("PDSN A10: failed to register key={key:?}: {err}"),
         },
-        HrpdPdsnA10Command::Release { key } => {
+        PdsnA10Command::Release { key } => {
             let is_registered = sessions
                 .get(&key.pcf_session_id)
                 .is_some_and(|session| session.key == key);
@@ -165,28 +246,38 @@ fn apply_hrpd_pdsn_a10_command(
             }
             sessions.remove(&key.pcf_session_id);
             table.remove_session_if_present(key.pcf_session_id);
-            info!("HRPD PDSN A10: released key={key:?}");
+            info!("PDSN A10: released key={key:?}");
         }
     }
 }
 
-async fn handle_hrpd_pdsn_a10_downlink_event(
-    event: HrpdPdsnA10DownlinkEvent,
-    bearer: &cdma_a8::TokioUdpGreEndpoint,
+async fn handle_pdsn_a10_downlink_event(
+    event: PdsnA10DownlinkEvent,
+    bearer: &A10Bearer,
     table: &mut cdma_a10::BearerTable,
-    sessions: &mut HashMap<u32, HrpdPdsnA10Session>,
+    sessions: &mut HashMap<u32, PdsnA10Session>,
     session_closed_tx: &tokio::sync::mpsc::UnboundedSender<cdma_a11::SessionKey>,
 ) {
     match event {
-        HrpdPdsnA10DownlinkEvent::Payload {
+        PdsnA10DownlinkEvent::Payload {
             session_id,
             registration_id,
             payload,
         } => {
-            let Some(session) = sessions.get(&session_id) else {
+            let Some(session) = sessions.get_mut(&session_id) else {
                 return;
             };
             if session.registration_id != registration_id {
+                return;
+            }
+            if !session.downlink_ready {
+                if !session.logged_downlink_hold {
+                    info!(
+                        "PDSN A10: holding downlink until first uplink key={:?}",
+                        session.key
+                    );
+                    session.logged_downlink_hold = true;
+                }
                 return;
             }
             let key = session.key;
@@ -194,15 +285,15 @@ async fn handle_hrpd_pdsn_a10_downlink_event(
             let outbound = match table.build_outbound_packet(session_id, payload) {
                 Ok(outbound) => outbound,
                 Err(err) => {
-                    warn!("HRPD PDSN A10: failed to encode downlink key={key:?}: {err}");
+                    warn!("PDSN A10: failed to encode downlink key={key:?}: {err}");
                     return;
                 }
             };
-            if let Err(err) = bearer.send_wire_packet_to(&outbound.wire_bytes, peer).await {
-                warn!("HRPD PDSN A10: send to {peer} failed key={key:?}: {err}");
+            if let Err(err) = bearer.send_wire_to(&outbound.wire_bytes, peer).await {
+                warn!("PDSN A10: send to {peer} failed key={key:?}: {err}");
             }
         }
-        HrpdPdsnA10DownlinkEvent::Closed {
+        PdsnA10DownlinkEvent::Closed {
             session_id,
             registration_id,
         } => {
@@ -216,12 +307,12 @@ async fn handle_hrpd_pdsn_a10_downlink_event(
                 return;
             };
             warn!(
-                "HRPD PDSN A10: packet session downlink closed key={:?}",
+                "PDSN A10: packet session downlink closed key={:?}",
                 session.key
             );
             if session_closed_tx.send(session.key).is_err() {
                 warn!(
-                    "HRPD PDSN A10: A11 close-notification receiver dropped key={:?}",
+                    "PDSN A10: A11 close-notification receiver dropped key={:?}",
                     session.key
                 );
             }
@@ -251,68 +342,72 @@ async fn deliver_uplink(
     from: SocketAddr,
     local_ipv4: [u8; 4],
     table: &mut cdma_a10::BearerTable,
-    sessions: &mut HashMap<u32, HrpdPdsnA10Session>,
+    sessions: &mut HashMap<u32, PdsnA10Session>,
 ) {
     let IpAddr::V4(from_ip) = from.ip() else {
-        warn!("HRPD PDSN A10: ignoring bearer packet from IPv6 source {from}");
+        warn!("PDSN A10: ignoring bearer packet from IPv6 source {from}");
         return;
     };
     let rx_endpoint = cdma_a10::BearerEndpoint::new(local_ipv4, from_ip.octets());
     let inbound = match decode_uplink(table, rx_endpoint, wire) {
         Ok(inbound) => inbound,
         Err(err) => {
-            warn!("HRPD PDSN A10: bearer packet from {from} rejected: {err}");
+            warn!("PDSN A10: bearer packet from {from} rejected: {err}");
             return;
         }
     };
     let Some(session) = sessions.get_mut(&inbound.session_id) else {
         warn!(
-            "HRPD PDSN A10: decoded packet for unknown session=0x{:08x}",
+            "PDSN A10: decoded packet for unknown session=0x{:08x}",
             inbound.session_id
         );
         return;
     };
     if session.peer != from {
         warn!(
-            "HRPD PDSN A10: return address for key={:?} changed from {} to {}",
+            "PDSN A10: return address for key={:?} changed from {} to {}",
             session.key, session.peer, from
         );
         session.peer = from;
     }
+    if !session.downlink_ready {
+        session.downlink_ready = true;
+        info!(
+            "PDSN A10: first uplink from {from}, enabling downlink key={:?}",
+            session.key
+        );
+    }
     let key = session.key;
     if session.uplink_tx.send(inbound.payload).await.is_err() {
-        warn!("HRPD PDSN A10: packet session uplink closed key={key:?}");
+        warn!("PDSN A10: packet session uplink closed key={key:?}");
     }
 }
 
 /// Starts the A10 bearer on `config`, which may omit `udp_peer_addr` because
 /// every session carries its own PCF address. `local_ipv4` is the bearer's own
 /// address as sessions are bound to it.
-pub fn spawn_hrpd_pdsn_a10_runtime(
+pub fn spawn_pdsn_a10_runtime(
     config: cdma_a10::BearerTransportConfig,
     local_ipv4: [u8; 4],
     session_closed_tx: tokio::sync::mpsc::UnboundedSender<cdma_a11::SessionKey>,
-) -> Result<HrpdPdsnA10Runtime, Error> {
-    let bearer = cdma_a8::UdpGreEndpoint::bind_multi_peer(config, "pdsn.a10_bearer")
-        .map_err(|err| Error::from(format!("HRPD PDSN A10 bind failed: {err}")))?
-        .into_tokio()
-        .map_err(|err| Error::from(format!("HRPD PDSN A10 Tokio setup failed: {err}")))?;
+) -> Result<PdsnA10Runtime, Error> {
+    let bearer = A10Bearer::bind(config, local_ipv4, "pdsn.a10_bearer")?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut table = cdma_a10::BearerTable::new();
-        let mut sessions: HashMap<u32, HrpdPdsnA10Session> = HashMap::new();
+        let mut sessions: HashMap<u32, PdsnA10Session> = HashMap::new();
         let (downlink_event_tx, mut downlink_event_rx) =
-            tokio::sync::mpsc::channel(HRPD_BEARER_EVENT_QUEUE_DEPTH);
+            tokio::sync::mpsc::channel(A10_BEARER_EVENT_QUEUE_DEPTH);
         let mut next_registration_id = 0u64;
         let mut pending_command = None;
         let mut pending_downlink_event = None;
         let mut buf = vec![0u8; 8192];
-        info!("HRPD PDSN A10 bearer listener started");
+        info!("PDSN A10 bearer listener started mode={}", bearer.mode());
         loop {
             let mut pass_active = false;
             while let Some(command) = pending_command.take().or_else(|| rx.try_recv().ok()) {
                 pass_active = true;
-                apply_hrpd_pdsn_a10_command(
+                apply_pdsn_a10_command(
                     command,
                     &mut table,
                     &mut sessions,
@@ -321,16 +416,15 @@ pub fn spawn_hrpd_pdsn_a10_runtime(
                 );
             }
 
-            for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
-                let Some((wire, from)) = recv_udp_gre_packet(&bearer, &mut buf, "HRPD PDSN A10")
-                else {
+            for _ in 0..A10_BEARER_MAX_DATAGRAMS_PER_PASS {
+                let Some((wire, from)) = bearer.try_recv_wire(&mut buf, "PDSN A10") else {
                     break;
                 };
                 pass_active = true;
                 deliver_uplink(&wire, from, local_ipv4, &mut table, &mut sessions).await;
             }
 
-            for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
+            for _ in 0..A10_BEARER_MAX_DATAGRAMS_PER_PASS {
                 let event = pending_downlink_event
                     .take()
                     .or_else(|| downlink_event_rx.try_recv().ok());
@@ -338,7 +432,7 @@ pub fn spawn_hrpd_pdsn_a10_runtime(
                     break;
                 };
                 pass_active = true;
-                handle_hrpd_pdsn_a10_downlink_event(
+                handle_pdsn_a10_downlink_event(
                     event,
                     &bearer,
                     &mut table,
@@ -354,7 +448,7 @@ pub fn spawn_hrpd_pdsn_a10_runtime(
             tokio::select! {
                 command = rx.recv() => {
                     let Some(command) = command else {
-                        info!("HRPD PDSN A10 bearer listener stopped");
+                        info!("PDSN A10 bearer listener stopped");
                         return;
                     };
                     pending_command = Some(command);
@@ -364,14 +458,14 @@ pub fn spawn_hrpd_pdsn_a10_runtime(
                 }
                 result = bearer.readable() => {
                     if let Err(err) = result {
-                        warn!("HRPD PDSN A10 readiness failed: {err}");
+                        warn!("PDSN A10 readiness failed: {err}");
                         return;
                     }
                 }
             }
         }
     });
-    Ok(HrpdPdsnA10Runtime { tx })
+    Ok(PdsnA10Runtime { tx })
 }
 
 fn recv_udp_gre_packet(
@@ -449,7 +543,7 @@ mod tests {
     }
 
     fn register_session(
-        runtime: &HrpdPdsnA10Runtime,
+        runtime: &PdsnA10Runtime,
         pcf_session_id: u32,
         peer: SocketAddr,
     ) -> TestSession {
@@ -511,7 +605,7 @@ mod tests {
             mn_session_reference_id: 7,
         };
         let (session_closed_tx, mut session_closed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = spawn_hrpd_pdsn_a10_runtime(
+        let runtime = spawn_pdsn_a10_runtime(
             cdma_a10::BearerTransportConfig::udp_encapsulated_gre(pdsn_addr, peer_addr),
             LOOPBACK,
             session_closed_tx,
@@ -534,16 +628,16 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        downlink_tx.send(vec![0xde, 0xad]).await.unwrap();
-        let (packet, _) = tokio::time::timeout(RECV_TIMEOUT, async {
-            let mut buf = [0_u8; 128];
-            peer.recv_gre_packet(&mut buf).await
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(packet.key, Some(key.pcf_session_id));
-        assert_eq!(packet.payload, [0xde, 0xad]);
+        downlink_tx.send(vec![0xaa]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), async {
+                let mut buf = [0_u8; 128];
+                peer.recv_gre_packet(&mut buf).await
+            })
+            .await
+            .is_err(),
+            "downlink GRE must wait for the first uplink"
+        );
 
         peer.send_gre_packet(&cdma_a8::GrePacket::octet_stream(
             key.pcf_session_id,
@@ -560,6 +654,17 @@ mod tests {
             [0xbe, 0xef]
         );
 
+        downlink_tx.send(vec![0xde, 0xad]).await.unwrap();
+        let (packet, _) = tokio::time::timeout(RECV_TIMEOUT, async {
+            let mut buf = [0_u8; 128];
+            peer.recv_gre_packet(&mut buf).await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(packet.key, Some(key.pcf_session_id));
+        assert_eq!(packet.payload, [0xde, 0xad]);
+
         drop(downlink_tx);
         assert_eq!(
             tokio::time::timeout(RECV_TIMEOUT, session_closed_rx.recv())
@@ -571,17 +676,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a10_downlink_reaches_each_sessions_own_pcf_before_any_uplink() {
+    async fn a10_downlink_reaches_each_sessions_own_pcf() {
         let pdsn_addr = free_udp_addr();
         let pcf_a = TestPcf::new(pdsn_addr);
         let pcf_b = TestPcf::new(pdsn_addr);
         let (session_closed_tx, _session_closed_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
-            spawn_hrpd_pdsn_a10_runtime(multi_peer_config(pdsn_addr), LOOPBACK, session_closed_tx)
+            spawn_pdsn_a10_runtime(multi_peer_config(pdsn_addr), LOOPBACK, session_closed_tx)
                 .unwrap();
-        let session_a = register_session(&runtime, 0xa, pcf_a.addr);
-        let session_b = register_session(&runtime, 0xb, pcf_b.addr);
+        let mut session_a = register_session(&runtime, 0xa, pcf_a.addr);
+        let mut session_b = register_session(&runtime, 0xb, pcf_b.addr);
         tokio::time::sleep(Duration::from_millis(10)).await;
+
+        pcf_a
+            .send_uplink(session_a.key.pcf_session_id, [0x01])
+            .await;
+        pcf_b
+            .send_uplink(session_b.key.pcf_session_id, [0x02])
+            .await;
+        assert_eq!(recv_uplink(&mut session_a).await.unwrap(), [0x01]);
+        assert_eq!(recv_uplink(&mut session_b).await.unwrap(), [0x02]);
 
         session_a.downlink_tx.send(vec![0xaa]).await.unwrap();
         session_b.downlink_tx.send(vec![0xbb]).await.unwrap();
@@ -609,7 +723,7 @@ mod tests {
         let stale_seed = free_udp_addr();
         let (session_closed_tx, _session_closed_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
-            spawn_hrpd_pdsn_a10_runtime(multi_peer_config(pdsn_addr), LOOPBACK, session_closed_tx)
+            spawn_pdsn_a10_runtime(multi_peer_config(pdsn_addr), LOOPBACK, session_closed_tx)
                 .unwrap();
         let mut session = register_session(&runtime, 0x1, stale_seed);
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -640,10 +754,12 @@ mod tests {
         let pcf = TestPcf::new(pdsn_addr);
         let (session_closed_tx, mut session_closed_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime =
-            spawn_hrpd_pdsn_a10_runtime(multi_peer_config(pdsn_addr), LOOPBACK, session_closed_tx)
+            spawn_pdsn_a10_runtime(multi_peer_config(pdsn_addr), LOOPBACK, session_closed_tx)
                 .unwrap();
         let mut session = register_session(&runtime, 0x1, pcf.addr);
         tokio::time::sleep(Duration::from_millis(10)).await;
+        pcf.send_uplink(session.key.pcf_session_id, [0x00]).await;
+        assert_eq!(recv_uplink(&mut session).await.unwrap(), [0x00]);
         session.downlink_tx.send(vec![0x01]).await.unwrap();
         assert!(pcf.recv().await.is_some());
 

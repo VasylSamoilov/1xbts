@@ -45,8 +45,8 @@ interface PacketSessionInfo {
   phoneNumber: string;
   imsi: string;
   meid: string;
-  hrpdMnId: string;
-  hrpdMnIdSource: string;
+  mnId: string;
+  mnIdSource: string;
   subscriberImsi: string;
   esn: number;
   trafficWalshCode: number;
@@ -122,9 +122,8 @@ function HrpdSessionsView() {
     };
   }, [carrierAddressed, carrierCell, baseStation]);
 
-  // The AN only answers for a cell with EV-DO enabled, so hold the poll until
-  // the carrier config confirms it. Polling a 1x-only cell only yields a
-  // connection error.
+  // The AN only answers for an EV-DO-enabled cell, so hold the poll until the
+  // carrier config confirms it — a 1x-only cell just yields a connection error.
   useEffect(() => {
     if (!evdo) return;
     let cancelled = false;

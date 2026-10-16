@@ -6,8 +6,6 @@ import "google/protobuf/empty.proto";
 
 // BSC management API for radio-access state, events, and operator controls.
 service BscManagementService {
-  // Returns current BSC/BTS serving status.
-  rpc GetBscStatus(google.protobuf.Empty) returns (bsc.v1.SystemStatus);
   // Lists mobiles known to the BSC mobility table.
   rpc ListMobiles(google.protobuf.Empty) returns (bsc.v1.MobileList);
   // Lists configured and allocated radio channels.

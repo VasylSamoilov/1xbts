@@ -1,0 +1,38 @@
+{
+  "sites": {
+    "home": {
+      "feid": "0005B9AABBCC",
+      "profile": "airave-25-2x",
+      "name": "Home femtocell",
+      "cell": {
+        "mcc": "310",
+        "imsi_11_12": "00",
+        "cell_id": 403,
+        "sector": 0
+      },
+      "1x": {
+        "enabled": false,
+        "sid": 22,
+        "nid": 65535,
+        "band_class": 1,
+        "channel": 50,
+        "pn_offset": 0,
+        "max_sector_power_dbm": -30
+      },
+      "evdo": {
+        "enabled": false
+      },
+      "acs": {
+        "password": "<device provisioning password>"
+      },
+      "sip": {
+        "password": "<device SIP password>"
+      },
+      "segw": {
+        "security_profile": "legacy",
+        "ike_group_key": "<device IKE group key>",
+        "eap_password": "<device EAP password>"
+      }
+    }
+  }
+}

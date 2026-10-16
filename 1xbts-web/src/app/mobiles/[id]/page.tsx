@@ -9,6 +9,8 @@ import { RecentOtaspCard } from "@/components/recent-otasp-card";
 import { TimeSeriesChart, type Series } from "@/components/time-series-chart";
 import { esnManufacturer } from "@/lib/esn-manufacturer";
 import {
+  A1Detail,
+  LaneBadge,
   AccessDetail,
   HrpdAccessDetail,
   HrpdSessionDetail,
@@ -35,6 +37,14 @@ import {
 import { useEventStream } from "@/lib/use-event-stream";
 import { hrpdTimestampNsToUs } from "@/lib/hrpd-correlation";
 import { type LogEntry, makeLogEntryId, makeSortKey, sortLogEntries, formatTime } from "@/lib/message-log";
+import {
+  a1DirectionClass,
+  a1DirectionLabel,
+  a1TimestampUs,
+  a1TypeName,
+  formatA1Summary,
+  type A1LogEvent,
+} from "@/lib/a1-event";
 import { cellLabel, cellToken, peerIdForCell } from "@/lib/cell";
 import { useBtsList } from "@/lib/use-bts-list";
 import { formatEsn, formatMeid } from "@/lib/format";
@@ -128,8 +138,8 @@ interface PacketSessionInfo {
   phoneNumber: string;
   imsi: string;
   meid: string;
-  hrpdMnId: string;
-  hrpdMnIdSource: string;
+  mnId: string;
+  mnIdSource: string;
   subscriberImsi: string;
   esn: number;
   trafficWalshCode: number;
@@ -257,6 +267,19 @@ function hrpdMatchesMobile(
   if (mobile.imsi && enriched.identity?.imsi === mobile.imsi) return true;
   if (mobile.esn != null && enriched.identity?.esn === mobile.esn) return true;
   if (mobile.meid && enriched.identity?.meid?.toLowerCase() === mobile.meid.toLowerCase()) return true;
+  return false;
+}
+
+// An A1 message matches this mobile by the bus-resolved subscriber or its Mobile
+// Identity IEs — there's no air-interface address or Walsh code to fall back on.
+function a1MatchesMobile(event: A1LogEvent, mobile: MobileInfo): boolean {
+  if (mobile.subscriberId && event.subscriber?.subscriberId === mobile.subscriberId) return true;
+  const imsi = event.identity?.imsi || event.mobileIdentity?.imsi;
+  const esn = event.identity?.esn || event.mobileIdentity?.esn;
+  const meid = event.identity?.meid || event.mobileIdentity?.meid;
+  if (mobile.imsi && imsi === mobile.imsi) return true;
+  if (mobile.esn != null && esn === mobile.esn) return true;
+  if (mobile.meid && meid?.toLowerCase() === mobile.meid.toLowerCase()) return true;
   return false;
 }
 
@@ -588,6 +611,23 @@ export default function MobileDetailPage({
     });
   }, [addMessage, mobile]));
 
+  useEventStream("a1", useCallback((data: string) => {
+    if (!mobile) return;
+    const event: A1LogEvent = JSON.parse(data);
+    if (!a1MatchesMobile(event, mobile)) return;
+    const ts = a1TimestampUs(event);
+    const identity = `a1:${event.eventId || `${event.messageTypeValue}:${event.sduHex}:${ts}`}`;
+    addMessage({
+      kind: "a1",
+      id: makeLogEntryId("a1", ts),
+      ts,
+      identity,
+      sortKey: makeSortKey(event.eventId, identity),
+      event,
+      seenCount: 1,
+    });
+  }, [addMessage, mobile]));
+
   const sendSms = async () => {
     if (!smsText.trim()) return;
     setSmsSending(true);
@@ -680,9 +720,8 @@ export default function MobileDetailPage({
 
   const applyPowerOverride = useCallback(async (payload: { targetDb?: number; clear?: boolean }) => {
     if (mobile?.trafficWalshCode == null) return;
-    // A mobile the BSC has not bound to a cell — an unregistered one, or one
-    // synthesized from an HRPD session — leaves the cell unnamed, so the BSC
-    // resolves it the way it resolves any unaddressed request.
+    // A mobile not bound to a cell (unregistered, or synthesized from an HRPD
+    // session) leaves the cell unnamed, so the BSC resolves it as an unaddressed request.
     const cell = cellToken(mobile.servingCell);
 
     setPowerOverridePending(true);
@@ -774,7 +813,7 @@ export default function MobileDetailPage({
     trafficPower?.reverseRadioConfig,
   );
   const isRc3 = trafficPower?.reverseRadioConfig === 3;
-  // Inner-loop metric: pilot SINR (RC3) or Eb/Nt (RC1/RC2); falls back to frame snapshot.
+  // Inner-loop metric: pilot SINR (RC3) or Eb/Nt (RC1/RC2). Falls back to frame snapshot.
   const pilotArr = trafficPower?.lastPcgPilotEcNtDb ?? [];
   const innerLoopPcgDb =
     pilotArr.length > 0
@@ -1554,6 +1593,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
+                        <LaneBadge lane="L3" />
                         <span className="text-accent-blue font-mono text-xs w-12 shrink-0">1x TX</span>
                         <span className="text-dimmed text-xs shrink-0">F-PCH</span>
                         <span className="text-primary shrink-0">{typeName}</span>
@@ -1567,7 +1607,7 @@ export default function MobileDetailPage({
                       <div className="shrink-0 flex items-center gap-1">
                         <span className="text-accent-amber text-xs font-mono w-14 text-right">{h ? `SEQ=${h.msgSeq}` : ""}</span>
                         <span className="text-accent-green text-xs font-mono w-14 text-right">{h?.validAck ? `ACK=${h.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "\u21A9" : ""}</span>
+                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "↩" : ""}</span>
                         <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
                       </div>
                     </div>
@@ -1596,6 +1636,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
+                        <LaneBadge lane="L3" />
                         <span className="text-accent-cyan font-mono text-xs w-12 shrink-0">1x TX</span>
                         <span className="text-dimmed text-xs shrink-0">{formatTrafficChannel(entry.event)}</span>
                         <span className="text-primary shrink-0">{typeName}</span>
@@ -1609,7 +1650,7 @@ export default function MobileDetailPage({
                       <div className="shrink-0 flex items-center gap-1">
                         <span className="text-accent-amber text-xs font-mono w-14 text-right">{h ? `SEQ=${h.msgSeq}` : ""}</span>
                         <span className="text-accent-green text-xs font-mono w-14 text-right">{h?.validAck ? `ACK=${h.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "\u21A9" : ""}</span>
+                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{h?.ackReq ? "↩" : ""}</span>
                         <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
                       </div>
                     </div>
@@ -1651,6 +1692,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
+                        <LaneBadge lane="L3" />
                         <span className={`${"direction" in entry.event ? hrpdDirectionClass(entry.event.direction) : hrpdDirectionClass()} font-mono text-xs w-16 shrink-0`}>
                           {"direction" in entry.event ? hrpdDirectionLabel(entry.event.direction) : "EVDO"}
                         </span>
@@ -1669,6 +1711,43 @@ export default function MobileDetailPage({
                     )}
                   </div>
                 );
+              } else if (entry.kind === "a1") {
+                const ev = entry.event;
+                return (
+                  <div
+                    key={entry.id}
+                    className="border-b border-border-subtle py-1.5 px-2 -mx-2 rounded"
+                  >
+                    <div
+                      className="flex items-center gap-2 text-sm cursor-pointer hover:bg-hover rounded"
+                      onClick={() => toggleExpand(entry.id)}
+                    >
+                      <div className="flex-1 min-w-0 flex items-center gap-2">
+                        <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
+                        <LaneBadge lane="A1" />
+                        <span className={`${a1DirectionClass(ev.direction)} font-mono text-xs w-12 shrink-0`}>
+                          {a1DirectionLabel(ev.direction)}
+                        </span>
+                        <span className="text-primary shrink-0">{a1TypeName(ev)}</span>
+                        {entry.seenCount > 1 && (
+                          <span className="text-muted text-xs shrink-0">x{entry.seenCount}</span>
+                        )}
+                        <span className="text-muted text-xs truncate">{formatA1Summary(ev)}</span>
+                      </div>
+                      <div className="shrink-0 flex items-center gap-1">
+                        <span className="text-accent-amber text-xs font-mono w-20 text-right">
+                          {ev.sduLengthBytes ? `${ev.sduLengthBytes}B` : ""}
+                        </span>
+                        <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
+                      </div>
+                    </div>
+                    {isExpanded && (
+                      <div className="mt-1.5 ml-8 pb-1">
+                        <A1Detail event={ev} cells={cells} />
+                      </div>
+                    )}
+                  </div>
+                );
               } else {
                 const ev = entry.event;
                 return (
@@ -1682,6 +1761,7 @@ export default function MobileDetailPage({
                     >
                       <div className="flex-1 min-w-0 flex items-center gap-2">
                         <span className="text-muted font-mono text-xs w-[15rem] shrink-0">{formatTime(entry.ts)}</span>
+                        <LaneBadge lane="L3" />
                         <span className="text-accent-green font-mono text-xs w-12 shrink-0">1x RX</span>
                         <span className="text-dimmed text-xs shrink-0">{formatAccessChannel(ev)}</span>
                         <span className="text-primary shrink-0">{ev.msgTypeName}</span>
@@ -1693,7 +1773,7 @@ export default function MobileDetailPage({
                       <div className="shrink-0 flex items-center gap-1">
                         <span className="text-accent-amber text-xs font-mono w-14 text-right">{ev.msgSeq != null ? `SEQ=${ev.msgSeq}` : ""}</span>
                         <span className="text-accent-green text-xs font-mono w-14 text-right">{ev.validAck && ev.ackSeq != null ? `ACK=${ev.ackSeq}` : ""}</span>
-                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{ev.ackReq ? "\u21A9" : ""}</span>
+                        <span className="text-badge-orange-text text-xs w-4 text-center" title="ACK required">{ev.ackReq ? "↩" : ""}</span>
                         <span className="text-dimmed text-xs">{isExpanded ? "▾" : "▸"}</span>
                       </div>
                     </div>

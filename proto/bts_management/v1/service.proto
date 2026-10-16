@@ -17,8 +17,8 @@ service BtsManagementService {
   // Lists the cells reachable through this endpoint. A BTS reports the single
   // cell it operates. A BSC reports every enrolled cell.
   rpc ListBts(google.protobuf.Empty) returns (BtsList);
-  // Returns BTS runtime status and configured identity.
-  rpc GetBtsStatus(CellRequest) returns (bsc.v1.SystemStatus);
+  // Confirms that the selected BTS operations endpoint is responsive.
+  rpc CheckHealth(CellRequest) returns (google.protobuf.Empty);
   // Returns the active BTS radio and overhead configuration.
   rpc GetBtsConfig(CellRequest) returns (bsc.v1.BtsConfig);
   // Returns the latest TX/RX/bearer radio metrics snapshot.
@@ -125,6 +125,26 @@ message BtsSummary {
   // on. The management front door reads HRPD sessions from here. Absent when
   // the cell runs no EV-DO carrier.
   optional string an_grpc_addr = 14;
+  CellKind kind = 15;
+  // Operator-assigned name for this cell.
+  optional string name = 16;
+  repeated CellCapability capabilities = 17;
+  // Software or firmware version reported by the managed base station.
+  optional string software_version = 18;
+}
+
+enum CellKind {
+  CELL_KIND_UNSPECIFIED = 0;
+  CELL_KIND_SDR = 1;
+  CELL_KIND_FEMTOCELL = 2;
+}
+
+enum CellCapability {
+  CELL_CAPABILITY_UNSPECIFIED = 0;
+  CELL_CAPABILITY_RADIO_METRICS = 1;
+  CELL_CAPABILITY_IQ_CAPTURE = 2;
+  CELL_CAPABILITY_POWER_CONTROL = 3;
+  CELL_CAPABILITY_FEMTO_MANAGEMENT = 4;
 }
 
 // Cells reachable through this endpoint.

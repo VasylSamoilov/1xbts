@@ -1,11 +1,13 @@
 use cdma_a11::{
     A11SecurityAssociation, A11SecurityConfig, A11TransportConfig, AuthenticationExtension,
-    AuthenticationExtensionType, CapabilitiesInfo, CapabilitiesInfoAcknowledge, Error, Extension,
-    Message, Nvse, PcfEnabledFeatureNvse, PdsnEnabledFeatureNvse, RawExtension,
-    RegistrationAcknowledge, RegistrationReply, RegistrationRequest, RegistrationUpdate,
-    SessionParameterNvse, SessionSpecificExtension, SessionUpdate, SessionUpdateAcknowledge,
-    UnknownNvse, UnverifiedDecodeReason, decode_unverified, decode_verified, encode,
+    AuthenticationExtensionType, CapabilitiesInfo, CapabilitiesInfoAcknowledge,
+    CriticalVendorExtension, Error, Extension, Message, Nvse, PcfEnabledFeatureNvse,
+    PdsnEnabledFeatureNvse, RawExtension, RegistrationAcknowledge, RegistrationReply,
+    RegistrationRequest, RegistrationUpdate, SessionParameterNvse, SessionSpecificExtension,
+    SessionUpdate, SessionUpdateAcknowledge, UnknownNvse, UnverifiedDecodeReason,
+    decode_unverified, decode_verified, encode,
 };
+use md5::{Digest, Md5};
 
 #[test]
 fn a11_transport_config_allows_unprivileged_ports() {
@@ -78,6 +80,32 @@ fn sample_registration_request() -> Message {
     })
 }
 
+#[test]
+fn registration_request_preserves_critical_vendor_extension() {
+    let mut message = sample_registration_request();
+    let Message::RegistrationRequest(request) = &mut message else {
+        unreachable!();
+    };
+    request.extensions.insert(
+        0,
+        Extension::CriticalVendor(CriticalVendorExtension {
+            reserved: 0,
+            value: vec![0x00, 0x00, 0x15, 0x9f, 0x01, 0x02, 0x03],
+        }),
+    );
+
+    let wire = encode(&message).unwrap();
+    assert_eq!(
+        decode_unverified(&wire, UnverifiedDecodeReason::TestFixture).unwrap(),
+        message
+    );
+    let cvse_offset = wire
+        .iter()
+        .position(|byte| *byte == CriticalVendorExtension::TYPE)
+        .unwrap();
+    assert_eq!(&wire[cvse_offset..cvse_offset + 4], &[0x26, 0, 0, 7]);
+}
+
 fn test_security() -> A11SecurityAssociation {
     A11SecurityAssociation::from_config(&A11SecurityConfig {
         spi: 0x1234,
@@ -104,6 +132,55 @@ fn security_association_signs_and_verifies_registration_request() {
     };
     assert_eq!(auth.security_parameter_index, security.spi());
     assert_ne!(auth.authenticator, vec![0; 16]);
+}
+
+#[test]
+fn authentication_omits_the_authenticator_field_instead_of_hashing_zeroes() {
+    let security = test_security();
+    let mut message = sample_registration_request();
+
+    security.sign_message(&mut message).unwrap();
+    let signed_wire = encode(&message).unwrap();
+    let Message::RegistrationRequest(request) = &message else {
+        panic!("expected registration request");
+    };
+    let Some(Extension::Authentication(authentication)) = request.extensions.last() else {
+        panic!("expected authentication extension");
+    };
+
+    let mut zeroed_wire = signed_wire.clone();
+    let authenticator_start = zeroed_wire.len() - authentication.authenticator.len();
+    zeroed_wire[authenticator_start..].fill(0);
+    let secret = b"spec-a11-secret";
+    let mut zeroed_field_md5 = Md5::new();
+    zeroed_field_md5.update(secret);
+    zeroed_field_md5.update(&zeroed_wire);
+    zeroed_field_md5.update(secret);
+
+    assert_ne!(
+        authentication.authenticator.as_slice(),
+        zeroed_field_md5.finalize().as_slice()
+    );
+}
+
+#[test]
+fn security_association_signs_and_verifies_registration_update() {
+    let security = test_security();
+    let mut message = Message::RegistrationUpdate(RegistrationUpdate {
+        reserved: [0, 0, 0],
+        home_address: [0, 0, 0, 0],
+        home_agent: [10, 0, 0, 1],
+        identification: 0x2122_2324_2526_2728,
+        session: session(),
+        nvses: vec![Nvse::PdsnCode(0xcb)],
+        authentication_extension: update_authentication_extension(),
+    });
+
+    security.sign_message(&mut message).unwrap();
+    let encoded = encode(&message).unwrap();
+    let verified = decode_verified(&encoded, &security).unwrap();
+
+    assert_eq!(verified.message(), &message);
 }
 
 #[test]

@@ -29,7 +29,7 @@ use cdma_common::hrpd::air as hrpd_air;
 #[cfg(test)]
 use cdma_pcf::spawn_hrpd_pcf_a9_service;
 #[cfg(test)]
-use cdma_pdsn::spawn_hrpd_pdsn_a11_service;
+use cdma_pdsn::spawn_pdsn_a11_service;
 use log::{error, info, warn};
 use tokio::sync::Mutex;
 
@@ -2319,12 +2319,15 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap(),
             ),
             a11_security: test_a11_security_config(),
+            a11_peers: Vec::new(),
             packet,
             ppp_session_timeout_secs: 1_800,
             events_endpoint: None,
+            a12: Default::default(),
+            hlr_endpoint: None,
         };
         let packet_service = cdma_pdsn::build_packet_service_with_sink(&pdsn_config, None).unwrap();
-        let pdsn_a11_addr = spawn_hrpd_pdsn_a11_service(pdsn_config, packet_service)
+        let pdsn_a11_addr = spawn_pdsn_a11_service(pdsn_config, packet_service)
             .await
             .unwrap();
 

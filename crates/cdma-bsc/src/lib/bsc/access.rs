@@ -306,7 +306,12 @@ impl AccessService {
         // contact, not just on explicit Registration Messages. The MSC
         // only sends welcome SMS on `is_new || elapsed > threshold`, so this
         // does not multiply welcome traffic.
-        bsc.notify_msc_registration(&outcome.fwd_address, registration_imsi, event.esn);
+        bsc.notify_msc_registration(
+            &outcome.fwd_address,
+            registration_imsi,
+            event.esn,
+            event.meid.clone(),
+        );
         outcome.fwd_address
     }
 
@@ -1390,8 +1395,9 @@ impl Bsc {
         fwd_address: &MsAddress,
         registration_imsi: Option<String>,
         event_esn: Option<u32>,
+        event_meid: Option<String>,
     ) {
-        // ESN-only mobiles carry it in fwd_address; IMSI+ESN class-0 mobiles
+        // ESN-only mobiles carry it in fwd_address. IMSI+ESN class-0 mobiles
         // carry it in the access PDU addressing fields.
         let esn_val = event_esn.or(match fwd_address {
             MsAddress::Esn(e) => Some(*e),
@@ -1414,6 +1420,9 @@ impl Bsc {
                 classmark_information_type_2: None,
                 registration_type: None,
                 mobile_identity_esn: esn_val.map(cdma_ios::MobileIdentity::Esn),
+                mobile_identity_meid: event_meid
+                    .as_deref()
+                    .and_then(super::a1::meid_identity_from_hex),
                 slot_cycle_index: None,
                 authentication_response_parameter: None,
                 authentication_confirmation_parameter: None,

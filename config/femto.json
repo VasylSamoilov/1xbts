@@ -1,0 +1,871 @@
+{
+  "home_domain": "femto.local.1xbts.org",
+  "event_bus_addr": "http://host.docker.internal:17023",
+  "segw": {
+    "profile_default": "legacy",
+    "listen": "0.0.0.0:500",
+    "swanctl_dir": "/etc/1xbts/swanctl",
+    "vip_subnet": "10.55.100.0/24",
+    "vip_dns": "10.56.0.2",
+    "ike_identity_domain": "femto.sprint.net"
+  },
+  "acs": {
+    "background_sync": {
+      "enabled": true,
+      "interval_seconds": 1800,
+      "per_fap_timeout_seconds": 60,
+      "startup_delay_seconds": 3
+    },
+    "listen": "0.0.0.0:7003",
+    "realm": "1xbts-acs",
+    "require_site_approval": true,
+    "reboot": false
+  },
+  "sip": {
+    "listen": "10.56.0.2:5060",
+    "realm": "fap.airave2.ims.spcsdns.net",
+    "allow_unauthenticated": false
+  },
+  "aaa": {
+    "enabled": false,
+    "listen": "10.56.0.2:1812",
+    "radius_secret": "",
+    "accept_unverified_chap": false,
+    "subscribers": []
+  },
+  "fcs": {
+    "msc_a1_addr": null,
+    "a1_listen": "0.0.0.0:17013",
+    "a1_advertise_addr": "172.31.0.2:17013",
+    "node_id": "femto-fcs-1",
+    "management_listen": "0.0.0.0:17024",
+    "cell_id": 403,
+    "sector": 0,
+    "mcc": "310",
+    "imsi_11_12": "00",
+    "rtp_bind_ip": "10.56.0.2",
+    "rtp_port_start": 18000,
+    "rtp_port_end": 18199
+  },
+  "packet": {
+    "adapter": "external_pdsn"
+  },
+  "fap_profiles": {
+    "standard-xs0059": {
+      "implementation": "standard_xs0059"
+    },
+    "airave-25-2x": {
+      "implementation": "airvana_airave2",
+      "acs": {
+        "ensure_objects": [
+          {
+            "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.",
+            "next_level": true,
+            "required_instance": 1,
+            "existence_probe_leaf": "Impi"
+          }
+        ],
+        "stages": [
+          {
+            "label": "lock-onex",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.AdminState",
+                "value": "lock",
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "lock-sector",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorAdminState",
+                "value": "lock",
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "configure-iwf-user",
+            "atomic": true,
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.Impi",
+                "value_from": {
+                  "context": "feid"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.Impu",
+                "value_from": {
+                  "context": "feid"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.SipPassword",
+                "value_from": {
+                  "context": "site_sip_password"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.SipUsrId",
+                "value": "1",
+                "xsd_type": "xsd:unsignedInt",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "configure-all",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.OutGoingProxyUri",
+                "value": "sip:10.56.0.2:5060",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorBandClass",
+                "value_from": {
+                  "context": "site_band_class"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorChannelFreq",
+                "value_from": {
+                  "context": "site_cdma_channel"
+                },
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorPNOffset",
+                "xsd_type": "xsd:int",
+                "verify": true,
+                "value_from": {
+                  "context": "site_pn_offset"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.MaxSectorPowerIndBm",
+                "xsd_type": "xsd:int",
+                "verify": true,
+                "value_from": {
+                  "context": "site_max_sector_power_dbm"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorSID",
+                "value_from": {
+                  "context": "site_sid"
+                },
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorNID",
+                "value_from": {
+                  "context": "site_nid"
+                },
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLatitude",
+                "value_from": {
+                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "transform": "gps_degrees_minutes_to_decimal_degrees"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLongitude",
+                "value_from": {
+                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "transform": "gps_degrees_minutes_to_decimal_degrees"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.MSCId",
+                "value": "1061123",
+                "xsd_type": "xsd:unsignedInt",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.CSRVUri",
+                "value": "sip:fap.airave2.ims.spcsdns.net",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpiRealm",
+                "value": "fap.airave2.ims.spcsdns.net",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpuDomain",
+                "value": "fap.airave2.ims.spcsdns.net",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.DefaultImpi",
+                "value_from": {
+                  "context": "feid"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.DefaultImpu",
+                "value_from": {
+                  "context": "feid"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.DefaultSipPassword",
+                "xsd_type": "xsd:string",
+                "verify": true,
+                "value_from": {
+                  "context": "site_sip_password"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIWFParamMO.LocationString",
+                "value_from": {
+                  "context": "site_location_string"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.LocalTimeZone",
+                "value_from": {
+                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "transform": "gps_longitude_to_timezone"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "unlock",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.AdminState",
+                "xsd_type": "xsd:string",
+                "verify": true,
+                "value_from": {
+                  "context": "site_onex_admin_state"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorAdminState",
+                "xsd_type": "xsd:string",
+                "verify": true,
+                "value_from": {
+                  "context": "site_onex_admin_state"
+                }
+              }
+            ]
+          }
+        ],
+        "discovery_query": [
+          {
+            "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",
+            "next_level": false
+          },
+          {
+            "name": "InternetGatewayDevice.X_0005B9_aGPSConfig.",
+            "next_level": false
+          },
+          {
+            "name": "InternetGatewayDevice.DeviceInfo.",
+            "next_level": true
+          }
+        ],
+        "status_query": [
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataCountersMO.nOneXDataCallAttempts",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataCountersMO.nOneXDataCallFailures",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataCountersMO.nSuccessfulOneXDataCalls",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataMO.DataService",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataMO.DormancyInactivityTimer",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIWFParamMO.LocationString",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.CSRVUri",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpiRealm",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpuDomain",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.OutGoingProxyUri",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.OneXPcfPdsnHealthMonitorInterval",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.X_0005B9_OneXPcfPdsn.OneXPcfPdsnTableEntry.1.OneXpdsnAdminStatus",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.X_0005B9_OneXPcfPdsn.OneXPcfPdsnTableEntry.1.OneXpdsnHealthStatus",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.X_0005B9_OneXPcfPdsn.OneXPcfPdsnTableEntry.1.OneXpdsnIpAddress",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.a10RegUpdateReceived",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.a10SetupAttempts",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.a10SetupSuccesses",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.totalA10EgressBytes",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.totalA10IngressBytes",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.AdminState",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.LocationAreaCode",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.MSCId",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorAdminState",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorBandClass",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorChannelFreq",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorNID",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorOperState",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorPNOffset",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorSID",
+          "InternetGatewayDevice.Time.LocalTimeZone",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSGotFix",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLocationType",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.TimingGood",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLatitude",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLongitude",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSRetryPeriodMax",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSServerPort",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSServerType",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSServerURL",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.MaxSectorPowerIndBm",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.PilotPwrPercentage",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.PchPwrPercentage",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.SyncPwrPercentage"
+        ],
+        "batch_queries": true
+      }
+    },
+    "airave-25-5x": {
+      "implementation": "airvana_airave2",
+      "acs": {
+        "ensure_objects": [
+          {
+            "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.",
+            "next_level": true,
+            "required_instance": 1,
+            "existence_probe_leaf": "Impi"
+          },
+          {
+            "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.",
+            "next_level": true
+          },
+          {
+            "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry."
+          }
+        ],
+        "stages": [
+          {
+            "label": "lock-onex",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.AdminState",
+                "value": "lock",
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "lock-sector",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorAdminState",
+                "value": "lock",
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "replace-onex-pdsn",
+            "replace_object": {
+              "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.",
+              "required_instance": 1
+            },
+            "params": []
+          },
+          {
+            "label": "configure-onex-pdsn",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableNumber",
+                "value": "0",
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTablePdsnStartIpAddress",
+                "value": "172.31.0.1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTablePdsnEndIpAddress",
+                "value": "172.31.0.1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableSecurityParameterIndex",
+                "value": "256",
+                "xsd_type": "xsd:unsignedInt",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableSecurityKey",
+                "value": "e3a276bb0615f4aeac4a047992f234a1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableIOSVersion",
+                "value": "tia-878-1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTablePdsnAdminStatus",
+                "value": "0",
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTablePdsnType",
+                "value": "1x",
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ],
+            "atomic": true
+          },
+          {
+            "label": "replace-do-pdsn",
+            "params": [],
+            "replace_object": {
+              "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.",
+              "required_instance": 1
+            }
+          },
+          {
+            "label": "configure-do-pdsn",
+            "atomic": true,
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableNumber",
+                "value": "0",
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTablePdsnStartIpAddress",
+                "value": "172.31.0.1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTablePdsnEndIpAddress",
+                "value": "172.31.0.1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableSecurityParameterIndex",
+                "value": "256",
+                "xsd_type": "xsd:unsignedInt",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableSecurityKey",
+                "value": "e3a276bb0615f4aeac4a047992f234a1",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableIOSVersion",
+                "value": "tia-878-a",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTablePdsnAdminStatus",
+                "value": "0",
+                "xsd_type": "xsd:int",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "configure-iwf-user",
+            "atomic": true,
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.Impi",
+                "value_from": {
+                  "context": "feid"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.Impu",
+                "value_from": {
+                  "context": "feid"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.SipPassword",
+                "value_from": {
+                  "context": "site_sip_password"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXUserProfileInfoMO.OneXUserProfileInfoAction.1.SipUsrId",
+                "value": "1",
+                "xsd_type": "xsd:unsignedInt",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "configure-all",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.OutGoingProxyUri",
+                "value": "sip:10.56.0.2:5060",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorBandClass",
+                "value_from": {
+                  "context": "site_band_class"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorChannelFreq",
+                "value_from": {
+                  "context": "site_cdma_channel"
+                },
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorPNOffset",
+                "xsd_type": "xsd:int",
+                "verify": true,
+                "value_from": {
+                  "context": "site_pn_offset"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.MaxSectorPowerIndBm",
+                "xsd_type": "xsd:int",
+                "verify": true,
+                "value_from": {
+                  "context": "site_max_sector_power_dbm"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorSID",
+                "value_from": {
+                  "context": "site_sid"
+                },
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorNID",
+                "value_from": {
+                  "context": "site_nid"
+                },
+                "xsd_type": "xsd:int",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.DeviceInfo.X_0005B9_ModeOfOperation",
+                "value": "FSM_DEPENDENT",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLatitude",
+                "value_from": {
+                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+                  "transform": "gps_degrees_minutes_to_decimal_degrees"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLongitude",
+                "value_from": {
+                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "transform": "gps_degrees_minutes_to_decimal_degrees"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.MSCId",
+                "value": "1061123",
+                "xsd_type": "xsd:unsignedInt",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.CSRVUri",
+                "value": "sip:fap.airave2.ims.spcsdns.net",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpiRealm",
+                "value": "fap.airave2.ims.spcsdns.net",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpuDomain",
+                "value": "fap.airave2.ims.spcsdns.net",
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIWFParamMO.LocationString",
+                "value_from": {
+                  "context": "site_location_string"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              },
+              {
+                "name": "InternetGatewayDevice.Time.LocalTimeZone",
+                "value_from": {
+                  "parameter": "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+                  "transform": "gps_longitude_to_timezone"
+                },
+                "xsd_type": "xsd:string",
+                "verify": true
+              }
+            ]
+          },
+          {
+            "label": "unlock",
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.AdminState",
+                "xsd_type": "xsd:string",
+                "verify": true,
+                "value_from": {
+                  "context": "site_onex_admin_state"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorAdminState",
+                "xsd_type": "xsd:string",
+                "verify": true,
+                "value_from": {
+                  "context": "site_onex_admin_state"
+                }
+              }
+            ]
+          },
+          {
+            "label": "configure-do",
+            "atomic": false,
+            "replace_object": null,
+            "params": [
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856Carrier.is856CarBandClass",
+                "xsd_type": "xsd:unsignedInt",
+                "value_from": {
+                  "context": "site_evdo_band_class"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856Carrier.is856CarChannelNumber",
+                "xsd_type": "xsd:unsignedInt",
+                "value_from": {
+                  "context": "site_evdo_channel"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorElementTxPower",
+                "xsd_type": "xsd:int",
+                "value_from": {
+                  "context": "site_evdo_tx_power"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.pnOffset",
+                "xsd_type": "xsd:int",
+                "value_from": {
+                  "context": "site_evdo_pn_offset"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.colorCode",
+                "xsd_type": "xsd:int",
+                "value_from": {
+                  "context": "site_evdo_color_code"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_TermAuthMO.X_0005B9_TaConfig.enableTerminalAuthentication",
+                "value": "1",
+                "xsd_type": "xsd:int"
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_TermAuthMO.X_0005B9_TaConfig.bypassRadiusProxyEnabled",
+                "value": "1",
+                "xsd_type": "xsd:unsignedInt"
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_TermAuthMO.X_0005B9_TaConfig.PrimaryTermAuthAAA",
+                "value": "172.31.0.1",
+                "xsd_type": "xsd:string"
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_TermAuthMO.X_0005B9_TaConfig.SecondaryTermAuthAAA",
+                "value": "0.0.0.0",
+                "xsd_type": "xsd:string"
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_TermAuthMO.X_0005B9_TaConfig.TermAuthAAAPSK",
+                "xsd_type": "xsd:string",
+                "verify": false,
+                "value_from": {
+                  "context": "term_auth_psk"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.is856SecElCellId",
+                "xsd_type": "xsd:string",
+                "value_from": {
+                  "context": "site_evdo_cell_id"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorId",
+                "xsd_type": "xsd:string",
+                "value_from": {
+                  "context": "site_evdo_sector_id"
+                }
+              },
+              {
+                "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorElementAdminStatus",
+                "xsd_type": "xsd:string",
+                "value_from": {
+                  "context": "site_evdo_admin_status"
+                }
+              }
+            ],
+            "bracket_admin": {
+              "parameter": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorElementAdminStatus",
+              "down_value": "1",
+              "up_value": "2",
+              "xsd_type": "xsd:string",
+              "settle_parameter": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorElementOperStatus",
+              "settle_operating_value": "2",
+              "settle_polls": 20
+            }
+          }
+        ],
+        "discovery_query": [
+          {
+            "name": "InternetGatewayDevice.X_0005B9_GPSStatus.",
+            "next_level": false
+          },
+          {
+            "name": "InternetGatewayDevice.X_0005B9_aGPSConfig.",
+            "next_level": false
+          },
+          {
+            "name": "InternetGatewayDevice.DeviceInfo.",
+            "next_level": true
+          }
+        ],
+        "status_query": [
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataCountersMO.nOneXDataCallAttempts",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataCountersMO.nOneXDataCallFailures",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataCountersMO.nSuccessfulOneXDataCalls",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataMO.DataService",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXDataMO.DormancyInactivityTimer",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIWFParamMO.LocationString",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.CSRVUri",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpiRealm",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.ImpuDomain",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXIwfCSRVInfoMO.OutGoingProxyUri",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.OneXPcfPdsnHealthMonitorInterval",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.X_0005B9_OneXPcfPdsn.OneXPcfPdsnTableEntry.1.OneXpdsnAdminStatus",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.X_0005B9_OneXPcfPdsn.OneXPcfPdsnTableEntry.1.OneXpdsnHealthStatus",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfConfig.X_0005B9_OneXPcfPdsn.OneXPcfPdsnTableEntry.1.OneXpdsnIpAddress",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.a10RegUpdateReceived",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.a10SetupAttempts",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.a10SetupSuccesses",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.totalA10EgressBytes",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXPcfCounters.X_0005B9_OneXPcfPerformance.totalA10IngressBytes",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.AdminState",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.LocationAreaCode",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXRTTMO.MSCId",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorAdminState",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorBandClass",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorChannelFreq",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorNID",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorOperState",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorPNOffset",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.OneXSectorSID",
+          "InternetGatewayDevice.Time.LocalTimeZone",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSGotFix",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLatitude",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLocationType",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.GPSLongitude",
+          "InternetGatewayDevice.X_0005B9_GPSStatus.TimingGood",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLatitude",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSReferenceLongitude",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSRetryPeriodMax",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSServerPort",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSServerType",
+          "InternetGatewayDevice.X_0005B9_aGPSConfig.aGPSServerURL",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.MaxSectorPowerIndBm",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.PilotPwrPercentage",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.PchPwrPercentage",
+          "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_OneXSectorMO.SyncPwrPercentage",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorElementOperStatus",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorElementAdminStatus",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856Carrier.is856CarChannelNumber",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856Carrier.is856CarBandClass",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_PcfConfig.X_0005B9_DOPcfPdsn.DOPcfPdsnTableEntry.1.pdsnAdminStatus",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_PcfConfig.X_0005B9_DOPcfPdsn.DOPcfPdsnTableEntry.1.pdsnHealthStatus",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.connectionCount",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.colorCode",
+          "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_is856SectorElement.sectorId"
+        ]
+      }
+    }
+  },
+  "sites": {},
+  "faps": {}
+}

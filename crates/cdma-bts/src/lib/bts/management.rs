@@ -345,24 +345,21 @@ impl BtsManagementService for BtsManagementServiceImpl {
                 an_grpc_addr: state.an_grpc_addr.clone(),
                 served_mobiles: None,
                 status_detail: None,
+                kind: bts_management_proto::CellKind::Sdr as i32,
+                name: None,
+                capabilities: vec![
+                    bts_management_proto::CellCapability::RadioMetrics as i32,
+                    bts_management_proto::CellCapability::IqCapture as i32,
+                    bts_management_proto::CellCapability::PowerControl as i32,
+                ],
+                software_version: None,
             }],
         }))
     }
 
-    async fn get_bts_status(
-        &self,
-        request: Request<CellRequest>,
-    ) -> Result<Response<proto::SystemStatus>, Status> {
+    async fn check_health(&self, request: Request<CellRequest>) -> Result<Response<()>, Status> {
         self.state.check_cell(request.into_inner().cell)?;
-        let oh = &self.state.overhead;
-        Ok(Response::new(proto::SystemStatus {
-            running: true,
-            sid: u32::from(oh.sid),
-            nid: u32::from(oh.nid),
-            base_id: u32::from(oh.base_id),
-            pilot_pn: self.state.pilot_offset as u32,
-            reg_zone: u32::from(oh.reg_zone),
-        }))
+        Ok(Response::new(()))
     }
 
     async fn get_bts_config(

@@ -54,10 +54,10 @@ impl MscClient for AutoAssignmentMscClient {
                     channel_rate_and_type: 0x08,
                     coding: 0x05,
                 },
-                circuit_identity_code: cdma_ios::CircuitIdentityCode {
+                circuit_identity_code: Some(cdma_ios::CircuitIdentityCode {
                     pcm_multiplexer: 0,
                     timeslot: 1,
-                },
+                }),
                 encryption_information: None,
                 service_option: Some(service_option),
                 signals: Vec::new(),

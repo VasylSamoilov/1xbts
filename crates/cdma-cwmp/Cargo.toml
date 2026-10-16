@@ -1,0 +1,18 @@
+[package]
+name = "cdma-cwmp"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TR-069 / CWMP SOAP message codec (Inform, Get/SetParameterValues, GetParameterNames, GetRPCMethods, Fault) for the femtocell ACS."
+
+[dependencies]
+hex = "0.4"
+md-5 = "0.10"
+quick-xml.workspace = true
+thiserror = "2"
+
+[lints]
+workspace = true

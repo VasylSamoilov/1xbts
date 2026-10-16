@@ -16,8 +16,8 @@ use std::time::Duration;
 use log::{debug, info, warn};
 
 use cdma_common::consts::{
-    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
-    SERVICE_OPTION_OTASP, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_OTASP,
+    SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_PACKET_DATA_RC3, SERVICE_OPTION_SMS,
 };
 use cdma_hlr::model::{RegistrationBinding, SubscriberIdentity};
 use cdma_ios::{EncodedA1Message, VoiceBearerFrame, VoiceBearerManager};
@@ -34,7 +34,7 @@ use crate::media_gateway::{
 };
 use crate::media_gateway_service::{
     MediaGatewayService, gateway_clear_cause, send_forward_bearer_frame,
-    send_gateway_clear_command, stop_media_for_call,
+    send_gateway_clear_command, send_progress_tones_off, stop_media_for_call,
 };
 use crate::mo_call::{MoCallService, select_mt_voice_service_option};
 use crate::mt_call::MtCallService;
@@ -56,9 +56,7 @@ fn is_sms_traffic_service_option(so: u16) -> bool {
 fn is_packet_data_service_option(so: u16) -> bool {
     matches!(
         so,
-        SERVICE_OPTION_PACKET_DATA
-            | SERVICE_OPTION_ASYNC_DATA
-            | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        SERVICE_OPTION_PACKET_DATA | SERVICE_OPTION_ASYNC_DATA | SERVICE_OPTION_PACKET_DATA_RC3
     )
 }
 
@@ -74,6 +72,18 @@ fn is_non_voice_a1_service_option(so: u16) -> bool {
 
 fn resolve_mo_service_option(requested: u16) -> u16 {
     requested
+}
+
+fn assignment_channel_type(so: u16) -> cdma_ios::ChannelType {
+    if is_packet_data_service_option(so) {
+        cdma_ios::ChannelType::packet_data()
+    } else {
+        cdma_ios::ChannelType {
+            speech_or_data_indicator: cdma_ios::ChannelType::SPEECH_OR_DATA_SPEECH,
+            channel_rate_and_type: cdma_ios::ChannelType::RATE_FULL_RATE_TCH_BM,
+            coding: cdma_ios::ChannelType::CODING_QCELP_13K,
+        }
+    }
 }
 
 impl PagePurpose {
@@ -250,6 +260,8 @@ pub struct MscRuntime {
     /// and session start.
     pub(crate) pending_otasp_originations:
         std::collections::HashMap<CallId, PendingOtaspOrigination>,
+    pub(crate) pending_sms_traffic:
+        std::collections::HashMap<CallId, crate::sms::SmsTrafficDelivery>,
 }
 
 /// Stashed at MO CL3 for an OTASP-recognized call until the traffic channel
@@ -301,6 +313,54 @@ impl MscRuntime {
             otasp_history,
             otasp_event_tx,
             pending_otasp_originations: std::collections::HashMap::new(),
+            pending_sms_traffic: std::collections::HashMap::new(),
+        }
+    }
+
+    async fn refresh_registration_binding(
+        hlr_repo: &dyn cdma_hlr::repository::HlrRepository,
+        serving_node: &BaseStationId,
+        subscriber_id: uuid::Uuid,
+        imsi: Option<String>,
+        esn: Option<u32>,
+        meid: Option<String>,
+        slot_cycle_index: Option<u32>,
+    ) {
+        let existing = match hlr_repo.get_registration_binding(subscriber_id).await {
+            Ok(binding) => binding,
+            Err(error) => {
+                warn!("MSC: failed to read registration binding before uplink refresh: {error}");
+                return;
+            }
+        };
+        let now = chrono::Utc::now();
+        let existing_imsi = existing.as_ref().and_then(|binding| binding.imsi.clone());
+        let existing_esn = existing.as_ref().and_then(|binding| binding.esn);
+        let existing_meid = existing.as_ref().and_then(|binding| binding.meid.clone());
+        let binding = RegistrationBinding {
+            subscriber_id,
+            serving_bs_id: serving_node.0.clone(),
+            state: cdma_hlr::model::RegistrationState::Registered,
+            imsi: imsi.or(existing_imsi),
+            esn: esn.or(existing_esn),
+            meid: meid.or(existing_meid),
+            mob_p_rev: existing.as_ref().and_then(|binding| binding.mob_p_rev),
+            pgslot: existing.as_ref().and_then(|binding| binding.pgslot),
+            slot_cycle_index: slot_cycle_index.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|binding| binding.slot_cycle_index)
+            }),
+            last_msg_seq: existing.as_ref().and_then(|binding| binding.last_msg_seq),
+            last_registered_at: now,
+            last_seen_at: now,
+            updated_at: now,
+        };
+        match hlr_repo.upsert_registration_binding(binding).await {
+            Ok(_) => info!(
+                "MSC: recorded registration binding from subscriber uplink subscriber_id={subscriber_id}"
+            ),
+            Err(error) => warn!("MSC: failed to refresh registration binding: {error}"),
         }
     }
 
@@ -458,10 +518,15 @@ impl MscRuntime {
                     }
                 }
                 _ = delayed_wav_sleep => {
-                    self.media.handle_due_delayed_wav_starts(
-                        &self.circuits,
-                        self.config.voice_bearer.as_ref(),
-                    );
+                    let due = self.media.drain_due_wav_starts();
+                    for call_id in due {
+                        send_progress_tones_off(a1, call_id, &mut self.controller).await;
+                        self.media.start_media_for_call(
+                            call_id,
+                            &self.circuits,
+                            self.config.voice_bearer.as_ref(),
+                        );
+                    }
                 }
                 _ = pending_clear_sleep => {
                     self.fire_due_pending_clears(a1).await;
@@ -475,8 +540,14 @@ impl MscRuntime {
                     }
                 }
                 _ = sms_retry_interval.tick(), if sms_retry_enabled => {
-                    if let Some(smsc) = self.smsc.as_mut() {
+                    let deliveries = if let Some(smsc) = self.smsc.as_mut() {
                         smsc.retry_eligible_sweep(a1, sms_retry_after).await;
+                        smsc.take_traffic_deliveries()
+                    } else {
+                        Vec::new()
+                    };
+                    for delivery in deliveries {
+                        self.start_mt_sms_traffic(a1, delivery).await;
                     }
                 }
                 _ = otasp_timeout_interval.tick() => {
@@ -582,6 +653,14 @@ impl MscRuntime {
                 };
                 if response_tx.send(result).is_err() {
                     warn!("MSC: send-sms response receiver dropped");
+                }
+                let deliveries = self
+                    .smsc
+                    .as_mut()
+                    .map(|smsc| smsc.take_traffic_deliveries())
+                    .unwrap_or_default();
+                for delivery in deliveries {
+                    self.start_mt_sms_traffic(a1, delivery).await;
                 }
             }
         }
@@ -700,6 +779,67 @@ impl MscRuntime {
             return Err(MtSetupError::A1Closed);
         }
         Ok(call_id)
+    }
+
+    /// Binary SMS requires a traffic channel before ADDS Page delivery to avoid
+    /// an idle Airave DSP fault (X.S0059-200 Fig. 22).
+    pub(crate) async fn start_mt_sms_traffic(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        delivery: crate::sms::SmsTrafficDelivery,
+    ) {
+        let imsi = match &delivery.mobile_identity {
+            cdma_ios::MobileIdentity::Imsi(imsi) => imsi.clone(),
+            _ => {
+                warn!(
+                    "MSC: MT SMS traffic delivery has no IMSI; dropping sms_id={}",
+                    delivery.sms_id
+                );
+                return;
+            }
+        };
+        if !a1.is_attached(&delivery.serving_node) {
+            info!(
+                "MSC: MT SMS traffic serving node {} unavailable; retry sweep will re-drive sms_id={}",
+                delivery.serving_node, delivery.sms_id
+            );
+            return;
+        }
+        let call_id = self.controller.create_call(
+            CallDirection::MobileTerminated,
+            Some(cdma_ios::MobileIdentity::Imsi(imsi.clone())),
+        );
+        a1.bind_call(call_id, &delivery.serving_node);
+        let paging_request = cdma_ios::PagingRequestMessage {
+            mobile_identity_imsi: cdma_ios::MobileIdentity::Imsi(imsi),
+            tag: Some(cdma_ios::Tag(call_id.0 as u32)),
+            cell_identifier_list: None,
+            slot_cycle_index: None,
+            service_option: Some(cdma_ios::ServiceOption::SMS),
+            is2000_mobile_capabilities: None,
+        };
+        if let Err(e) = self.controller.apply_from_msc(
+            call_id,
+            &cdma_ios::ProcedureMessage::PagingRequest(paging_request.clone()),
+        ) {
+            warn!("MSC: MT SMS paging state error call_id={}: {e}", call_id.0);
+            self.controller.remove_call(call_id);
+            a1.release_call(call_id);
+            return;
+        }
+        self.circuits
+            .paging_requests
+            .insert(call_id, paging_request.clone());
+        self.pending_sms_traffic.insert(call_id, delivery);
+        info!("MSC: A1 tx PagingRequest (MT SMS) call_id={}", call_id.0);
+        if !self
+            .send_paging_request_to_bsc(a1, call_id, paging_request, PagePurpose::Initial)
+            .await
+        {
+            self.pending_sms_traffic.remove(&call_id);
+            self.controller.remove_call(call_id);
+            a1.release_call(call_id);
+        }
     }
 
     fn abort_mt_setup(&mut self, a1: &dyn MscA1Endpoint, call_id: CallId) {
@@ -834,16 +974,28 @@ impl MscRuntime {
     ) {
         // ADDS messages use SMS Tag correlation, not the A1 transport call_id.
         // Route them directly to the SMS coordinator before the call_id check.
-        // CompleteLayer3Information without a call_id is a registration notification.
+        // Location Updating Request is connectionless on A1. The local transport
+        // correlation, when present, is returned to the femtocell adapter so it
+        // can address the response to the originating mobile.
         match message.message_type() {
             cdma_ios::MessageType::AddsPageAck
             | cdma_ios::MessageType::AddsDeliverAck
             | cdma_ios::MessageType::AddsTransfer
             | cdma_ios::MessageType::AddsDeliver => {
-                self.handle_adds_message(a1, message).await;
+                self.handle_adds_message(a1, node, message).await;
                 return;
             }
-            cdma_ios::MessageType::CompleteLayer3Information if message.call_id().is_none() => {
+            cdma_ios::MessageType::CompleteLayer3Information
+                if message.decode().ok().is_some_and(|decoded| {
+                    cdma_ios::CompleteLayer3InformationMessage::decode(&decoded.payload).is_ok_and(
+                        |cli3| {
+                            cli3.layer3_information
+                                .decode_location_updating_request()
+                                .is_ok()
+                        },
+                    )
+                }) =>
+            {
                 self.handle_registration_notification(a1, node, message)
                     .await;
                 return;
@@ -899,6 +1051,50 @@ impl MscRuntime {
                     return;
                 }
                 self.mt_page_retry.cancel(call_id);
+                let imsi = match &response.mobile_identity_imsi {
+                    cdma_ios::MobileIdentity::Imsi(imsi) => Some(
+                        a1.serving_imsi_prefix(node)
+                            .map(|(mcc, imsi_11_12)| {
+                                crate::base_station::complete_imsi(&mcc, &imsi_11_12, imsi)
+                            })
+                            .unwrap_or_else(|| imsi.clone()),
+                    ),
+                    _ => None,
+                };
+                let esn = match response.mobile_identity_esn.as_ref() {
+                    Some(cdma_ios::MobileIdentity::Esn(esn)) => Some(*esn),
+                    _ => None,
+                };
+                let meid = response.mobile_identity_meid.as_ref().and_then(meid_hex);
+                if let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
+                    imsi.as_deref(),
+                    esn,
+                    meid.as_deref(),
+                ) {
+                    match self
+                        .config
+                        .hlr_repo
+                        .resolve_by_identity(&identity_key)
+                        .await
+                    {
+                        Ok(Some(resolved)) => {
+                            Self::refresh_registration_binding(
+                                self.config.hlr_repo.as_ref(),
+                                node,
+                                resolved.subscriber.subscriber_id,
+                                imsi,
+                                esn,
+                                meid,
+                                response.slot_cycle_index.map(|value| u32::from(value.0)),
+                            )
+                            .await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!(
+                            "MSC: HLR lookup failed during paging-response binding refresh: {error}"
+                        ),
+                    }
+                }
                 let secondary_leg = self
                     .circuits
                     .circuits
@@ -1015,6 +1211,40 @@ impl MscRuntime {
                     }
                 }
                 self.circuits.reset_assignment_failure_retries(call_id);
+                if let Some(delivery) = self.pending_sms_traffic.remove(&call_id) {
+                    info!(
+                        "MSC: AssignmentComplete call_id={} - delivering MT SMS on the traffic channel",
+                        call_id.0
+                    );
+                    let encoded = EncodedA1Message::from_message_for_call(
+                        &cdma_ios::Message::new(
+                            cdma_ios::MessageType::AddsPage,
+                            delivery.adds_page.clone(),
+                        ),
+                        Some(call_id.0),
+                    );
+                    if let Err(e) = a1.send_to_node(&delivery.serving_node, encoded).await {
+                        warn!(
+                            "MSC: failed to deliver MT SMS on traffic channel call_id={}: {e}",
+                            call_id.0
+                        );
+                    } else if let Some(smsc) = self.smsc.as_mut() {
+                        smsc.begin_pending(
+                            delivery.tag,
+                            delivery.sms_id,
+                            delivery.delivery_attempt_id,
+                            delivery.mobile_identity.clone(),
+                        );
+                    }
+                    // Delivery completes on the later ADDS Page Ack. The FAP
+                    // keeps the channel until it finishes the burst and its own
+                    // timers tear it down.
+                    self.mt_page_retry.cancel(call_id);
+                    self.controller.remove_call(call_id);
+                    self.stop_media_for_call(call_id);
+                    a1.release_call(call_id);
+                    return;
+                }
                 if let Some(pending) = self.pending_otasp_originations.remove(&call_id)
                     && let Some(otasp) = self.otasp.as_mut()
                 {
@@ -1034,14 +1264,17 @@ impl MscRuntime {
                         .await;
                     return;
                 }
-                if completed_circuit_id
+                let completed_non_voice = completed_circuit_id
                     .and_then(|cid| self.circuits.circuits.get(&cid))
-                    .is_some_and(|session| is_non_voice_a1_service_option(session.service_option))
-                {
+                    .is_some_and(|session| is_non_voice_a1_service_option(session.service_option));
+                if completed_non_voice {
                     debug!(
                         "MSC: AssignmentComplete call_id={} completed non-voice A1 context",
                         call_id.0
                     );
+                    self.controller.remove_call(call_id);
+                    self.stop_media_for_call(call_id);
+                    a1.release_call(call_id);
                     return;
                 }
                 if let Some(call) = self.circuits.m2m_calls.get(&call_id).copied() {
@@ -1331,6 +1564,30 @@ impl MscRuntime {
                         self.config.hlr_repo.as_ref(),
                     )
                     .await;
+                if let Some((_, subscriber_id)) = originator.as_ref() {
+                    let imsi = cm_service_request.as_ref().and_then(|request| {
+                        let cdma_ios::MobileIdentity::Imsi(imsi) = &request.mobile_identity_imsi
+                        else {
+                            return None;
+                        };
+                        Some(imsi.clone())
+                    });
+                    let (esn, meid) = extract_hardware_identity(cm_service_request.as_ref());
+                    let slot_cycle_index = cm_service_request
+                        .as_ref()
+                        .and_then(|request| request.slot_cycle_index)
+                        .map(|value| u32::from(value.0));
+                    Self::refresh_registration_binding(
+                        self.config.hlr_repo.as_ref(),
+                        node,
+                        *subscriber_id,
+                        imsi,
+                        esn,
+                        meid,
+                        slot_cycle_index,
+                    )
+                    .await;
+                }
                 let calling_number = originator.as_ref().map(|(n, _)| n.clone());
 
                 let mobile_identity = cm_service_request
@@ -1393,12 +1650,8 @@ impl MscRuntime {
                         circuit_id,
                     );
                     let assignment_request = cdma_ios::AssignmentRequestMessage {
-                        channel_type: cdma_ios::ChannelType {
-                            speech_or_data_indicator: 0x01,
-                            channel_rate_and_type: 0x08,
-                            coding: 0x05,
-                        },
-                        circuit_identity_code: cic,
+                        channel_type: assignment_channel_type(service_option),
+                        circuit_identity_code: None,
                         encryption_information: None,
                         service_option: Some(cdma_ios::ServiceOption(service_option)),
                         signals: Vec::new(),
@@ -1566,7 +1819,7 @@ impl MscRuntime {
                         channel_rate_and_type: 0x08,
                         coding: 0x05,
                     },
-                    circuit_identity_code: cic,
+                    circuit_identity_code: Some(cic),
                     encryption_information: None,
                     service_option: Some(cdma_ios::ServiceOption(service_option)),
                     signals: Vec::new(),
@@ -2299,7 +2552,12 @@ impl MscRuntime {
     }
 
     /// Routes an inbound ADDS message from the BSC to the SMS or OTASP coordinator.
-    async fn handle_adds_message(&mut self, a1: &dyn MscA1Endpoint, message: EncodedA1Message) {
+    async fn handle_adds_message(
+        &mut self,
+        a1: &dyn MscA1Endpoint,
+        node: &BaseStationId,
+        message: EncodedA1Message,
+    ) {
         let decoded = match message.decode() {
             Ok(d) => d,
             Err(e) => {
@@ -2376,7 +2634,83 @@ impl MscRuntime {
             }
             cdma_ios::MessageType::AddsTransfer => {
                 match cdma_ios::AddsTransferMessage::decode(&decoded.payload) {
-                    Ok(msg) => smsc.handle_adds_transfer(&msg, a1).await,
+                    Ok(mut msg) => {
+                        if let cdma_ios::MobileIdentity::Imsi(imsi) = &msg.mobile_identity_imsi {
+                            let completed = a1
+                                .serving_imsi_prefix(node)
+                                .map(|(mcc, imsi_11_12)| {
+                                    crate::base_station::complete_imsi(&mcc, &imsi_11_12, imsi)
+                                })
+                                .unwrap_or_else(|| imsi.clone());
+                            msg.mobile_identity_imsi = cdma_ios::MobileIdentity::Imsi(completed);
+                        }
+                        let imsi = match &msg.mobile_identity_imsi {
+                            cdma_ios::MobileIdentity::Imsi(imsi) => Some(imsi.clone()),
+                            _ => None,
+                        };
+                        let esn = match msg.mobile_identity_esn.as_ref() {
+                            Some(cdma_ios::MobileIdentity::Esn(esn)) => Some(*esn),
+                            _ => None,
+                        };
+                        let meid = msg.mobile_identity_meid.as_ref().and_then(meid_hex);
+                        if let Ok(identity_key) = cdma_hlr::model::MobileIdentityKey::from_parts(
+                            imsi.as_deref(),
+                            esn,
+                            meid.as_deref(),
+                        ) {
+                            match self
+                                .config
+                                .hlr_repo
+                                .resolve_by_identity(&identity_key)
+                                .await
+                            {
+                                Ok(Some(resolved)) => {
+                                    Self::refresh_registration_binding(
+                                        self.config.hlr_repo.as_ref(),
+                                        node,
+                                        resolved.subscriber.subscriber_id,
+                                        imsi,
+                                        esn,
+                                        meid,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    warn!(
+                                        "MSC: HLR lookup failed during ADDS binding refresh: {error}"
+                                    )
+                                }
+                            }
+                        }
+                        let ack = cdma_ios::AddsTransferAckMessage {
+                            mobile_identity_imsi: msg.mobile_identity_imsi.clone(),
+                            tag: msg.tag,
+                            cause: None,
+                        };
+                        match ack.encode() {
+                            Ok(payload) => {
+                                let message = cdma_ios::Message::new(
+                                    cdma_ios::MessageType::AddsTransferAck,
+                                    payload,
+                                );
+                                if let Err(error) = a1
+                                    .send_to_node(
+                                        node,
+                                        EncodedA1Message::from_message_for_call(&message, None),
+                                    )
+                                    .await
+                                {
+                                    warn!("MSC: failed to send ADDS Transfer Ack: {error}");
+                                } else {
+                                    info!("MSC: A1 tx ADDS Transfer Ack");
+                                }
+                            }
+                            Err(error) => warn!("MSC: failed to encode ADDS Transfer Ack: {error}"),
+                        }
+                        smsc.handle_adds_transfer(&msg, a1).await;
+                    }
                     Err(e) => warn!("MSC: failed to decode ADDS Transfer: {e}"),
                 }
             }
@@ -2416,27 +2750,13 @@ impl MscRuntime {
         }
     }
 
-    /// Handles a `CompleteLayer3Information` with no call_id — this is BSC's registration
-    /// notification (LocationUpdatingRequest in L3 body). Triggers welcome SMS if configured.
     async fn handle_registration_notification(
         &mut self,
         a1: &dyn MscA1Endpoint,
         node: &BaseStationId,
         message: EncodedA1Message,
     ) {
-        let welcome_cfg = match self.config.welcome_sms.as_ref() {
-            Some(c) if c.enabled => c.clone(),
-            _ => return,
-        };
-        let smsc = match self.smsc.as_mut() {
-            Some(s) => s,
-            None => {
-                warn!(
-                    "MSC: registration notification received but SMSC coordinator not configured"
-                );
-                return;
-            }
-        };
+        let transport_call_id = message.call_id();
         let decoded = match message.decode() {
             Ok(d) => d,
             Err(e) => {
@@ -2471,15 +2791,15 @@ impl MscRuntime {
             Some(cdma_ios::MobileIdentity::Esn(e)) => Some(*e),
             _ => None,
         };
-        let identity_key = match cdma_hlr::model::MobileIdentityKey::from_parts(imsi, esn, None) {
-            Ok(identity_key) => identity_key,
-            _ => {
-                warn!(
-                    "MSC: registration notification has no complete identity — welcome SMS skipped"
-                );
-                return;
-            }
-        };
+        let meid = lur.mobile_identity_meid.as_ref().and_then(meid_hex);
+        let identity_key =
+            match cdma_hlr::model::MobileIdentityKey::from_parts(imsi, esn, meid.as_deref()) {
+                Ok(identity_key) => identity_key,
+                Err(error) => {
+                    warn!("MSC: registration notification has no complete identity: {error}");
+                    return;
+                }
+            };
         let upsert = match self
             .config
             .hlr_repo
@@ -2491,6 +2811,59 @@ impl MscRuntime {
                 warn!("MSC: upsert_mobile_seen failed: {e}");
                 return;
             }
+        };
+        match self
+            .config
+            .hlr_repo
+            .resolve_by_identity(&identity_key)
+            .await
+        {
+            Ok(Some(resolved)) => {
+                Self::refresh_registration_binding(
+                    self.config.hlr_repo.as_ref(),
+                    node,
+                    resolved.subscriber.subscriber_id,
+                    imsi.map(str::to_string),
+                    esn,
+                    meid.clone(),
+                    lur.slot_cycle_index.map(|value| u32::from(value.0)),
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(error) => warn!("MSC: HLR lookup failed during registration refresh: {error}"),
+        }
+        let accept = cdma_ios::LocationUpdatingAcceptMessage {
+            location_area_identification: lur.location_area_identification,
+        };
+        let payload = match accept.encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!("MSC: failed to encode Location Updating Accept: {error}");
+                return;
+            }
+        };
+        if let Err(error) = a1
+            .send_to_node(
+                node,
+                EncodedA1Message::from_message_for_call(
+                    &cdma_ios::Message::new(cdma_ios::MessageType::LocationUpdatingAccept, payload),
+                    transport_call_id,
+                ),
+            )
+            .await
+        {
+            warn!("MSC: failed to send Location Updating Accept: {error}");
+            return;
+        }
+        info!(
+            "MSC: registration accepted for IMSI {}",
+            identity_key.imsi()
+        );
+
+        let welcome_cfg = match self.config.welcome_sms.as_ref() {
+            Some(config) if config.enabled => config.clone(),
+            _ => return,
         };
         let should_send = if upsert.is_new {
             info!("MSC: first-time mobile — welcome SMS queued");
@@ -2540,6 +2913,15 @@ impl MscRuntime {
             );
             crate::sms::SmsDestinationKey::Imsi(imsi.to_string())
         };
+        let smsc = match self.smsc.as_mut() {
+            Some(smsc) => smsc,
+            None => {
+                warn!(
+                    "MSC: registration accepted but SMSC coordinator is not configured for welcome SMS"
+                );
+                return;
+            }
+        };
         smsc.send_sms(
             crate::sms::SmsSendRequest {
                 originating_number: welcome_cfg.originating_number.clone(),
@@ -2553,6 +2935,10 @@ impl MscRuntime {
             a1,
         )
         .await;
+        let deliveries = smsc.take_traffic_deliveries();
+        for delivery in deliveries {
+            self.start_mt_sms_traffic(a1, delivery).await;
+        }
     }
 
     /// Cleans up every call a base station held when its A1 link dropped.
@@ -2590,9 +2976,15 @@ fn extract_hardware_identity(
         Some(cdma_ios::MobileIdentity::Esn(e)) => Some(*e),
         _ => None,
     };
-    // CmServiceRequest does not currently carry a MEID IE; if a future MEID
-    // form arrives here it'll appear via the IMSI slot encoded as such.
-    (esn, None)
+    let meid = req.mobile_identity_meid.as_ref().and_then(meid_hex);
+    (esn, meid)
+}
+
+fn meid_hex(identity: &cdma_ios::MobileIdentity) -> Option<String> {
+    let cdma_ios::MobileIdentity::Meid(bytes) = identity else {
+        return None;
+    };
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn decode_cm_service_request(
@@ -2688,8 +3080,10 @@ mod tests {
     use cdma_bsc_a1_edge_compat::test_node;
     use cdma_ios::{
         AssignmentCompleteMessage, AssignmentRequestMessage, Cause, ChannelNumber, ChannelType,
-        CircuitIdentityCode, ConnectMessage, MobileIdentity, PagingRequestMessage,
-        PagingResponseMessage, ProcedureMessage, ServiceOption, SlotCycleIndex, Tag,
+        CircuitIdentityCode, CompleteLayer3InformationMessage, ConnectMessage, Layer3Information,
+        LocationUpdatingRequestMessage, MobileIdentity, PagingRequestMessage,
+        PagingResponseMessage, ProcedureMessage, RegistrationType, ServiceOption, SlotCycleIndex,
+        Tag,
     };
     use tokio::time::{Duration, timeout};
 
@@ -2707,6 +3101,97 @@ mod tests {
         assert!(is_non_voice_a1_service_option(SERVICE_OPTION_ASYNC_DATA));
     }
 
+    #[test]
+    fn packet_assignment_uses_data_channel_type() {
+        let packet = assignment_channel_type(SERVICE_OPTION_PACKET_DATA_RC3);
+        assert_eq!(
+            packet.speech_or_data_indicator,
+            ChannelType::SPEECH_OR_DATA_DATA
+        );
+        assert_eq!(packet.coding, ChannelType::CODING_DATA_NON_TRANSPARENT);
+        let voice = assignment_channel_type(SERVICE_OPTION_BASIC_VOICE);
+        assert_eq!(
+            voice.speech_or_data_indicator,
+            ChannelType::SPEECH_OR_DATA_SPEECH
+        );
+        assert_eq!(voice.coding, ChannelType::CODING_QCELP_13K);
+    }
+
+    #[tokio::test]
+    async fn completed_packet_data_context_releases_its_circuit() {
+        let (_client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: None,
+            otasp: None,
+        });
+        let call_id = CallId(42);
+        runtime.controller.create_call_with_id(
+            call_id,
+            CallDirection::MobileOriginated,
+            Some(MobileIdentity::Imsi("12345678901".to_string())),
+        );
+        runtime.circuits.insert_circuit_session(
+            7,
+            CircuitSession {
+                call_id,
+                audio_file: None,
+                service_option: SERVICE_OPTION_PACKET_DATA_RC3,
+                leg_role: MscVoiceLeg::Primary,
+                peer_circuit_id: None,
+                bearer_remote_ready: true,
+                media_gateway_handle: None,
+                called_number: None,
+            },
+        );
+        runtime
+            .circuits
+            .queue_assignment_complete_circuit(call_id, MscVoiceLeg::Primary, 7);
+        let complete = AssignmentCompleteMessage {
+            channel_number: ChannelNumber(50),
+            encryption_information: None,
+            service_option: Some(ServiceOption::HIGH_RATE_PACKET_DATA),
+            a2p_bearer_session_params: None,
+            a2p_bearer_format_params: None,
+        };
+
+        runtime
+            .handle_bsc_a1_message(
+                &endpoint,
+                &test_node(),
+                EncodedA1Message::from_message_for_call(
+                    &cdma_ios::Message::new(
+                        cdma_ios::MessageType::AssignmentComplete,
+                        complete.encode().unwrap(),
+                    ),
+                    Some(call_id.0),
+                ),
+            )
+            .await;
+
+        assert_eq!(runtime.controller.active_call_count(), 0);
+        assert!(runtime.circuits.circuits.is_empty());
+        assert!(!runtime.circuits.has_pending_assignment_complete(call_id));
+    }
+
     /// HLR stub that resolves a single phone number to a Registered subscriber
     /// with one primary IMSI, used to drive the MO M2M paging path.
     struct M2mHlrRepo {
@@ -2714,6 +3199,7 @@ mod tests {
         subscriber_id: uuid::Uuid,
         imsi: &'static str,
         mob_p_rev: u32,
+        refreshed_binding: std::sync::Mutex<Option<RegistrationBinding>>,
         registration_state: cdma_hlr::model::RegistrationState,
     }
 
@@ -2728,9 +3214,113 @@ mod tests {
                 subscriber_id: uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
                 imsi: "111111111111111",
                 mob_p_rev,
+                refreshed_binding: std::sync::Mutex::new(None),
                 registration_state: cdma_hlr::model::RegistrationState::Registered,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn subscriber_uplink_creates_registration_binding() {
+        let repo = M2mHlrRepo::new();
+
+        MscRuntime::refresh_registration_binding(
+            &repo,
+            &BaseStationId("femto-fcs-1".to_string()),
+            repo.subscriber_id,
+            Some("310005551239999".to_string()),
+            Some(0x80ab_cdef),
+            Some("53a18cc200000a".to_string()),
+            Some(2),
+        )
+        .await;
+
+        let binding = repo.refreshed_binding.lock().unwrap().clone().unwrap();
+        assert_eq!(binding.subscriber_id, repo.subscriber_id);
+        assert_eq!(binding.serving_bs_id, "femto-fcs-1");
+        assert_eq!(
+            binding.state,
+            cdma_hlr::model::RegistrationState::Registered
+        );
+        assert_eq!(binding.imsi.as_deref(), Some("310005551239999"));
+        assert_eq!(binding.esn, Some(0x80ab_cdef));
+        assert_eq!(binding.meid.as_deref(), Some("53a18cc200000a"));
+        assert_eq!(binding.slot_cycle_index, Some(2));
+    }
+
+    #[tokio::test]
+    async fn correlated_location_update_returns_location_updating_accept() {
+        let (client, endpoint) = cdma_bsc_a1_edge_compat::InProcessMscClient::pair(4);
+        let mut runtime = MscRuntime::new(MscRuntimeConfig {
+            hlr_repo: Arc::new(StubHlrRepo),
+            smsc_repo: None,
+            welcome_sms: None,
+            sms_retry: crate::config::SmsRetryConfig::default(),
+            default_voice_service_option: 3,
+            supported_voice_service_options: vec![3],
+            wav_file: None,
+            gateway_fallback_to_wav: true,
+            local_answer_delay_ms: 10_000,
+            media_ringback_enabled: false,
+            media_ringback_type: MediaRingbackType::Nanp,
+            sip_ringback_disable: false,
+            inbound_sip_msc_ringback: false,
+            generate_ringback: true,
+            send_tones_alert: false,
+            page_retry_cooldown_ms: 1000,
+            page_retry_max_duration_ms: 60_000,
+            failure_tone_duration_ms: 0,
+            voice_bearer: None,
+            media_gateway: None,
+            otasp: None,
+        });
+        let transport_call_id = 73;
+        let request = LocationUpdatingRequestMessage {
+            mobile_identity_imsi: MobileIdentity::Imsi("310005551239999".to_string()),
+            location_area_identification: None,
+            classmark_information_type_2: None,
+            registration_type: Some(RegistrationType(1)),
+            mobile_identity_esn: Some(MobileIdentity::Esn(0x80ab_cdef)),
+            mobile_identity_meid: None,
+            slot_cycle_index: Some(SlotCycleIndex(2)),
+            authentication_response_parameter: None,
+            authentication_confirmation_parameter: None,
+            authentication_parameter_count: None,
+            authentication_challenge_parameter: None,
+            authentication_event: None,
+            user_zone_id: None,
+            is2000_mobile_capabilities: None,
+        };
+        let cli3 = CompleteLayer3InformationMessage {
+            cell_identifier: cdma_ios::CellId {
+                cell: 0x123,
+                sector: 0,
+            },
+            layer3_information: Layer3Information::from_location_updating_request(&request)
+                .unwrap(),
+        };
+        let message = EncodedA1Message::from_message_for_call(
+            &cdma_ios::Message::new(
+                cdma_ios::MessageType::CompleteLayer3Information,
+                cli3.encode().unwrap(),
+            ),
+            Some(transport_call_id),
+        );
+
+        runtime
+            .handle_bsc_a1_message(&endpoint, &test_node(), message)
+            .await;
+
+        let outbound = timeout(Duration::from_millis(50), client.poll_a1())
+            .await
+            .expect("Location Updating Accept should be sent")
+            .unwrap();
+        assert_eq!(outbound.call_id(), Some(transport_call_id));
+        assert_eq!(
+            outbound.message_type(),
+            cdma_ios::MessageType::LocationUpdatingAccept
+        );
+        assert_eq!(runtime.controller.active_call_count(), 0);
     }
 
     #[derive(Default)]
@@ -2897,6 +3487,7 @@ mod tests {
             called_party_bcd_number: called_bcd.map(cdma_ios::CalledPartyBcdNumber),
             tag: None,
             mobile_identity_esn: None,
+            mobile_identity_meid: None,
             slot_cycle_index: None,
             authentication_response_parameter: None,
             authentication_confirmation_parameter: None,
@@ -3273,15 +3864,19 @@ mod tests {
         }
         async fn upsert_registration_binding(
             &self,
-            _: cdma_hlr::model::RegistrationBinding,
+            binding: cdma_hlr::model::RegistrationBinding,
         ) -> Result<cdma_hlr::model::RegistrationBinding, String> {
-            unimplemented!()
+            *self.refreshed_binding.lock().unwrap() = Some(binding.clone());
+            Ok(binding)
         }
         async fn get_registration_binding(
             &self,
             subscriber_id: uuid::Uuid,
         ) -> Result<Option<cdma_hlr::model::RegistrationBinding>, String> {
             assert_eq!(subscriber_id, self.subscriber_id);
+            if let Some(binding) = self.refreshed_binding.lock().unwrap().clone() {
+                return Ok(Some(binding));
+            }
             Ok(Some(cdma_hlr::model::RegistrationBinding {
                 subscriber_id,
                 serving_bs_id: test_node().0,
@@ -3424,6 +4019,7 @@ mod tests {
             ])),
             tag: None,
             mobile_identity_esn: None,
+            mobile_identity_meid: None,
             slot_cycle_index: None,
             authentication_response_parameter: None,
             authentication_confirmation_parameter: None,
@@ -3461,6 +4057,7 @@ mod tests {
             ])),
             tag: None,
             mobile_identity_esn: None,
+            mobile_identity_meid: None,
             slot_cycle_index: None,
             authentication_response_parameter: None,
             authentication_confirmation_parameter: None,
@@ -3612,6 +4209,7 @@ mod tests {
             mobile_identity_imsi: MobileIdentity::Imsi("12345678901".to_string()),
             tag: Some(Tag(0x01020304)),
             mobile_identity_esn: None,
+            mobile_identity_meid: None,
             slot_cycle_index: Some(SlotCycleIndex(1)),
             authentication_response_parameter: None,
             authentication_confirmation_parameter: None,
@@ -3682,10 +4280,10 @@ mod tests {
                         channel_rate_and_type: 0x08,
                         coding: 0x05,
                     },
-                    circuit_identity_code: CircuitIdentityCode {
+                    circuit_identity_code: Some(CircuitIdentityCode {
                         pcm_multiplexer: 0x0123,
                         timeslot: 0x1a,
-                    },
+                    }),
                     encryption_information: None,
                     service_option: Some(ServiceOption(0x0003)),
                     signals: Vec::new(),
@@ -3823,7 +4421,11 @@ mod tests {
             Some(ServiceOption(SERVICE_OPTION_QCELP13))
         );
         assert_eq!(
-            runtime.circuits.circuits[&assignment.circuit_identity_code.to_packed()].service_option,
+            runtime.circuits.circuits[&assignment
+                .circuit_identity_code
+                .expect("voice assignment CIC")
+                .to_packed()]
+                .service_option,
             SERVICE_OPTION_QCELP13
         );
     }
@@ -3943,8 +4545,14 @@ mod tests {
         let second_assignment =
             cdma_ios::AssignmentRequestMessage::decode(&second_payload.payload).unwrap();
         assert_ne!(
-            first_assignment.circuit_identity_code.to_packed(),
-            second_assignment.circuit_identity_code.to_packed()
+            first_assignment
+                .circuit_identity_code
+                .expect("first voice assignment CIC")
+                .to_packed(),
+            second_assignment
+                .circuit_identity_code
+                .expect("second voice assignment CIC")
+                .to_packed()
         );
         assert_eq!(
             runtime
@@ -3955,8 +4563,14 @@ mod tests {
                 .count(),
             2
         );
-        let first_circuit_id = first_assignment.circuit_identity_code.to_packed();
-        let second_circuit_id = second_assignment.circuit_identity_code.to_packed();
+        let first_circuit_id = first_assignment
+            .circuit_identity_code
+            .expect("first voice assignment CIC")
+            .to_packed();
+        let second_circuit_id = second_assignment
+            .circuit_identity_code
+            .expect("second voice assignment CIC")
+            .to_packed();
         assert_eq!(
             runtime.circuits.circuits[&first_circuit_id].peer_circuit_id,
             Some(second_circuit_id)
@@ -4460,6 +5074,7 @@ mod tests {
             AssignmentRequestMessage::decode(&assignment.decode().unwrap().payload)
                 .unwrap()
                 .circuit_identity_code
+                .expect("voice assignment CIC")
                 .to_packed();
         let page = timeout(Duration::from_millis(50), client.poll_a1())
             .await
@@ -4539,6 +5154,7 @@ mod tests {
                 AssignmentRequestMessage::decode(&assignment.decode().unwrap().payload)
                     .unwrap()
                     .circuit_identity_code
+                    .expect("voice assignment CIC")
                     .to_packed();
             assert!(
                 runtime
@@ -5040,10 +5656,10 @@ mod tests {
                         channel_rate_and_type: 0x08,
                         coding: 0x05,
                     },
-                    circuit_identity_code: CircuitIdentityCode {
+                    circuit_identity_code: Some(CircuitIdentityCode {
                         pcm_multiplexer: 0x0123,
                         timeslot: 0x1a,
-                    },
+                    }),
                     encryption_information: None,
                     service_option: Some(ServiceOption(0x0003)),
                     signals: Vec::new(),

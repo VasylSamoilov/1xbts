@@ -56,23 +56,25 @@ export default function BtsPage() {
                       key={`${summary.baseStation}-${summary.peerId}`}
                       className="border-t border-border hover:bg-hover"
                     >
-                      <td className="py-2 font-mono text-xs text-primary">
+                      <td className="py-2 text-xs text-primary">
                         <Link
                           href={`/bts/${encodeURIComponent(summary.peerId)}?baseStation=${encodeURIComponent(summary.baseStation)}`}
                           className="hover:text-accent-green transition-colors"
                         >
                           {summary.cell ? (
                             <>
-                              <div>{`Cell ${summary.cell.cell}`}</div>
-                              <div className="text-[11px] text-muted">
-                                {`Sector ${summary.cell.sector}`}
+                              <div className="font-medium">
+                                {summary.name || `Cell ${summary.cell.cell}`}
+                              </div>
+                              <div className="text-[11px] text-muted font-mono">
+                                {summary.name ? `Cell ${summary.cell.cell}` : `Sector ${summary.cell.sector}`}
                               </div>
                             </>
                           ) : (
                             <>
-                              <div>{summary.peerId}</div>
+                              <div className="font-medium">{summary.name || summary.peerId}</div>
                               {summary.managementEndpoint && (
-                                <div className="text-[11px] text-muted">
+                                <div className="text-[11px] text-muted font-mono">
                                   {summary.managementEndpoint}
                                 </div>
                               )}

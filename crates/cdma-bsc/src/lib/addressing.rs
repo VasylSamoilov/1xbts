@@ -1,6 +1,6 @@
 use cdma_common::consts::{
-    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
-    SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_QCELP13,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_PACKET_DATA_RC3, SERVICE_OPTION_QCELP13,
 };
 use cdma_common::lac::paging_messages::{self as paging_messages, MsAddress, MsPageAddress};
 use log::{info, warn};
@@ -10,9 +10,7 @@ use crate::config::TrafficAssignmentConfig;
 pub(crate) fn is_packet_data_so(so: u16) -> bool {
     matches!(
         so,
-        SERVICE_OPTION_PACKET_DATA
-            | SERVICE_OPTION_ASYNC_DATA
-            | SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        SERVICE_OPTION_PACKET_DATA | SERVICE_OPTION_ASYNC_DATA | SERVICE_OPTION_PACKET_DATA_RC3
     )
 }
 
@@ -31,7 +29,7 @@ pub(crate) fn packet_data_service_option_for_origination(
     if mob_p_rev < 6 {
         SERVICE_OPTION_PACKET_DATA
     } else {
-        SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        SERVICE_OPTION_PACKET_DATA_RC3
     }
 }
 
@@ -51,7 +49,7 @@ pub(crate) fn ms_eligible_for_fsch_phase1(
     for_supported_rcs: &[u8],
 ) -> bool {
     enable_f_sch
-        && service_option == SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+        && service_option == SERVICE_OPTION_PACKET_DATA_RC3
         && for_rc >= 3
         && mob_p_rev >= 6
         && (for_preferred_rc == Some(3) || for_supported_rcs.contains(&3))
@@ -366,10 +364,10 @@ mod tests {
         assert_eq!(
             packet_data_service_option_for_origination(
                 "#777",
-                Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+                Some(SERVICE_OPTION_PACKET_DATA_RC3),
                 6
             ),
-            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+            SERVICE_OPTION_PACKET_DATA_RC3
         );
     }
 
@@ -381,7 +379,7 @@ mod tests {
         );
         assert_eq!(
             packet_data_service_option_for_origination("#777", None, 6),
-            SERVICE_OPTION_HIGH_RATE_PACKET_DATA
+            SERVICE_OPTION_PACKET_DATA_RC3
         );
     }
 

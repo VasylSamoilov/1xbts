@@ -10,9 +10,10 @@ import "events/v1/hlr.proto";
 import "events/v1/smsc.proto";
 import "events/v1/bts.proto";
 import "events/v1/an.proto";
+import "events/v1/femto.proto";
+import "events/v1/a1.proto";
 
-// Aggregated event bus. Every component publishes events here as a gRPC
-// client; every consumer subscribes to ListenEvents.
+// Aggregated network event bus.
 service EventService {
   // Long-lived server-streaming subscription. The server fans out matching
   // events to each subscriber. Slow subscribers are disconnected.
@@ -36,6 +37,7 @@ enum EventSource {
   EVENT_SOURCE_SMSC = 7;
   EVENT_SOURCE_NIB  = 8;
   EVENT_SOURCE_AN   = 9;
+  EVENT_SOURCE_FEMTO = 10;
 }
 
 // Radio-layer identifiers known at the producer site. Producers fill in
@@ -100,6 +102,9 @@ message NetworkEvent {
     SmscNetworkEvent smsc = 15;
     BtsNetworkEvent  bts  = 16;
     AnNetworkEvent   an   = 17;
+    FemtoNetworkEvent femto = 18;
+    // A1 signaling (A.S0014 / A.S0001).
+    A1SignalingEvent a1 = 19;
   }
 }
 

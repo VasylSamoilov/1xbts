@@ -15,11 +15,10 @@ use crate::ip_transport::IpTransportConfig;
 use crate::proto::packet_service_server::PacketService;
 use crate::proto::{
     AccessTechnology, CloseSessionRequest, CloseSessionResponse, GetSessionByIpRequest,
-    GetSessionByIpResponse, GetSessionStatusRequest, GetSessionStatusResponse, HrpdMnIdSource,
-    ListSessionsRequest, ListSessionsResponse, OpenSessionRequest, OpenSessionResponse,
-    PacketSessionDetail, PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent,
-    SessionFrame, SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest,
-    SetSessionCaptureResponse,
+    GetSessionByIpResponse, GetSessionStatusRequest, GetSessionStatusResponse, ListSessionsRequest,
+    ListSessionsResponse, MnIdSource, OpenSessionRequest, OpenSessionResponse, PacketSessionDetail,
+    PacketSessionInfo, PacketTraceEvent as ProtoPacketTraceEvent, SessionFrame,
+    SetSchActiveRequest, SetSchActiveResponse, SetSessionCaptureRequest, SetSessionCaptureResponse,
 };
 use crate::session_lifecycle::{NullSink, SessionLifecycleSink};
 use crate::session_task::{self, PppSessionStore, SessionControl, SessionMetadata, SessionStatus};
@@ -210,7 +209,7 @@ impl PacketServiceImpl {
     /// byte-stream payload octets from the PCF. The returned downlink receiver
     /// emits byte-stream payload octets to be keyed-GRE encapsulated toward the
     /// PCF. HRPD Default Packet RLP wrapping stays on the AN/BTS air side.
-    pub fn open_hrpd_a10_byte_stream_session_direct(
+    pub fn open_pdsn_a10_byte_stream_session_direct(
         &self,
         session_id: String,
         service_option: u32,
@@ -334,7 +333,7 @@ impl PacketServiceImpl {
     }
 
     /// Close an in-process HRPD A10 Unstructured Byte Stream session.
-    pub async fn close_hrpd_a10_byte_stream_session_direct(&self, session_id: &str) {
+    pub async fn close_pdsn_a10_byte_stream_session_direct(&self, session_id: &str) {
         self.close_session_direct(session_id).await;
     }
 
@@ -489,23 +488,23 @@ fn access_technology_to_proto(label: &str) -> i32 {
     tech as i32
 }
 
-/// Map the domain HRPD MN-ID source label to the wire enum.
-fn hrpd_mn_id_source_to_proto(label: &str) -> i32 {
+/// Map the domain MN-ID source label to the wire enum.
+fn mn_id_source_to_proto(label: &str) -> i32 {
     let source = match label {
-        "a11" => HrpdMnIdSource::A11,
-        "derived_hardware" => HrpdMnIdSource::DerivedHardware,
-        _ => HrpdMnIdSource::Unspecified,
+        "a11" => MnIdSource::A11,
+        "derived_hardware" => MnIdSource::DerivedHardware,
+        _ => MnIdSource::Unspecified,
     };
     source as i32
 }
 
-/// Map the wire HRPD MN-ID source enum back to the domain label, treating the
+/// Map the wire MN-ID source enum back to the domain label, treating the
 /// unspecified variant as absent.
-fn hrpd_mn_id_source_label(value: i32) -> Option<String> {
-    match HrpdMnIdSource::try_from(value).unwrap_or(HrpdMnIdSource::Unspecified) {
-        HrpdMnIdSource::A11 => Some("a11".to_string()),
-        HrpdMnIdSource::DerivedHardware => Some("derived_hardware".to_string()),
-        HrpdMnIdSource::Unspecified => None,
+fn mn_id_source_label(value: i32) -> Option<String> {
+    match MnIdSource::try_from(value).unwrap_or(MnIdSource::Unspecified) {
+        MnIdSource::A11 => Some("a11".to_string()),
+        MnIdSource::DerivedHardware => Some("derived_hardware".to_string()),
+        MnIdSource::Unspecified => None,
     }
 }
 
@@ -534,8 +533,8 @@ fn to_proto_session_info(session_id: &str, status: &SessionStatus) -> PacketSess
         imsi: status.imsi.clone(),
         esn: status.esn,
         meid: status.meid.clone(),
-        hrpd_mn_id: status.hrpd_mn_id.clone(),
-        hrpd_mn_id_source: hrpd_mn_id_source_to_proto(&status.hrpd_mn_id_source),
+        mn_id: status.mn_id.clone(),
+        mn_id_source: mn_id_source_to_proto(&status.mn_id_source),
         subscriber_imsi: status.subscriber_imsi.clone(),
         traffic_walsh_code: status.traffic_walsh_code,
         rlp_state: status.rlp_state.clone(),
@@ -598,8 +597,8 @@ impl PacketService for PacketServiceImpl {
             imsi: (!req.imsi.is_empty()).then(|| req.imsi.clone()),
             esn: (req.esn != 0).then_some(req.esn),
             meid: (!req.meid.is_empty()).then(|| req.meid.clone()),
-            hrpd_mn_id: (!req.hrpd_mn_id.is_empty()).then(|| req.hrpd_mn_id.clone()),
-            hrpd_mn_id_source: hrpd_mn_id_source_label(req.hrpd_mn_id_source),
+            mn_id: (!req.mn_id.is_empty()).then(|| req.mn_id.clone()),
+            mn_id_source: mn_id_source_label(req.mn_id_source),
             subscriber_imsi: (!req.subscriber_imsi.is_empty()).then(|| req.subscriber_imsi.clone()),
             traffic_walsh_code: req.traffic_walsh_code,
         };
@@ -848,9 +847,9 @@ mod tests {
         );
         let session_id = "hrpd-a10-test".to_string();
         let (_uplink_tx, _downlink_rx) = service
-            .open_hrpd_a10_byte_stream_session_direct(
+            .open_pdsn_a10_byte_stream_session_direct(
                 session_id.clone(),
-                u32::from(cdma_common::consts::SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+                u32::from(cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3),
                 SessionMetadata {
                     access_technology: "HRPD".to_string(),
                     mobile_address: "hrpd-uati-session:0000002a".to_string(),
@@ -859,8 +858,8 @@ mod tests {
                     imsi: None,
                     esn: None,
                     meid: None,
-                    hrpd_mn_id: Some("310556898017332".to_string()),
-                    hrpd_mn_id_source: Some("a11".to_string()),
+                    mn_id: Some("310556898017332".to_string()),
+                    mn_id_source: Some("a11".to_string()),
                     subscriber_imsi: None,
                     traffic_walsh_code: 42,
                 },
@@ -874,8 +873,8 @@ mod tests {
             .expect("HRPD A10 session should be in common list");
         assert_eq!(listed.access_technology(), AccessTechnology::Hrpd);
         assert_eq!(listed.imsi, "");
-        assert_eq!(listed.hrpd_mn_id, "310556898017332");
-        assert_eq!(listed.hrpd_mn_id_source(), HrpdMnIdSource::A11);
+        assert_eq!(listed.mn_id, "310556898017332");
+        assert_eq!(listed.mn_id_source(), MnIdSource::A11);
 
         for _ in 0..20 {
             let ready = service
@@ -906,7 +905,7 @@ mod tests {
         assert!(sch_error.contains("does not support SCH"));
 
         service
-            .close_hrpd_a10_byte_stream_session_direct(&session_id)
+            .close_pdsn_a10_byte_stream_session_direct(&session_id)
             .await;
     }
 }

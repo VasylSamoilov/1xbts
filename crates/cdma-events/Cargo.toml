@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "Aggregated network-event bus and gRPC service for 1xBTS components."
 
 [dependencies]
+cdma-ios = { path = "../cdma-ios" }
 cdma-common = { path = "../cdma-common" }
 cdma-hlr = { path = "../cdma-hlr" }
 async-trait = "0.1"

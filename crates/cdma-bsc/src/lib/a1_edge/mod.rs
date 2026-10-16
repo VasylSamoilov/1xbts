@@ -4,6 +4,7 @@
 //! MSC can use it. This module re-exports it and defines the BSC-facing
 //! `MscClient` trait plus the in-process loopback used for testing.
 
+mod events;
 pub mod network;
 
 pub use cdma_ios::{A1TransportError, EncodedA1Message};

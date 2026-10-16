@@ -1,4 +1,4 @@
-import { createChannel, createClient } from "nice-grpc";
+import { createChannel, createClient, waitForChannelReady } from "nice-grpc";
 import { SmscServiceDefinition } from "../proto/smsc/v1/service";
 import { coLocatedServiceAddress } from "./client";
 
@@ -12,4 +12,8 @@ const smscChannel = createChannel(SMSC_GRPC_ADDRESS, undefined, {
 
 export function getSmscClient() {
   return createClient(SmscServiceDefinition, smscChannel);
+}
+
+export async function waitForSmscReady(timeoutMs = 1500) {
+  await waitForChannelReady(smscChannel, new Date(Date.now() + timeoutMs));
 }

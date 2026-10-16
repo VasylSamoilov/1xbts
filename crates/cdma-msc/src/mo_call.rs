@@ -68,7 +68,10 @@ impl MoCallService {
                 resolved.subscriber.phone_number,
                 resolved.subscriber.subscriber_id,
             )),
-            Ok(None) => None,
+            Ok(None) => {
+                warn!("MSC: no subscriber matched MO originator imsi={imsi:?} esn={esn:?}");
+                None
+            }
             Err(error) => {
                 warn!("MSC: HLR originator lookup failed for MO call: {}", error);
                 None

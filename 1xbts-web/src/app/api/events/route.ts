@@ -6,6 +6,7 @@ import {
 import { getEventBusClient } from "@/lib/grpc/events-bus-client";
 import { shouldHideAccessEvent } from "@/lib/access-event-filter";
 import { EventSource } from "@/lib/proto/events/v1/service";
+import { A1SignalingEvent } from "@/lib/proto/events/v1/a1";
 import { HrpdTrafficReason, HrpdUati } from "@/lib/proto/events/v1/an";
 import type {
   HrpdAccessEvent,
@@ -73,6 +74,35 @@ function compactHrpdTrafficEvent(event: HrpdTrafficEvent) {
     payloadLengthBytes: event.payloadLengthBytes || event.payload?.length || 0,
     fullUati: event.fullUati ? HrpdUati.toJSON(event.fullUati) : undefined,
     receiveAti: event.receiveAti,
+  };
+}
+
+function compactA1Event(event: A1SignalingEvent) {
+  const { sdu, ...rest } = event;
+  return {
+    ...rest,
+    sduLengthBytes: sdu?.length ?? 0,
+    informationElements: event.informationElements.map((ie) => ({
+      iei: ie.iei,
+      name: ie.name,
+      contentHex: Array.from(ie.content, (byte) =>
+        byte.toString(16).toUpperCase().padStart(2, "0")
+      ).join(""),
+      // Raw `value` bytes are dropped — `valueHex` carries the same content.
+      ...(ie.mobileIdentity ? { mobileIdentity: ie.mobileIdentity } : {}),
+      ...(ie.serviceOption ? { serviceOption: ie.serviceOption } : {}),
+      ...(ie.registrationType ? { registrationType: ie.registrationType } : {}),
+      ...(ie.cmServiceType ? { cmServiceType: ie.cmServiceType } : {}),
+      ...(ie.slotCycleIndex ? { slotCycleIndex: ie.slotCycleIndex } : {}),
+      ...(ie.tag ? { tag: ie.tag } : {}),
+      ...(ie.channelType ? { channelType: ie.channelType } : {}),
+      ...(ie.channelNumber ? { channelNumber: ie.channelNumber } : {}),
+      ...(ie.calledParty ? { calledParty: ie.calledParty } : {}),
+      ...(ie.authResponse ? { authResponse: { valueHex: ie.authResponse.valueHex } } : {}),
+      ...(ie.authConfirmation ? { authConfirmation: ie.authConfirmation } : {}),
+      ...(ie.authCount ? { authCount: ie.authCount } : {}),
+      ...(ie.authChallenge ? { authChallenge: { valueHex: ie.authChallenge.valueHex } } : {}),
+    })),
   };
 }
 
@@ -165,6 +195,17 @@ export async function GET(request: Request) {
                 sourceNodeType: value.sourceNodeType,
                 classification: value.classification,
               };
+              if (value.nodeHealth) {
+                retryMs = STREAM_RETRY_BASE_MS;
+                publishBackendConnected();
+                send(
+                  `event: node-health\ndata: ${JSON.stringify({
+                    ...value.nodeHealth,
+                    management: metadata,
+                  })}\n\n`
+                );
+                continue;
+              }
               if (value.radioMetrics) {
                 retryMs = STREAM_RETRY_BASE_MS;
                 publishBackendConnected();
@@ -272,30 +313,47 @@ export async function GET(request: Request) {
         }
       };
 
-      // HRPD/AN events arrive on the aggregated event bus rather than the BSC
-      // facade. Re-emit the typed session/access/traffic arms as named SSE
-      // events, carrying the bus-resolved subscriber/identity for the UI.
+      // HRPD/AN events come from the aggregated event bus. Re-emit the typed arms
+      // as named SSE events with the bus-resolved subscriber/identity.
       const runEventBusStream = async () => {
         let retryMs = STREAM_RETRY_BASE_MS;
         while (!abort.signal.aborted) {
           try {
             const client = getEventBusClient();
             for await (const value of client.listenEvents(
-              { sourceFilter: [EventSource.EVENT_SOURCE_AN] },
+              {
+                sourceFilter: [
+                  EventSource.EVENT_SOURCE_BSC,
+                  EventSource.EVENT_SOURCE_AN,
+                  EventSource.EVENT_SOURCE_FEMTO,
+                ],
+              },
               { signal: abort.signal }
             )) {
               if (abort.signal.aborted) {
                 break;
-              }
-              const an = value.an;
-              if (!an) {
-                continue;
               }
               const enrich = {
                 subscriber: value.subscriber,
                 identity: value.identity,
                 sequence: value.sequence,
               };
+              // A1 signaling — `source` says which element published it.
+              if (value.a1) {
+                retryMs = STREAM_RETRY_BASE_MS;
+                send(
+                  `event: a1\ndata: ${JSON.stringify({
+                    ...compactA1Event(value.a1),
+                    source: value.source,
+                    ...enrich,
+                  })}\n\n`
+                );
+                continue;
+              }
+              const an = value.an;
+              if (!an) {
+                continue;
+              }
               if (an.session) {
                 retryMs = STREAM_RETRY_BASE_MS;
                 send(

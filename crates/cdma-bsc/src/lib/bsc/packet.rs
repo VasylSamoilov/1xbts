@@ -7,7 +7,7 @@
 use cdma_abis::control::typed::ForwardBurstRadioInfo;
 use cdma_common::channel::TrafficRate;
 use cdma_common::consts::{
-    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA,
+    SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_PACKET_DATA_RC3,
 };
 use cdma_common::sch::Rc3FschProfile;
 use log::{debug, info, warn};
@@ -86,7 +86,7 @@ impl Bsc {
         let service_option = match req.service_option {
             SERVICE_OPTION_PACKET_DATA => SERVICE_OPTION_PACKET_DATA,
             SERVICE_OPTION_ASYNC_DATA => SERVICE_OPTION_ASYNC_DATA,
-            _ => SERVICE_OPTION_HIGH_RATE_PACKET_DATA,
+            _ => SERVICE_OPTION_PACKET_DATA_RC3,
         };
         info!(
             "BSC: initiating BS-originated data call subscriber={} SO={}",

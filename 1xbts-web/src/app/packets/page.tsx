@@ -33,8 +33,8 @@ interface PacketSessionInfo {
   phoneNumber: string;
   imsi: string;
   meid: string;
-  hrpdMnId: string;
-  hrpdMnIdSource: string;
+  mnId: string;
+  mnIdSource: string;
   subscriberImsi: string;
   esn: number;
   trafficWalshCode: number;
@@ -271,10 +271,10 @@ export default function PacketsPage() {
                                 Subscriber IMSI {subscriberImsi}
                               </div>
                             )}
-                            {session.hrpdMnId && (
+                            {session.mnId && (
                               <div className="text-[11px] text-dimmed font-mono">
-                                HRPD MN ID {session.hrpdMnId}
-                                {session.hrpdMnIdSource ? ` (${session.hrpdMnIdSource})` : ""}
+                                MN ID {session.mnId}
+                                {session.mnIdSource ? ` (${session.mnIdSource})` : ""}
                               </div>
                             )}
                           </div>

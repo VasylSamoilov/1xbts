@@ -9,8 +9,7 @@ export async function GET(request: Request) {
   const timeout = setTimeout(() => abort.abort(), 5000);
   try {
     const client = getNetworkManagementClient();
-    // colorCode 0 selects the AN's configured allocator. The response includes
-    // its actual sector color code.
+    // colorCode 0 selects the AN's configured allocator (the response gives the actual code).
     // A request with no cell sums the UATI pool across every EV-DO cell.
     if (isUnscoped(request.url)) {
       let capacity = 0;
@@ -38,7 +37,7 @@ export async function GET(request: Request) {
     return Response.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    return Response.json({ error: msg }, { status: 502 });
+    return Response.json({ error: msg });
   } finally {
     clearTimeout(timeout);
   }

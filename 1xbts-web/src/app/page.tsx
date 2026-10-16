@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Card, Stat } from "@/components/card";
 import { HrpdSummaryCard } from "@/components/hrpd-summary-card";
 import { useBaseStations } from "@/lib/use-base-stations";
-import { cellLabel } from "@/lib/cell";
+import { attachStateLabel, cellLabel } from "@/lib/cell";
 import { radioConfigPairName } from "@/lib/radio-config";
 import { serviceOptionName } from "@/lib/service-option";
 import { smsStateColor } from "@/lib/sms-state";
@@ -21,6 +21,7 @@ import {
   shouldHideAccessEvent,
 } from "@/components/message-detail";
 import type { AccessEvent, PagingEvent, TrafficEvent } from "@/lib/proto/bsc/v1/service";
+import { CellKind, BtsAttachState, type BtsSummary } from "@/lib/proto/bts_management/v1/service";
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -28,6 +29,8 @@ interface RadioMetrics {
   tx?: { rtRatio: number; blocksTransmitted: number; syncFragmentsSent: number; pagingFragmentsSent: number };
   rx?: { rtRatio: number; deficitMs?: number };
 }
+
+type NetworkCell = BtsSummary & { baseStation: string };
 
 interface MobileInfo {
   address: string;
@@ -134,6 +137,7 @@ const MAX_RECENT = 8;
 
 export default function DashboardPage() {
   const { nodes } = useBaseStations();
+  const [networkCells, setNetworkCells] = useState<NetworkCell[]>([]);
   const [metricsByCell, setMetricsByCell] = useState<Record<string, RadioMetrics>>({});
   const [mobiles, setMobiles] = useState<MobileInfo[]>([]);
   const [channelData, setChannelData] = useState<ChannelsResponse | null>(null);
@@ -141,9 +145,23 @@ export default function DashboardPage() {
   const [packetSessions, setPacketSessions] = useState<PacketSession[]>([]);
   const [recentEvents, setRecentEvents] = useState<RecentEvent[]>([]);
 
-  const cells = nodes.flatMap((node) => node.cells);
   const attachedBs = nodes.filter((node) => node.attached).length;
-  const inServiceCells = cells.filter((cell) => cell.inService).length;
+  const inServiceCells = networkCells.filter(
+    (cell) => cell.state === BtsAttachState.BTS_ATTACH_STATE_IN_SERVICE,
+  ).length;
+
+  useEffect(() => {
+    const fetchNetworkCells = () => {
+      void fetch("/api/bts")
+        .then((response) => response.json())
+        .then((result) => {
+          setNetworkCells(result.bts || []);
+        });
+    };
+    fetchNetworkCells();
+    const interval = setInterval(fetchNetworkCells, 10000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Stream live radio metrics, keyed by the cell that emitted them so the
   // health rollup covers every cell rather than whichever reported last.
@@ -257,20 +275,69 @@ export default function DashboardPage() {
       <h1 className="text-lg font-bold">Dashboard</h1>
 
       {/* Top row: System + Radio */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card title="Network">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card title="Network" className="lg:col-span-2">
           {nodes.length > 0 ? (
             <>
-              <Stat label="Base Stations" value={`${attachedBs}/${nodes.length} attached`} />
-              <Stat label="Cells" value={`${inServiceCells}/${cells.length} in service`} />
+              <div className="grid grid-cols-2 gap-x-8 mb-3">
+                <Stat label="Base Stations" value={`${attachedBs}/${nodes.length} attached`} />
+                <Stat label="Cells" value={`${inServiceCells}/${networkCells.length} in service`} />
+              </div>
+              <div className="overflow-x-auto border-t border-border">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-dimmed uppercase tracking-wide text-[10px]">
+                      <th className="text-left py-2 font-medium">Cell</th>
+                      <th className="text-left py-2 font-medium">Type</th>
+                      <th className="text-left py-2 font-medium">State</th>
+                      <th className="text-left py-2 font-medium">Radio</th>
+                      <th className="text-right py-2 font-medium">Mobiles</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {networkCells.slice(0, 5).map((cell) => (
+                      <tr key={`${cell.baseStation}:${cell.peerId}`} className="border-t border-border-subtle">
+                        <td className="py-2 pr-3">
+                          <Link
+                            href={`/bts/${encodeURIComponent(cell.peerId || "")}?baseStation=${encodeURIComponent(cell.baseStation || "")}`}
+                            className="font-medium text-secondary hover:text-accent-green"
+                          >
+                            {cell.name || cellLabel(cell.cell)}
+                          </Link>
+                          <div className="text-[10px] text-dimmed font-mono mt-0.5">
+                            SID {cell.sid} · NID {cell.nid}
+                          </div>
+                        </td>
+                        <td className="py-2 pr-3">
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] ${
+                            cell.kind === CellKind.CELL_KIND_FEMTOCELL
+                              ? "bg-badge-blue-bg text-badge-blue-text"
+                              : "bg-badge-purple-bg text-badge-purple-text"
+                          }`}>
+                            {cell.kind === CellKind.CELL_KIND_FEMTOCELL ? "Femto" : "SDR"}
+                          </span>
+                        </td>
+                        <td className="py-2 pr-3 text-muted">{attachStateLabel(cell.state)}</td>
+                        <td className="py-2 pr-3 text-dimmed font-mono whitespace-nowrap">
+                          {cell.bandClass || "-"} · CH {cell.cdmaChannel}
+                        </td>
+                        <td className="py-2 text-right text-secondary">{cell.servedMobiles ?? "-"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </>
           ) : (
             <p className="text-dimmed text-sm">Unavailable</p>
           )}
-          <div className="mt-2 pt-2 border-t border-border">
-            <Link href="/base-stations" className="text-xs text-accent-green hover:text-accent-green">
-              Base stations &rarr;
+          <div className="mt-2 pt-2 border-t border-border flex items-center justify-between">
+            <Link href="/bts" className="text-xs text-accent-green hover:text-accent-green">
+              View all cells &rarr;
             </Link>
+            {networkCells.length > 5 && (
+              <span className="text-[11px] text-dimmed">Showing 5 of {networkCells.length}</span>
+            )}
           </div>
         </Card>
 

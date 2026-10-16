@@ -1,6 +1,6 @@
 import {
   AccessTechnology,
-  HrpdMnIdSource,
+  MnIdSource,
   type PacketSessionInfo,
 } from "../proto/packet/v1/service";
 
@@ -19,11 +19,11 @@ function accessTechnologyLabel(value: AccessTechnology): string {
   }
 }
 
-function hrpdMnIdSourceLabel(value: HrpdMnIdSource): string {
+function mnIdSourceLabel(value: MnIdSource): string {
   switch (value) {
-    case HrpdMnIdSource.HRPD_MN_ID_SOURCE_A11:
+    case MnIdSource.MN_ID_SOURCE_A11:
       return "a11";
-    case HrpdMnIdSource.HRPD_MN_ID_SOURCE_DERIVED_HARDWARE:
+    case MnIdSource.MN_ID_SOURCE_DERIVED_HARDWARE:
       return "derived_hardware";
     default:
       return "";
@@ -32,10 +32,10 @@ function hrpdMnIdSourceLabel(value: HrpdMnIdSource): string {
 
 export type PacketSessionJson = Omit<
   PacketSessionInfo,
-  "accessTechnology" | "hrpdMnIdSource"
+  "accessTechnology" | "mnIdSource"
 > & {
   accessTechnology: string;
-  hrpdMnIdSource: string;
+  mnIdSource: string;
 };
 
 export function packetSessionToJson(
@@ -44,6 +44,6 @@ export function packetSessionToJson(
   return {
     ...session,
     accessTechnology: accessTechnologyLabel(session.accessTechnology),
-    hrpdMnIdSource: hrpdMnIdSourceLabel(session.hrpdMnIdSource),
+    mnIdSource: mnIdSourceLabel(session.mnIdSource),
   };
 }

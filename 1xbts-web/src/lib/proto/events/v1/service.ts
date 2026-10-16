@@ -8,9 +8,11 @@
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import type { CallContext, CallOptions } from "nice-grpc-common";
 import { Timestamp } from "../../google/protobuf/timestamp";
+import { A1SignalingEvent } from "./a1";
 import { AnNetworkEvent } from "./an";
 import { BscNetworkEvent } from "./bsc";
 import { BtsNetworkEvent } from "./bts";
+import { FemtoNetworkEvent } from "./femto";
 import { HlrNetworkEvent } from "./hlr";
 import { MscNetworkEvent } from "./msc";
 import { PcfNetworkEvent } from "./pcf";
@@ -31,6 +33,7 @@ export enum EventSource {
   EVENT_SOURCE_SMSC = 7,
   EVENT_SOURCE_NIB = 8,
   EVENT_SOURCE_AN = 9,
+  EVENT_SOURCE_FEMTO = 10,
   UNRECOGNIZED = -1,
 }
 
@@ -66,6 +69,9 @@ export function eventSourceFromJSON(object: any): EventSource {
     case 9:
     case "EVENT_SOURCE_AN":
       return EventSource.EVENT_SOURCE_AN;
+    case 10:
+    case "EVENT_SOURCE_FEMTO":
+      return EventSource.EVENT_SOURCE_FEMTO;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -95,6 +101,8 @@ export function eventSourceToJSON(object: EventSource): string {
       return "EVENT_SOURCE_NIB";
     case EventSource.EVENT_SOURCE_AN:
       return "EVENT_SOURCE_AN";
+    case EventSource.EVENT_SOURCE_FEMTO:
+      return "EVENT_SOURCE_FEMTO";
     case EventSource.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -209,6 +217,11 @@ export interface NetworkEvent {
   smsc?: SmscNetworkEvent | undefined;
   bts?: BtsNetworkEvent | undefined;
   an?: AnNetworkEvent | undefined;
+  femto?:
+    | FemtoNetworkEvent
+    | undefined;
+  /** A1 signaling (A.S0014 / A.S0001). */
+  a1?: A1SignalingEvent | undefined;
 }
 
 export interface PublishRequest {
@@ -452,6 +465,8 @@ function createBaseNetworkEvent(): NetworkEvent {
     smsc: undefined,
     bts: undefined,
     an: undefined,
+    femto: undefined,
+    a1: undefined,
   };
 }
 
@@ -498,6 +513,12 @@ export const NetworkEvent: MessageFns<NetworkEvent> = {
     }
     if (message.an !== undefined) {
       AnNetworkEvent.encode(message.an, writer.uint32(138).fork()).join();
+    }
+    if (message.femto !== undefined) {
+      FemtoNetworkEvent.encode(message.femto, writer.uint32(146).fork()).join();
+    }
+    if (message.a1 !== undefined) {
+      A1SignalingEvent.encode(message.a1, writer.uint32(154).fork()).join();
     }
     return writer;
   },
@@ -621,6 +642,22 @@ export const NetworkEvent: MessageFns<NetworkEvent> = {
           message.an = AnNetworkEvent.decode(reader, reader.uint32());
           continue;
         }
+        case 18: {
+          if (tag !== 146) {
+            break;
+          }
+
+          message.femto = FemtoNetworkEvent.decode(reader, reader.uint32());
+          continue;
+        }
+        case 19: {
+          if (tag !== 154) {
+            break;
+          }
+
+          message.a1 = A1SignalingEvent.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -650,6 +687,8 @@ export const NetworkEvent: MessageFns<NetworkEvent> = {
       smsc: isSet(object.smsc) ? SmscNetworkEvent.fromJSON(object.smsc) : undefined,
       bts: isSet(object.bts) ? BtsNetworkEvent.fromJSON(object.bts) : undefined,
       an: isSet(object.an) ? AnNetworkEvent.fromJSON(object.an) : undefined,
+      femto: isSet(object.femto) ? FemtoNetworkEvent.fromJSON(object.femto) : undefined,
+      a1: isSet(object.a1) ? A1SignalingEvent.fromJSON(object.a1) : undefined,
     };
   },
 
@@ -697,6 +736,12 @@ export const NetworkEvent: MessageFns<NetworkEvent> = {
     if (message.an !== undefined) {
       obj.an = AnNetworkEvent.toJSON(message.an);
     }
+    if (message.femto !== undefined) {
+      obj.femto = FemtoNetworkEvent.toJSON(message.femto);
+    }
+    if (message.a1 !== undefined) {
+      obj.a1 = A1SignalingEvent.toJSON(message.a1);
+    }
     return obj;
   },
 
@@ -737,6 +782,10 @@ export const NetworkEvent: MessageFns<NetworkEvent> = {
       ? BtsNetworkEvent.fromPartial(object.bts)
       : undefined;
     message.an = (object.an !== undefined && object.an !== null) ? AnNetworkEvent.fromPartial(object.an) : undefined;
+    message.femto = (object.femto !== undefined && object.femto !== null)
+      ? FemtoNetworkEvent.fromPartial(object.femto)
+      : undefined;
+    message.a1 = (object.a1 !== undefined && object.a1 !== null) ? A1SignalingEvent.fromPartial(object.a1) : undefined;
     return message;
   },
 };
@@ -941,10 +990,7 @@ export const ListenEventsRequest: MessageFns<ListenEventsRequest> = {
   },
 };
 
-/**
- * Aggregated event bus. Every component publishes events here as a gRPC
- * client; every consumer subscribes to ListenEvents.
- */
+/** Aggregated network event bus. */
 export type EventServiceDefinition = typeof EventServiceDefinition;
 export const EventServiceDefinition = {
   name: "EventService",

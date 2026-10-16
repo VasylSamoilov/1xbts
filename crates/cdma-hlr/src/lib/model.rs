@@ -321,6 +321,56 @@ pub struct SubscriberIdentity {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthAlgorithm {
+    #[default]
+    None,
+    Cave,
+}
+
+impl AuthAlgorithm {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cave => "cave",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Self::None),
+            "cave" => Ok(Self::Cave),
+            other => Err(format!("unknown auth algorithm: {other}")),
+        }
+    }
+}
+
+pub const AUTH_KEY_LEN: usize = 8;
+
+/// The raw A-key is never returned.
+#[derive(Debug, Clone)]
+pub struct IdentityAuthState {
+    pub subscriber_identity_id: Uuid,
+    pub credentials_provisioned: bool,
+    pub ssd_provisioned: bool,
+    pub auth_algo: AuthAlgorithm,
+    /// CAVE 6-bit call-history COUNT (0..=63).
+    pub auth_count: u8,
+    pub auth_failure_count: u32,
+    pub last_auth_at: Option<DateTime<Utc>>,
+}
+
+pub fn validate_auth_key(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() != AUTH_KEY_LEN {
+        return Err(format!(
+            "auth key must be exactly {} bytes, got {}",
+            AUTH_KEY_LEN,
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Validates an IMSI: exactly 15 decimal digits (3GPP TS 23.003 / E.212).
 pub fn validate_imsi(imsi: &str) -> Result<(), String> {
     if imsi.len() != IMSI_LEN {
@@ -471,5 +521,24 @@ mod tests {
         assert!(validate_phone_number("555-0001").is_err());
         assert!(validate_phone_number("555 0001").is_err());
         assert!(validate_phone_number("abc").is_err());
+    }
+
+    #[test]
+    fn auth_algorithm_round_trips_through_string() {
+        use super::AuthAlgorithm;
+        for algo in [AuthAlgorithm::None, AuthAlgorithm::Cave] {
+            assert_eq!(AuthAlgorithm::from_str(algo.as_str()).unwrap(), algo);
+        }
+        assert!(AuthAlgorithm::from_str("md5").is_err());
+        assert_eq!(AuthAlgorithm::default(), AuthAlgorithm::None);
+    }
+
+    #[test]
+    fn validates_auth_key_length() {
+        use super::{AUTH_KEY_LEN, validate_auth_key};
+        assert!(validate_auth_key(&[0u8; AUTH_KEY_LEN]).is_ok());
+        assert!(validate_auth_key(&[0u8; 7]).is_err());
+        assert!(validate_auth_key(&[0u8; 9]).is_err());
+        assert!(validate_auth_key(&[]).is_err());
     }
 }

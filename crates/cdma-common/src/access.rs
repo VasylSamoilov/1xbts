@@ -7725,7 +7725,7 @@ fn decode_page_response(
 mod tests {
     use crate::bits::Bitstream;
     use crate::consts::{
-        SERVICE_OPTION_HIGH_RATE_PACKET_DATA, SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_SMS,
+        SERVICE_OPTION_PACKET_DATA, SERVICE_OPTION_PACKET_DATA_RC3, SERVICE_OPTION_SMS,
     };
     use crate::lac::message_types::{MessageId, WireChannel};
 
@@ -10103,7 +10103,7 @@ mod tests {
         bits.write_u8(rcsch_wire(MessageId::Reconnect), 8);
         bits.write_u8(1, 1); // ORIG_IND
         bits.write_u8(0, 1); // SYNC_ID_INCL
-        bits.write_u32(u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA), 16); // SERVICE_OPTION
+        bits.write_u32(u32::from(SERVICE_OPTION_PACKET_DATA_RC3), 16); // SERVICE_OPTION
         bits.write_u8(0b010, 3); // SR_ID
 
         let msg =
@@ -10115,10 +10115,7 @@ mod tests {
         };
         assert!(msg.orig_ind);
         assert!(!msg.sync_id_incl);
-        assert_eq!(
-            Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
-            msg.service_option
-        );
+        assert_eq!(Some(SERVICE_OPTION_PACKET_DATA_RC3), msg.service_option);
         assert_eq!(Some(0b010), msg.sr_id);
         assert_eq!(None, msg.sdb_incl);
         assert_eq!(0, msg.remaining_bits);
@@ -10335,7 +10332,7 @@ mod tests {
             scm: 0x2a,
             request_mode: 1,
             special_service: true,
-            service_option: Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            service_option: Some(SERVICE_OPTION_PACKET_DATA_RC3),
             pm: false,
             digit_mode: false,
             number_type: None,
@@ -10693,7 +10690,7 @@ mod tests {
             scm: 0x2a,
             request_mode: 1,
             special_service: true,
-            service_option: Some(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            service_option: Some(SERVICE_OPTION_PACKET_DATA_RC3),
             pm: false,
             digit_mode: false,
             number_type: Some(0),
@@ -11399,7 +11396,7 @@ mod tests {
         bits.write_u8(9, 8); // MOB_P_REV
         bits.write_u8(0x2a, 8); // SCM
         bits.write_u8(0b001, 3); // REQUEST_MODE
-        bits.write_u32(u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA), 16); // SERVICE_OPTION
+        bits.write_u32(u32::from(SERVICE_OPTION_PACKET_DATA_RC3), 16); // SERVICE_OPTION
         bits.write_u8(0, 1); // PM
         bits.write_u8(0, 1); // NAR_AN_CAP
         // ENCRYPTION_SUPPORTED omitted (p_rev >= 7)
@@ -11491,7 +11488,7 @@ mod tests {
         bits.write_u8(11, 8); // MOB_P_REV
         bits.write_u8(0x2a, 8); // SCM
         bits.write_u8(0b001, 3); // REQUEST_MODE
-        bits.write_u32(u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA), 16); // SERVICE_OPTION
+        bits.write_u32(u32::from(SERVICE_OPTION_PACKET_DATA_RC3), 16); // SERVICE_OPTION
         bits.write_u8(0, 1); // PM
         bits.write_u8(0, 1); // NAR_AN_CAP
         bits.write_u8(0, 3); // NUM_ALT_SO

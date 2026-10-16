@@ -191,7 +191,7 @@ impl MtCallService {
                 channel_rate_and_type: 0x08,
                 coding: 0x05,
             },
-            circuit_identity_code: cic,
+            circuit_identity_code: Some(cic),
             encryption_information: None,
             service_option: Some(cdma_ios::ServiceOption(service_option)),
             signals: Vec::new(),

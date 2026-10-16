@@ -27,7 +27,7 @@ use crate::rlp2_frames::{self as rlp2_codec};
 use crate::rlp2_session::{Rlp2Session, Rlp2State};
 use crate::rlp3_frames::MuxOption;
 use crate::rlp3_session::{FrameRate, Rlp3Config, Rlp3Session, Rlp3State, RlpEvent};
-use cdma_common::consts::{SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_HIGH_RATE_PACKET_DATA};
+use cdma_common::consts::{SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_PACKET_DATA_RC3};
 use cdma_common::crc::crc16_sch;
 use cdma_common::hrpd::traffic::{
     DEFAULT_PACKET_RLP_SEQUENCE_BITS, default_packet_rlp_packet_bits,
@@ -1213,7 +1213,7 @@ impl PacketSession {
         ppp_resume: Option<PppSessionState>,
     ) -> Self {
         let rlp: Box<dyn RlpBackend> =
-            if service_option == u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA) {
+            if service_option == u32::from(SERVICE_OPTION_PACKET_DATA_RC3) {
                 log::debug!("PacketSession: using RLP Type 3 for SO {}", service_option);
                 Box::new(Rlp3Backend::new(Rlp3Config {
                     mux_option: MuxOption::Odd, // 171-bit frames (MUX option 0x1, Rate Set 1)
@@ -3283,7 +3283,7 @@ mod tests {
     #[test]
     fn a10_unstructured_byte_stream_session_starts_lcp_before_uplink() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3322,7 +3322,7 @@ mod tests {
     #[test]
     fn a10_uplink_burst_is_ingested_without_packet_session_ticks() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3347,7 +3347,7 @@ mod tests {
     #[test]
     fn a10_lcp_peer_ack_without_peer_request_advances_to_ipcp_after_retransmits() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3405,7 +3405,7 @@ mod tests {
     #[test]
     fn a10_lcp_peer_request_without_peer_ack_waits_for_peer_ipcp() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3448,7 +3448,7 @@ mod tests {
     #[test]
     fn a10_simple_ip_dns_only_peer_request_opens_active_after_max_failure() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3486,7 +3486,7 @@ mod tests {
     #[test]
     fn a10_peer_lcp_terminate_sets_one_shot_signal() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3524,7 +3524,7 @@ mod tests {
     #[test]
     fn a10_unstructured_byte_stream_tick_drains_backlog_in_multiple_chunks() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3547,7 +3547,7 @@ mod tests {
     #[test]
     fn a10_unstructured_byte_stream_coalesces_partial_arrival_chunks() {
         let mut session = PacketSession::new_a10_unstructured_byte_stream(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -3602,7 +3602,7 @@ mod tests {
     #[test]
     fn hrpd_default_packet_session_emits_lcp_without_rlp_sync() {
         let mut session = PacketSession::new_hrpd_default_packet(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
             None,
         );
@@ -4050,7 +4050,7 @@ mod tests {
     #[test]
     fn active_sch_emits_fill_muxpdu_when_rlp_queue_empty() {
         let mut session = PacketSession::new(
-            u32::from(SERVICE_OPTION_HIGH_RATE_PACKET_DATA),
+            u32::from(SERVICE_OPTION_PACKET_DATA_RC3),
             IpcpConfig::default(),
         );
         complete_rlp3_handshake(&mut session);

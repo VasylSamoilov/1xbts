@@ -32,8 +32,8 @@ interface PacketSessionInfo {
   phoneNumber: string;
   imsi: string;
   meid: string;
-  hrpdMnId: string;
-  hrpdMnIdSource: string;
+  mnId: string;
+  mnIdSource: string;
   subscriberImsi: string;
   esn: number;
   trafficWalshCode: number;
@@ -376,8 +376,8 @@ export default function PacketSessionDetailPage({
           <Stat label="Subscriber" value={summary.subscriberId || "-"} mono />
           <Stat label="ESN" value={summary.esn ? `0x${summary.esn.toString(16).toUpperCase().padStart(8, "0")}` : "-"} mono />
           <Stat label="MEID" value={summary.meid || "-"} mono />
-          <Stat label="HRPD MN ID" value={summary.hrpdMnId || "-"} mono />
-          <Stat label="MN ID Source" value={summary.hrpdMnIdSource || "-"} mono />
+          <Stat label="MN ID" value={summary.mnId || "-"} mono />
+          <Stat label="MN ID Source" value={summary.mnIdSource || "-"} mono />
         </Card>
       </div>
 

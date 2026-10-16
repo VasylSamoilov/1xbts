@@ -5,7 +5,7 @@
   "tx_antenna": "TXA",
   "rx_antenna": "A_BALANCED",
   "tx_gain_db": 65,
-  "rx_gain_db": 20,
+  "rx_gain_db": 15,
   "rx_reference_dbm": null,
   "rx_power_adj": 0.0,
   "rx_sample_delay": 82,

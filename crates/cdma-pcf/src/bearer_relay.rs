@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use cdma_common::error::Error;
 use log::{info, warn};
 
-const HRPD_BEARER_MAX_DATAGRAMS_PER_PASS: usize = 64;
+const A10_BEARER_MAX_DATAGRAMS_PER_PASS: usize = 64;
 
 enum HrpdPcfBearerCommand {
     Register {
@@ -145,7 +145,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                 &mut a8_peers,
             ) > 0;
 
-            for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
+            for _ in 0..A10_BEARER_MAX_DATAGRAMS_PER_PASS {
                 if !relay_one_a8_to_a10(
                     &a8,
                     &a10,
@@ -170,7 +170,7 @@ pub fn spawn_hrpd_pcf_bearer_relay(
                 &mut a10_to_a8,
                 &mut a8_peers,
             ) > 0;
-            for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
+            for _ in 0..A10_BEARER_MAX_DATAGRAMS_PER_PASS {
                 if !relay_one_a10_to_a8(
                     &a10,
                     &a8,

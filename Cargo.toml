@@ -5,13 +5,18 @@ members = [
     "crates/cdma-a9",
     "crates/cdma-a10",
     "crates/cdma-a11",
+    "crates/cdma-a12",
     "crates/cdma-a21",
     "crates/cdma-abis",
     "crates/cdma-an",
     "crates/cdma-bsc",
     "crates/cdma-bts",
+    "crates/cdma-cave",
     "crates/cdma-common",
     "crates/cdma-events",
+    "crates/cdma-femto",
+    "crates/cdma-cwmp",
+    "crates/cdma-sip",
     "crates/cdma-hlr",
     "crates/cdma-ios",
     "crates/cdma-modem",
@@ -42,6 +47,7 @@ members = [
 ]
 
 [workspace.dependencies]
+quick-xml = { version = "0.41", default-features = false }
 rustix = { version = "0.38.44", features = ["pipe", "stdio", "termios"] }
 socket2 = "0.6.3"
 

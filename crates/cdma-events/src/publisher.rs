@@ -145,11 +145,8 @@ impl EventPublisher {
     }
 }
 
-#[cfg(test)]
 impl EventPublisher {
-    /// Test-only: synchronous publish that doesn't spawn a drainer. Used to
-    /// validate the shed-oldest behavior without standing up a gRPC bus.
-    pub fn for_test(capacity: usize) -> Self {
+    pub fn in_memory(capacity: usize) -> Self {
         let ring = Arc::new(Ring {
             queue: PlMutex::new(VecDeque::with_capacity(capacity)),
             notify: Notify::new(),
@@ -162,6 +159,17 @@ impl EventPublisher {
             ring,
             producer_instance: Arc::new("test".to_string()),
         }
+    }
+
+    pub fn drain_published(&self) -> Vec<NetworkEvent> {
+        self.ring.queue.lock().drain(..).collect()
+    }
+}
+
+#[cfg(test)]
+impl EventPublisher {
+    pub fn for_test(capacity: usize) -> Self {
+        Self::in_memory(capacity)
     }
 
     pub fn queue_len(&self) -> usize {

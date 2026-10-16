@@ -13,6 +13,9 @@ test/capture/*
 .claude/
 .worktrees
 config/*.local.json
+config/femto/segw/
+config/femto-segw/femto.local.json
+config/femto-segw/swanctl/
 .env
 .env.*
 !.env.example

@@ -141,16 +141,6 @@ impl NetworkManagementService for NetworkManagement {
         self.bts(&selector)?.list_bts(()).await
     }
 
-    async fn get_bts_status(
-        &self,
-        request: Request<mgmt::CellScopedRequest>,
-    ) -> Result<Response<bsc::SystemStatus>, Status> {
-        let req = request.into_inner();
-        self.bts(&req.selector)?
-            .get_bts_status(cell_request(req.request))
-            .await
-    }
-
     async fn get_bts_config(
         &self,
         request: Request<mgmt::CellScopedRequest>,
@@ -270,14 +260,6 @@ impl NetworkManagementService for NetworkManagement {
     }
 
     // Per-selector proxy: BSC management
-
-    async fn get_bsc_status(
-        &self,
-        request: Request<mgmt::BsRequest>,
-    ) -> Result<Response<bsc::SystemStatus>, Status> {
-        let selector = request.into_inner().selector;
-        self.bsc_mgmt(&selector)?.get_bsc_status(()).await
-    }
 
     async fn list_mobiles(
         &self,

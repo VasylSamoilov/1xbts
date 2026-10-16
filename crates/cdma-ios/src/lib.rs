@@ -4,6 +4,8 @@ use std::fmt::{Display, Formatter};
 
 /// A1 message encoding and decoding (TIA/EIA/IS-2001).
 pub mod a1_message;
+/// `FemtoInterfaceMsg` A1-over-SIP body codec (3GPP2 X.S0059-200 §8.1.1.2).
+pub mod femto_interface_msg;
 /// A1 call-control procedures (origination, paging, assignment, release).
 pub mod procedures;
 /// Well-known A1 port and address constants.
@@ -66,6 +68,7 @@ pub use procedures::{
     TimerAction, Transition,
 };
 pub use typed::{
+    A1Frame,
     A2pBearerFormatParams,
     A2pBearerSessionParams,
     // ADDS messages (A.S0001 §6.1.7)
@@ -177,6 +180,7 @@ pub use typed::{
     Tag,
     UserZoneId,
     UserZoneUpdateMessage,
+    split_a1_frame,
 };
 pub use voice_bearer::{
     BearerEvent, BearerPayloadTypes, DtmfBearerEvent, RtpSendState, VoiceBearerFormat,

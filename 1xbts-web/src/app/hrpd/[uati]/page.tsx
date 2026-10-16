@@ -61,8 +61,8 @@ interface PacketSessionInfo {
   phoneNumber: string;
   imsi: string;
   meid: string;
-  hrpdMnId: string;
-  hrpdMnIdSource: string;
+  mnId: string;
+  mnIdSource: string;
   subscriberImsi: string;
   esn: number;
   trafficWalshCode: number;
@@ -240,7 +240,7 @@ export default function HrpdSessionPage() {
             }
           }
         }
-        // Records are oldest-first; the timeline renders newest-first.
+        // Records are oldest-first. The timeline renders newest-first.
         setTimeline(rows.reverse().slice(0, MAX_TIMELINE));
         setSamples(seededSamples.slice(-MAX_SAMPLES));
         if (seededLatest) setLatest(seededLatest);
@@ -538,12 +538,12 @@ export default function HrpdSessionPage() {
                 </span>
               </div>
             )}
-            {packetSession.hrpdMnId && (
+            {packetSession.mnId && (
               <div className="text-muted">
-                HRPD MN ID{" "}
+                MN ID{" "}
                 <span className="font-mono text-primary">
-                  {packetSession.hrpdMnId}
-                  {packetSession.hrpdMnIdSource ? ` (${packetSession.hrpdMnIdSource})` : ""}
+                  {packetSession.mnId}
+                  {packetSession.mnIdSource ? ` (${packetSession.mnIdSource})` : ""}
                 </span>
               </div>
             )}

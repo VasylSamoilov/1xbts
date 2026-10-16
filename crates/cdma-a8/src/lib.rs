@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::os::fd::{AsRawFd, RawFd};
 
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -353,6 +354,111 @@ const IP_PROTOCOL_GRE: i32 = 47;
 pub struct RawGreEndpoint {
     socket: Socket,
     remote_ip: IpAddr,
+}
+
+#[derive(Debug)]
+pub struct RawGreSocket {
+    socket: Socket,
+    local_ip: IpAddr,
+}
+
+impl AsRawFd for RawGreSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+}
+
+impl RawGreSocket {
+    pub fn bind(local_ip: IpAddr, label: &str) -> Result<Self> {
+        let domain = match local_ip {
+            IpAddr::V4(_) => Domain::IPV4,
+            IpAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = Socket::new(domain, Type::RAW, Some(Protocol::from(IP_PROTOCOL_GRE)))
+            .map_err(|e| RawGreEndpoint::map_socket_error(label, "create raw GRE socket", &e))?;
+        socket
+            .bind(&SocketAddr::new(local_ip, 0).into())
+            .map_err(|e| RawGreEndpoint::map_socket_error(label, "bind raw GRE socket", &e))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| Error::RawTransport(format!("{label}: set nonblocking: {e}")))?;
+        Ok(Self { socket, local_ip })
+    }
+
+    pub fn send_wire_packet_to(&self, remote_ip: IpAddr, wire_bytes: &[u8]) -> Result<usize> {
+        self.socket
+            .send_to(wire_bytes, &SockAddr::from(SocketAddr::new(remote_ip, 0)))
+            .map_err(|e| Error::RawTransport(format!("send native GRE packet: {e}")))
+    }
+
+    pub fn try_recv_wire_packet(&self, buf: &mut [u8]) -> Result<(Vec<u8>, IpAddr)> {
+        // SAFETY: MaybeUninit<u8> has the same layout as u8. The cast preserves
+        // the slice length and exclusive borrow, and recv_from never deinitializes bytes.
+        let uninit = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                buf.len(),
+            )
+        };
+        let (len, from) = self
+            .socket
+            .recv_from(uninit)
+            .map_err(|e| Error::RawTransport(format!("receive native GRE packet: {e}")))?;
+        let source_ip = from
+            .as_socket()
+            .map(|addr| addr.ip())
+            .ok_or_else(|| Error::RawTransport("native GRE source address unavailable".into()))?;
+        let gre_bytes = strip_inbound_ip_header(self.local_ip, &buf[..len])?;
+        GrePacket::decode(gre_bytes)?;
+        Ok((gre_bytes.to_vec(), source_ip))
+    }
+}
+
+#[derive(Debug)]
+pub struct TokioRawGreSocket {
+    socket: tokio::io::unix::AsyncFd<RawGreSocket>,
+}
+
+impl TokioRawGreSocket {
+    pub fn bind(local_ip: IpAddr, label: &str) -> Result<Self> {
+        let socket = RawGreSocket::bind(local_ip, label)?;
+        tokio::io::unix::AsyncFd::new(socket)
+            .map(|socket| Self { socket })
+            .map_err(|e| Error::RawTransport(format!("{label}: Tokio raw GRE setup: {e}")))
+    }
+
+    pub async fn readable(&self) -> std::io::Result<()> {
+        let mut guard = self.socket.readable().await?;
+        guard.clear_ready();
+        Ok(())
+    }
+
+    pub fn local_ip(&self) -> IpAddr {
+        self.socket.get_ref().local_ip
+    }
+
+    pub fn try_recv_wire_packet(&self, buf: &mut [u8]) -> Result<(Vec<u8>, IpAddr)> {
+        self.socket.get_ref().try_recv_wire_packet(buf)
+    }
+
+    pub async fn send_wire_packet_to(&self, remote_ip: IpAddr, wire_bytes: &[u8]) -> Result<usize> {
+        loop {
+            let mut guard = self
+                .socket
+                .writable()
+                .await
+                .map_err(|e| Error::RawTransport(format!("wait to send native GRE: {e}")))?;
+            match guard.try_io(|socket| {
+                socket
+                    .get_ref()
+                    .send_wire_packet_to(remote_ip, wire_bytes)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }) {
+                Ok(result) => return result.map_err(|e| Error::RawTransport(e.to_string())),
+                Err(_) => continue,
+            }
+        }
+    }
 }
 
 impl RawGreEndpoint {

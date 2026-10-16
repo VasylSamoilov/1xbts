@@ -165,13 +165,18 @@ async fn callee_assignment_retry_preserves_the_pending_caller_and_relinks_the_ne
             .has_pending_assignment_complete(setup.caller)
     );
     assert!(
-        !runtime
-            .circuits
-            .circuits
-            .contains_key(&first.circuit_identity_code.to_packed())
+        !runtime.circuits.circuits.contains_key(
+            &first
+                .circuit_identity_code
+                .expect("assignment CIC")
+                .to_packed()
+        )
     );
     let second = assign_callee(&mut runtime, &endpoint, &client, &setup).await;
-    let new_circuit = second.circuit_identity_code.to_packed();
+    let new_circuit = second
+        .circuit_identity_code
+        .expect("assignment CIC")
+        .to_packed();
     assert_ne!(first.circuit_identity_code, second.circuit_identity_code);
     assert_eq!(
         runtime.circuits.circuits[&setup.caller_circuit].peer_circuit_id,
@@ -498,7 +503,10 @@ async fn independent_bearers_stay_silent_until_answer_and_route_both_directions(
         )));
         let setup = begin_m2m_setup(&mut runtime, &endpoint, &client).await;
         let assignment = assign_callee(&mut runtime, &endpoint, &client, &setup).await;
-        let callee_circuit = assignment.circuit_identity_code.to_packed();
+        let callee_circuit = assignment
+            .circuit_identity_code
+            .expect("assignment CIC")
+            .to_packed();
         let receiver = VoiceBearerManager::new(std::net::Ipv4Addr::LOCALHOST);
         let caller_remote = receiver
             .open_circuit(setup.caller_circuit, None)

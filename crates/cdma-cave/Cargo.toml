@@ -1,0 +1,15 @@
+[package]
+name = "cdma-cave"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CDMA CAVE authentication algorithm (SSD generation, AUTHR/AUTHU/AUTHBS, CMEA/VPM) per C.S0005-E and TIA Common Cryptographic Algorithms."
+
+[dependencies]
+thiserror = "1"
+
+[lints]
+workspace = true

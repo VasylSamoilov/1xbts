@@ -12,6 +12,24 @@ use crate::{
 /// Fixed header size for the crate-local A11 UDP frame wrapper.
 pub const UDP_FRAME_HEADER_LEN: usize = 2;
 
+/// 3GPP2 A.S0017 carries A11 registration messages as bare Mobile-IP
+/// registrations (RFC 3012 / RFC 2002) on UDP port 699, with no outer length
+/// prefix. A real FAP/PCF binds this port and uses [`A11Framing::Bare`].
+pub const A11_STANDARD_UDP_PORT: u16 = 699;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum A11Framing {
+    /// Crate-local 2-byte big-endian payload-length prefix ahead of the
+    /// message bytes.
+    #[default]
+    LengthPrefixed,
+    /// Standards-conformant bare registration message with no outer prefix:
+    /// the datagram is the whole A11 message. This is the framing a real
+    /// FAP/PCF speaks on [`A11_STANDARD_UDP_PORT`].
+    Bare,
+}
+
 /// Length-delimited UDP frame carrying one exact A11 message payload.
 ///
 /// This helper is intentionally transport-local to the crate. It does not model
@@ -47,31 +65,58 @@ impl UdpFrame {
 
     /// Encodes the UDP frame as `payload_length | message_bytes`.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let payload = encode(&self.message)?;
-        let payload_len = u16::try_from(payload.len()).map_err(|_| Error::InvalidValue {
-            context: "udp_frame.payload_len",
-            reason: "encoded message exceeds u16 transport length",
-        })?;
-
-        let mut out = Vec::with_capacity(UDP_FRAME_HEADER_LEN + payload.len());
-        out.extend_from_slice(&payload_len.to_be_bytes());
-        out.extend_from_slice(&payload);
-        Ok(out)
+        self.encode_with(A11Framing::LengthPrefixed)
     }
 
-    /// Decodes one UDP frame from an exact datagram slice without verifying authentication.
+    pub fn encode_with(&self, framing: A11Framing) -> Result<Vec<u8>> {
+        let payload = encode(&self.message)?;
+        match framing {
+            A11Framing::Bare => Ok(payload),
+            A11Framing::LengthPrefixed => {
+                let payload_len =
+                    u16::try_from(payload.len()).map_err(|_| Error::InvalidValue {
+                        context: "udp_frame.payload_len",
+                        reason: "encoded message exceeds u16 transport length",
+                    })?;
+
+                let mut out = Vec::with_capacity(UDP_FRAME_HEADER_LEN + payload.len());
+                out.extend_from_slice(&payload_len.to_be_bytes());
+                out.extend_from_slice(&payload);
+                Ok(out)
+            }
+        }
+    }
+
     pub fn decode_unverified(input: &[u8], reason: UnverifiedDecodeReason) -> Result<Self> {
-        let payload = udp_frame_payload(input)?;
+        Self::decode_unverified_with(input, reason, A11Framing::LengthPrefixed)
+    }
+
+    pub fn decode_unverified_with(
+        input: &[u8],
+        reason: UnverifiedDecodeReason,
+        framing: A11Framing,
+    ) -> Result<Self> {
+        let payload = frame_payload(input, framing)?;
         let message = decode_unverified(payload, reason)?;
         Ok(Self { message })
     }
 
-    /// Decodes one UDP frame from an exact datagram slice and verifies authentication.
     pub fn decode_verified<V>(input: &[u8], verifier: &V) -> Result<VerifiedUdpFrame>
     where
         V: AuthenticationVerifier + ?Sized,
     {
-        let payload = udp_frame_payload(input)?;
+        Self::decode_verified_with(input, verifier, A11Framing::LengthPrefixed)
+    }
+
+    pub fn decode_verified_with<V>(
+        input: &[u8],
+        verifier: &V,
+        framing: A11Framing,
+    ) -> Result<VerifiedUdpFrame>
+    where
+        V: AuthenticationVerifier + ?Sized,
+    {
+        let payload = frame_payload(input, framing)?;
         let message = decode_verified(payload, verifier)?;
         Ok(VerifiedUdpFrame { message })
     }
@@ -80,14 +125,25 @@ impl UdpFrame {
 /// Native UDP/IP endpoint for A11 signaling.
 pub struct UdpEndpoint {
     socket: UdpSocket,
+    framing: A11Framing,
 }
 
 impl UdpEndpoint {
-    /// Binds an A11 UDP endpoint to a local address.
     pub async fn bind(local_addr: SocketAddr) -> std::io::Result<Self> {
+        Self::bind_with_framing(local_addr, A11Framing::LengthPrefixed).await
+    }
+
+    pub async fn bind_with_framing(
+        local_addr: SocketAddr,
+        framing: A11Framing,
+    ) -> std::io::Result<Self> {
         UdpSocket::bind(local_addr)
             .await
-            .map(|socket| Self { socket })
+            .map(|socket| Self { socket, framing })
+    }
+
+    pub fn framing(&self) -> A11Framing {
+        self.framing
     }
 
     /// Returns the bound local address.
@@ -95,9 +151,10 @@ impl UdpEndpoint {
         self.socket.local_addr()
     }
 
-    /// Sends one length-delimited A11 UDP frame to a peer.
     pub async fn send_frame(&self, peer: SocketAddr, frame: &UdpFrame) -> std::io::Result<usize> {
-        let bytes = frame.encode().map_err(to_io_invalid_data)?;
+        let bytes = frame
+            .encode_with(self.framing)
+            .map_err(to_io_invalid_data)?;
         self.socket.send_to(&bytes, peer).await
     }
 
@@ -113,7 +170,8 @@ impl UdpEndpoint {
         reason: UnverifiedDecodeReason,
     ) -> std::io::Result<(UdpFrame, SocketAddr)> {
         let (len, peer) = self.socket.recv_from(buf).await?;
-        let frame = UdpFrame::decode_unverified(&buf[..len], reason).map_err(to_io_invalid_data)?;
+        let frame = UdpFrame::decode_unverified_with(&buf[..len], reason, self.framing)
+            .map_err(to_io_invalid_data)?;
         Ok((frame, peer))
     }
 
@@ -137,7 +195,8 @@ impl UdpEndpoint {
         V: AuthenticationVerifier + ?Sized,
     {
         let (len, peer) = self.socket.recv_from(buf).await?;
-        let frame = UdpFrame::decode_verified(&buf[..len], verifier).map_err(to_io_invalid_data)?;
+        let frame = UdpFrame::decode_verified_with(&buf[..len], verifier, self.framing)
+            .map_err(to_io_invalid_data)?;
         Ok((frame, peer))
     }
 
@@ -152,6 +211,13 @@ impl UdpEndpoint {
     {
         let (frame, peer) = self.recv_frame_verified(buf, verifier).await?;
         Ok((frame.message, peer))
+    }
+}
+
+fn frame_payload(input: &[u8], framing: A11Framing) -> Result<&[u8]> {
+    match framing {
+        A11Framing::Bare => Ok(input),
+        A11Framing::LengthPrefixed => udp_frame_payload(input),
     }
 }
 

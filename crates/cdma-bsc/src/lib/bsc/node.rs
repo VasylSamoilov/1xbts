@@ -168,6 +168,16 @@ pub async fn run_node(config_dir: &Path) -> Result<(), Error> {
     let msc_client = NetworkMscClient::bind(bsc_config.a1_bind_addr)
         .await
         .map_err(|e| Error::from(format!("failed to bind the BSC A1 listener: {e}")))?;
+    let msc_client = match bsc_config.events_endpoint.as_deref() {
+        Some(endpoint) => {
+            let publisher = cdma_events::EventPublisher::spawn(
+                cdma_events::EventPublisherConfig::new(endpoint, &bsc_config.node_id),
+            )?;
+            info!("BSC A1 events publishing to {endpoint}");
+            msc_client.with_events(publisher, bsc_config.node_id.clone())
+        }
+        None => msc_client,
+    };
     info!(
         "BSC A1 signaling listener bound on {}",
         msc_client.local_addr()?

@@ -112,16 +112,7 @@ export class SharedEventSource {
       }
     });
 
-    const eventTypes = [
-      "radio-metrics",
-      "paging",
-      "traffic",
-      "access",
-      "hrpd-session",
-      "hrpd-access",
-      "hrpd-traffic",
-    ];
-    for (const eventType of eventTypes) {
+    for (const eventType of SSE_EVENT_TYPES) {
       this.es.addEventListener(eventType, (e) => {
         // Dispatch locally
         this.dispatch(eventType, e.data);
@@ -155,6 +146,11 @@ export class SharedEventSource {
   }
 
   addEventListener(event: string, fn: Listener) {
+    if (event !== "connection" && !SSE_EVENT_TYPES.includes(event)) {
+      console.warn(
+        `[shared-events] "${event}" is not registered on the EventSource — this listener will never fire. Add it to SSE_EVENT_TYPES.`,
+      );
+    }
     let set = this.listeners.get(event);
     if (!set) {
       set = new Set();
@@ -181,6 +177,20 @@ export class SharedEventSource {
 }
 
 /** Get or create the singleton shared event source. */
+// SSE event names this source registers and relays. A name absent here is still
+// carried by the stream but never subscribed to, so `useEventStream` callbacks
+// for it silently never fire — add the name when the server emits a new type.
+const SSE_EVENT_TYPES = [
+  "radio-metrics",
+  "paging",
+  "traffic",
+  "access",
+  "hrpd-session",
+  "hrpd-access",
+  "hrpd-traffic",
+  "a1",
+];
+
 export function getSharedEvents(): SharedEventSource {
   const g = globalThis as Record<string, unknown>;
   if (!g[GLOBAL_KEY]) {

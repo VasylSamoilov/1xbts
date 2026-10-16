@@ -38,5 +38,13 @@
       "home_address_pool": null
     }
   },
-  "events_endpoint": "http://127.0.0.1:17023"
+  "events_endpoint": "http://127.0.0.1:17023",
+  "a12": {
+    "enabled": false,
+    "listen": "0.0.0.0:1812",
+    "radius_secret": "",
+    "accept_unverified_chap": true,
+    "validate_subscribers": false
+  },
+  "hlr_endpoint": "http://127.0.0.1:17019"
 }

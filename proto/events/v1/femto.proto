@@ -1,0 +1,110 @@
+syntax = "proto3";
+package events.v1;
+
+// Femtocell (FAP) network events: provisioning, SeGW tunnel, IMS registration,
+// and per-session activity for a standards-facing femtocell access point.
+message FemtoNetworkEvent {
+  // Stable femtocell equipment identity (FEID) the event pertains to.
+  string feid = 1;
+
+  oneof body {
+    FapProvisioningState provisioning = 10;
+    TunnelState tunnel = 11;
+    ImsRegistrationState ims_registration = 12;
+    FemtoAuthFailure auth_failure = 13;
+    FemtoSessionEvent session = 14;
+  }
+}
+
+// Where a FAP is in the TR-069 provisioning + site-approval lifecycle.
+message FapProvisioningState {
+  FapProvisioningStage stage = 1;
+  bool site_approved = 2;
+  bool service_enabled = 3;
+}
+
+enum FapProvisioningStage {
+  FAP_PROVISIONING_STAGE_UNSPECIFIED = 0;
+  FAP_PROVISIONING_STAGE_DISCOVERED = 1;
+  FAP_PROVISIONING_STAGE_INFORM = 2;
+  FAP_PROVISIONING_STAGE_CONFIGURED = 3;
+  FAP_PROVISIONING_STAGE_SERVICE_ENABLED = 4;
+  FAP_PROVISIONING_STAGE_FAILED = 5;
+}
+
+// SeGW IPsec tunnel state plus which security profile was selected for the FAP.
+message TunnelState {
+  TunnelStatus status = 1;
+  SecurityProfile profile = 2;
+}
+
+enum TunnelStatus {
+  TUNNEL_STATUS_UNSPECIFIED = 0;
+  TUNNEL_STATUS_DOWN = 1;
+  TUNNEL_STATUS_NEGOTIATING = 2;
+  TUNNEL_STATUS_ESTABLISHED = 3;
+  TUNNEL_STATUS_FAILED = 4;
+}
+
+enum SecurityProfile {
+  SECURITY_PROFILE_UNSPECIFIED = 0;
+  // Certificate-authenticated IKEv2 with AES-based suites (S.S0132 / A.S0024).
+  SECURITY_PROFILE_STANDARD = 1;
+  // Device-observed legacy suite (e.g. EAP-MD5 / 3DES) for a specific FAP.
+  SECURITY_PROFILE_LEGACY = 2;
+}
+
+// IMS (SIP) registration state of the FAP SIP client at the S-CSCF/FCS.
+message ImsRegistrationState {
+  ImsRegistrationStatus status = 1;
+  uint32 expires_secs = 2;
+}
+
+enum ImsRegistrationStatus {
+  IMS_REGISTRATION_STATUS_UNSPECIFIED = 0;
+  IMS_REGISTRATION_STATUS_REGISTERING = 1;
+  IMS_REGISTRATION_STATUS_REGISTERED = 2;
+  IMS_REGISTRATION_STATUS_DEREGISTERED = 3;
+  IMS_REGISTRATION_STATUS_FAILED = 4;
+}
+
+// An authentication failure attributable to the femtocell path.
+message FemtoAuthFailure {
+  FemtoAuthStage stage = 1;
+  string detail = 2;
+}
+
+enum FemtoAuthStage {
+  FEMTO_AUTH_STAGE_UNSPECIFIED = 0;
+  FEMTO_AUTH_STAGE_SEGW_IKE = 1;
+  FEMTO_AUTH_STAGE_IMS = 2;
+  FEMTO_AUTH_STAGE_MOBILE_CAVE = 3;
+}
+
+// Lifecycle of a voice/SMS/data session carried through the FAP, plus which
+// packet adapter served a data session.
+message FemtoSessionEvent {
+  FemtoSessionKind kind = 1;
+  FemtoSessionAction action = 2;
+  // Set only for data sessions. Identifies which ingress path served it.
+  FemtoPacketAdapter packet_adapter = 3;
+}
+
+enum FemtoSessionKind {
+  FEMTO_SESSION_KIND_UNSPECIFIED = 0;
+  FEMTO_SESSION_KIND_VOICE = 1;
+  FEMTO_SESSION_KIND_SMS = 2;
+  FEMTO_SESSION_KIND_DATA = 3;
+}
+
+enum FemtoSessionAction {
+  FEMTO_SESSION_ACTION_UNSPECIFIED = 0;
+  FEMTO_SESSION_ACTION_STARTED = 1;
+  FEMTO_SESSION_ACTION_ENDED = 2;
+}
+
+enum FemtoPacketAdapter {
+  FEMTO_PACKET_ADAPTER_UNSPECIFIED = 0;
+  FEMTO_PACKET_ADAPTER_A10_A11 = 1;
+  FEMTO_PACKET_ADAPTER_DIRECT_IP = 2;
+}

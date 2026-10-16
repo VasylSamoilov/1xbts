@@ -379,6 +379,7 @@ pub struct BscNodeConfig {
     /// Packet gRPC endpoint the packet-data path drives sessions through.
     #[serde(default = "default_packet_endpoint")]
     pub packet_endpoint: String,
+    pub events_endpoint: Option<String>,
     /// Local IP that voice bearer UDP sockets bind to.
     /// Defaults to 127.0.0.1. Set to the host's network-facing IP when the
     /// BSC and voice gateway are on separate hosts.
@@ -390,6 +391,8 @@ pub struct BscNodeConfig {
     #[serde(default = "default_node_id")]
     pub node_id: String,
 }
+
+const DEFAULT_EVENTS_ENDPOINT: &str = "http://127.0.0.1:17023";
 
 fn default_node_id() -> String {
     "bsc".to_string()
@@ -412,6 +415,7 @@ impl Default for BscNodeConfig {
             hlr_endpoint: default_hlr_endpoint(),
             smsc_endpoint: default_smsc_endpoint(),
             packet_endpoint: default_packet_endpoint(),
+            events_endpoint: Some(DEFAULT_EVENTS_ENDPOINT.to_string()),
             voice_bearer_bind_ip: default_voice_bearer_bind_ip(),
             node_id: default_node_id(),
         }

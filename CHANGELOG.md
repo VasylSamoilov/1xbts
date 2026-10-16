@@ -1,7 +1,7 @@
 # HEAD
 
+- Added support for femtocells (Airvana Airave FAPs): ACS/CWMP provisioning over an IPsec SeGW, SIP voice and SMS, and packet data, managed as ordinary cells. Configure in `config/femto.json`, `config/femto.local.json`, and `config/pdsn.local.json`.
 - Fixed band class channel validation and PRL scanning in cdma-ms, which now tunes by band class and channel alone.
-
 - Added a full CDMA2000 1x Mobile Station library and softphone.
 - Fix issue with HRPD only mode exiting early.
 - MS-to-MS calls paging streamlined for quicker time to ring.

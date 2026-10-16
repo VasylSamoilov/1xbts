@@ -107,8 +107,8 @@ impl PcfClient for LegacyPcfClient {
             imsi: metadata.imsi,
             esn: metadata.esn,
             meid: None,
-            hrpd_mn_id: None,
-            hrpd_mn_id_source: None,
+            mn_id: None,
+            mn_id_source: None,
             subscriber_imsi: None,
             traffic_walsh_code: metadata.traffic_walsh_code,
         };
@@ -340,8 +340,8 @@ impl PcfClient for GrpcPcfClient {
             phone_number: metadata.phone_number,
             traffic_walsh_code: metadata.traffic_walsh_code,
             meid: String::new(),
-            hrpd_mn_id: String::new(),
-            hrpd_mn_id_source: proto::HrpdMnIdSource::Unspecified as i32,
+            mn_id: String::new(),
+            mn_id_source: proto::MnIdSource::Unspecified as i32,
             subscriber_imsi: String::new(),
         };
         client

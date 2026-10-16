@@ -30,8 +30,6 @@ service NetworkManagementService {
 
   // Lists the cells of one base station.
   rpc ListBts(BsRequest) returns (bts_management.v1.BtsList);
-  // Returns runtime status for one cell.
-  rpc GetBtsStatus(CellScopedRequest) returns (bsc.v1.SystemStatus);
   // Returns the active radio and overhead configuration for one cell.
   rpc GetBtsConfig(CellScopedRequest) returns (bsc.v1.BtsConfig);
   // Returns the latest radio metrics snapshot for one cell.
@@ -57,8 +55,6 @@ service NetworkManagementService {
 
   // Per-selector proxy: BSC management (one base station)
 
-  // Returns serving status for one base station.
-  rpc GetBscStatus(BsRequest) returns (bsc.v1.SystemStatus);
   // Lists mobiles on one base station.
   rpc ListMobiles(BsRequest) returns (bsc.v1.MobileList);
   // Lists channels on one base station.

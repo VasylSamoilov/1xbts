@@ -50,10 +50,15 @@ fn encode_submission_payload(submission: &SmsSubmission, message_id: u16) -> Vec
     )
 }
 
+fn fits_paging_channel(submission: &SmsSubmission) -> bool {
+    submission.raw_user_data.is_none()
+}
+
 /// Correlation between a Tag value and the SMSC submission being delivered.
 struct SmsCorrelation {
     sms_id: Uuid,
     delivery_attempt_id: Uuid,
+    mobile_identity: MobileIdentity,
     sent_at: Instant,
 }
 
@@ -69,6 +74,16 @@ pub(crate) struct MscSmsCoordinator {
     next_tag: u32,
     /// Outstanding deliveries waiting for ADDS Page Ack or ADDS Deliver Ack.
     pending: HashMap<u32, SmsCorrelation>,
+    traffic_deliveries: Vec<SmsTrafficDelivery>,
+}
+
+pub(crate) struct SmsTrafficDelivery {
+    pub sms_id: Uuid,
+    pub delivery_attempt_id: Uuid,
+    pub mobile_identity: MobileIdentity,
+    pub serving_node: BaseStationId,
+    pub adds_page: Vec<u8>,
+    pub tag: u32,
 }
 
 /// Outcome of an HLR phone-number lookup used by SMS send/retry paths.
@@ -139,6 +154,7 @@ impl MscSmsCoordinator {
             hlr,
             next_tag: 1,
             pending: HashMap::new(),
+            traffic_deliveries: Vec::new(),
         }
     }
 
@@ -243,6 +259,21 @@ impl MscSmsCoordinator {
             return Some(sms_id);
         };
 
+        if self.has_pending_mobile(&mobile_identity) {
+            let _ = self
+                .smsc
+                .update_delivery_attempt_state(
+                    attempt.sms_delivery_attempt_id,
+                    DeliveryAttemptState::Failed,
+                    Some("another SMS is already paging this mobile".to_string()),
+                )
+                .await;
+            info!(
+                "MSC SMS: queued sms_id={sms_id} while another delivery is paging the same mobile"
+            );
+            return Some(sms_id);
+        }
+
         let _ = self
             .smsc
             .update_delivery_attempt_state(
@@ -263,7 +294,7 @@ impl MscSmsCoordinator {
 
         // Build and send ADDS Page
         let adds_page = AddsPageMessage {
-            mobile_identity,
+            mobile_identity: mobile_identity.clone(),
             adds_user_part: AddsUserPart {
                 burst_type: 0x03, // SMS
                 data: encoded_payload,
@@ -291,29 +322,66 @@ impl MscSmsCoordinator {
                 return None;
             }
         };
-        let encoded = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
-            cdma_ios::MessageType::AddsPage,
-            payload,
-        ));
-        if let Err(e) = a1.send_to_node(&serving_node, encoded).await {
-            warn!("MSC SMS: failed to send ADDS Page to base station {serving_node}: {e}");
-            return None;
-        }
-
-        // Track pending delivery
         self.pending.insert(
             tag_value,
             SmsCorrelation {
                 sms_id,
                 delivery_attempt_id: attempt.sms_delivery_attempt_id,
+                mobile_identity: mobile_identity.clone(),
                 sent_at: Instant::now(),
             },
         );
-        info!(
-            "MSC SMS: sent ADDS Page sms_id={} tag={} attempt={}",
-            sms_id, tag_value, attempt.sms_delivery_attempt_id
-        );
+        if fits_paging_channel(&submission) {
+            let encoded = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+                cdma_ios::MessageType::AddsPage,
+                payload,
+            ));
+            if let Err(e) = a1.send_to_node(&serving_node, encoded).await {
+                warn!("MSC SMS: failed to send ADDS Page to base station {serving_node}: {e}");
+                self.pending.remove(&tag_value);
+                return None;
+            }
+            info!(
+                "MSC SMS: sent ADDS Page on paging channel sms_id={} tag={} attempt={}",
+                sms_id, tag_value, attempt.sms_delivery_attempt_id
+            );
+        } else {
+            self.traffic_deliveries.push(SmsTrafficDelivery {
+                sms_id,
+                delivery_attempt_id: attempt.sms_delivery_attempt_id,
+                mobile_identity,
+                serving_node,
+                adds_page: payload,
+                tag: tag_value,
+            });
+            info!(
+                "MSC SMS: staged traffic-channel SMS delivery sms_id={} tag={} attempt={}",
+                sms_id, tag_value, attempt.sms_delivery_attempt_id
+            );
+        }
         Some(sms_id)
+    }
+
+    pub(crate) fn take_traffic_deliveries(&mut self) -> Vec<SmsTrafficDelivery> {
+        std::mem::take(&mut self.traffic_deliveries)
+    }
+
+    pub(crate) fn begin_pending(
+        &mut self,
+        tag: u32,
+        sms_id: Uuid,
+        delivery_attempt_id: Uuid,
+        mobile_identity: MobileIdentity,
+    ) {
+        self.pending.insert(
+            tag,
+            SmsCorrelation {
+                sms_id,
+                delivery_attempt_id,
+                mobile_identity,
+                sent_at: Instant::now(),
+            },
+        );
     }
 
     /// Handles an incoming ADDS Page Ack from the BS (paging-channel delivery result).
@@ -714,6 +782,14 @@ impl MscSmsCoordinator {
             return;
         };
 
+        if self.has_pending_mobile(&mobile_identity) {
+            log::debug!(
+                "MSC SMS retry: another delivery is paging the same mobile; deferring sms_id={}",
+                submission.sms_id
+            );
+            return;
+        }
+
         let attempt = match self
             .smsc
             .create_delivery_attempt(submission.sms_id, submission.destination_subscriber_id)
@@ -745,7 +821,7 @@ impl MscSmsCoordinator {
         let tag_value = self.alloc_tag();
         let encoded_payload = encode_submission_payload(submission, message_id);
         let adds_page = AddsPageMessage {
-            mobile_identity,
+            mobile_identity: mobile_identity.clone(),
             adds_user_part: AddsUserPart {
                 burst_type: 0x03, // SMS
                 data: encoded_payload,
@@ -776,26 +852,51 @@ impl MscSmsCoordinator {
                 return;
             }
         };
-        let encoded = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
-            cdma_ios::MessageType::AddsPage,
-            payload,
-        ));
-        if let Err(e) = a1.send_to_node(&serving_node, encoded).await {
-            warn!("MSC SMS retry: send to base station {serving_node} failed: {e}");
-            return;
-        }
         self.pending.insert(
             tag_value,
             SmsCorrelation {
                 sms_id: submission.sms_id,
                 delivery_attempt_id: attempt.sms_delivery_attempt_id,
+                mobile_identity: mobile_identity.clone(),
                 sent_at: Instant::now(),
             },
         );
-        info!(
-            "MSC SMS retry: re-sent ADDS Page sms_id={} tag={} attempt={} (#{}) ",
-            submission.sms_id, tag_value, attempt.sms_delivery_attempt_id, attempt.attempt_number
-        );
+        if fits_paging_channel(submission) {
+            let encoded = cdma_ios::EncodedA1Message::from_message(&cdma_ios::Message::new(
+                cdma_ios::MessageType::AddsPage,
+                payload,
+            ));
+            if let Err(e) = a1.send_to_node(&serving_node, encoded).await {
+                warn!(
+                    "MSC SMS retry: failed to send ADDS Page to base station {serving_node}: {e}"
+                );
+                self.pending.remove(&tag_value);
+                return;
+            }
+            info!(
+                "MSC SMS retry: sent ADDS Page on paging channel sms_id={} tag={} attempt={} (#{})",
+                submission.sms_id,
+                tag_value,
+                attempt.sms_delivery_attempt_id,
+                attempt.attempt_number
+            );
+        } else {
+            self.traffic_deliveries.push(SmsTrafficDelivery {
+                sms_id: submission.sms_id,
+                delivery_attempt_id: attempt.sms_delivery_attempt_id,
+                mobile_identity,
+                serving_node,
+                adds_page: payload,
+                tag: tag_value,
+            });
+            info!(
+                "MSC SMS retry: staged traffic-channel SMS delivery sms_id={} tag={} attempt={} (#{})",
+                submission.sms_id,
+                tag_value,
+                attempt.sms_delivery_attempt_id,
+                attempt.attempt_number
+            );
+        }
     }
 
     // Internal helpers
@@ -823,6 +924,12 @@ impl MscSmsCoordinator {
                 None
             }
         }
+    }
+
+    fn has_pending_mobile(&self, mobile_identity: &MobileIdentity) -> bool {
+        self.pending
+            .values()
+            .any(|correlation| &correlation.mobile_identity == mobile_identity)
     }
 
     /// Resolves a phone number against the HLR into a `ResolveResult`.

@@ -11,10 +11,14 @@ pub mod events;
 pub mod node;
 pub mod session;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 
-pub use a10_runtime::{HrpdPdsnA10Runtime, spawn_hrpd_pdsn_a10_runtime};
-pub use a11_service::{PacketServiceHrpdA10Adapter, spawn_hrpd_pdsn_a11_service};
+pub use a10_runtime::{PdsnA10Runtime, spawn_pdsn_a10_runtime};
+pub use a11_service::{PacketServicePdsnA10Adapter, spawn_pdsn_a11_service};
 pub use config::{PacketTransportConfig, PdsnNodeConfig};
 pub use node::{resolve_config_dir, run_node};
 pub use session::{
@@ -149,9 +153,7 @@ fn packet_transport_config(
                 .fou_remote
                 .as_ref()
                 .ok_or("pdsn.packet.fou_remote is required when transport = \"fou\"")?;
-            let addr = remote
-                .parse()
-                .map_err(|e| format!("invalid pdsn.packet.fou_remote '{}': {}", remote, e))?;
+            let addr = resolve_remote_endpoint(remote)?;
             Ok(cdma_packet::ip_transport::IpTransportConfig::Fou {
                 remote_addr: addr,
                 local_port: cfg.fou_local_port,
@@ -162,9 +164,7 @@ fn packet_transport_config(
                 .fou_remote
                 .as_ref()
                 .ok_or("pdsn.packet.fou_remote is required when transport = \"fou_tcp\"")?;
-            let addr = remote
-                .parse()
-                .map_err(|e| format!("invalid pdsn.packet.fou_remote '{}': {}", remote, e))?;
+            let addr = resolve_remote_endpoint(remote)?;
             Ok(cdma_packet::ip_transport::IpTransportConfig::FouTcp { remote_addr: addr })
         }
         other => Err(format!(
@@ -172,6 +172,14 @@ fn packet_transport_config(
             other
         )),
     }
+}
+
+fn resolve_remote_endpoint(remote: &str) -> std::result::Result<SocketAddr, String> {
+    remote
+        .to_socket_addrs()
+        .map_err(|error| format!("invalid pdsn.packet.fou_remote '{remote}': {error}"))?
+        .next()
+        .ok_or_else(|| format!("pdsn.packet.fou_remote '{remote}' resolved to no addresses"))
 }
 
 #[cfg(test)]

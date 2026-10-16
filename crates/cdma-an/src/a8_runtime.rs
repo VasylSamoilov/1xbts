@@ -9,7 +9,7 @@ use log::{debug, info, trace, warn};
 
 use crate::rlp;
 
-const HRPD_BEARER_MAX_DATAGRAMS_PER_PASS: usize = 64;
+const A10_BEARER_MAX_DATAGRAMS_PER_PASS: usize = 64;
 // Per RLP segment the forward framing adds 32 bits (22-bit RLP sequence,
 // 2-bit stream header, 8-bit Format B length), so a 120-octet segment frames
 // to exactly 992 bits — the enhanced 1024-bit packet's security capacity, and
@@ -2558,7 +2558,7 @@ impl HrpdAnA8Actor {
                 }
             }
 
-            for _ in 0..HRPD_BEARER_MAX_DATAGRAMS_PER_PASS {
+            for _ in 0..A10_BEARER_MAX_DATAGRAMS_PER_PASS {
                 let (packet, _) = match bearer.try_recv_gre_packet(&mut self.buf) {
                     Ok(value) => value,
                     Err(cdma_a8::Error::UdpTransport(err)) if is_udp_timeout(&err) => break,
