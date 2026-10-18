@@ -33,6 +33,42 @@
         "ike_group_key": "<device IKE group key>",
         "eap_password": "<device EAP password>"
       }
+    },
+    "home2": {
+      "feid": "0005B9304FF8",
+      "profile": "airave-25plus",
+      "name": "Airvana 2.5 Plus",
+      "cell": {
+        "mcc": "310",
+        "imsi_11_12": "00",
+        "cell_id": 404,
+        "sector": 0
+      },
+      "1x": {
+        "enabled": false,
+        "sid": 2,
+        "nid": 65535,
+        "band_class": 1,
+        "channel": 1175,
+        "pn_offset": 0,
+        "max_sector_power_dbm": -30
+      },
+      "evdo": {
+        "enabled": false
+      },
+      "acs": {
+        "username": "<device provisioning username>",
+        "password": "<device provisioning password>"
+      },
+      "sip": {
+        "password": "<device SIP password>"
+      },
+      "segw": {
+        "security_profile": "legacy",
+        "ike_group_key": "<device IKE group key>",
+        "eap_identity": "<device EAP identity>",
+        "eap_password": "<device EAP password>"
+      }
     }
   }
 }
