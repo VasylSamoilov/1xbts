@@ -6,6 +6,7 @@
     "listen": "0.0.0.0:500",
     "swanctl_dir": "/etc/1xbts/swanctl",
     "vip_subnet": "10.55.100.0/24",
+    "vip_netmask": "255.255.255.0",
     "vip_dns": "10.56.0.2",
     "ike_identity_domain": "femto.sprint.net"
   },
