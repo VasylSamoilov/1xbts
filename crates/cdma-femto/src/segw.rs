@@ -161,7 +161,7 @@ impl SegwController {
                      \x20 }}\n"
                 ));
                 // StrongSwan's config parser reads a value to end-of-line, so
-                // each setting must be on its own line â€” an inline
+                // each setting must be on its own line - an inline
                 // `{ id = .. secret = .. }` makes `id` swallow the `secret`.
                 secrets.push_str(&format!(
                     "  ike-fap-{name} {{\n\
