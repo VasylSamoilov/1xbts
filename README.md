@@ -204,6 +204,15 @@ Compose does not start the shared network core. For a femtocell-only
 installation, follow the Femtocell Setup guide to add the femtocell to the MSC,
 configure the PDSN and host return route, and run the shared core without an SDR.
 
+
+For Airave 2.5+ (`cdmaFAP3`, tested with firmware `6.5.01.010`), select
+`airave-25plus` and set `segw.vip_netmask` to `255.255.255.0` alongside the
+`10.55.100.0/24` VIP pool. The Plus deletes its ESP tunnel if the gateway omits
+the netmask attribute. Every site needs a distinct cell identity.
+See [Femtocell configuration and reloads](docs/FEMTOCELLS.md) for profile notes,
+configuration reload commands, and restart requirements.
+
+
 To terminate FAP IPsec on this host while running the femtocell core elsewhere,
 start only StrongSwan, tunnel DNS, and the SeGW configuration controller:
 

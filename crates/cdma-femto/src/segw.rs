@@ -40,6 +40,7 @@ pub struct SegwController {
     connections: Vec<SegwConnection>,
     vip_subnet: Option<String>,
     vip_dns: Option<String>,
+    vip_netmask: Option<String>,
 }
 
 impl SegwController {
@@ -50,6 +51,7 @@ impl SegwController {
             connections: config.connections.clone(),
             vip_subnet: config.vip_subnet.clone(),
             vip_dns: config.vip_dns.clone(),
+            vip_netmask: config.vip_netmask.clone(),
         }
     }
 
@@ -75,12 +77,19 @@ impl SegwController {
         let Some(subnet) = self.vip_subnet.as_deref() else {
             return String::new();
         };
+        let netmask = self
+            .vip_netmask
+            .as_deref()
+            .map(|mask| format!("      netmask = {mask}\n"))
+            .unwrap_or_default();
         let dns = self
             .vip_dns
             .as_deref()
             .map(|d| format!("      dns = {d}\n"))
             .unwrap_or_default();
-        format!("pools {{\n  {VIP_POOL_NAME} {{\n      addrs = {subnet}\n{dns}  }}\n}}\n\n")
+        format!(
+            "pools {{\n  {VIP_POOL_NAME} {{\n      addrs = {subnet}\n{netmask}{dns}  }}\n}}\n\n"
+        )
     }
 
     pub fn default_profile(&self) -> SecurityProfile {
@@ -152,7 +161,7 @@ impl SegwController {
                      \x20 }}\n"
                 ));
                 // StrongSwan's config parser reads a value to end-of-line, so
-                // each setting must be on its own line — an inline
+                // each setting must be on its own line â€” an inline
                 // `{ id = .. secret = .. }` makes `id` swallow the `secret`.
                 secrets.push_str(&format!(
                     "  ike-fap-{name} {{\n\
@@ -297,6 +306,7 @@ mod tests {
             connections: conns,
             vip_subnet: None,
             vip_dns: None,
+            vip_netmask: None,
         }
     }
 
@@ -326,6 +336,26 @@ mod tests {
         assert!(conf.contains("addrs = 198.51.100.0/24"));
         assert!(conf.contains("dns = 192.0.2.53"));
         assert!(conf.contains("pools = femto-vip"));
+    }
+
+    #[test]
+    fn virtual_ip_netmask_is_opt_in_for_plus_firmware() {
+        let mut controller = controller(vec![legacy_conn()]);
+        controller.vip_subnet = Some("198.51.100.0/24".to_string());
+        let original = controller
+            .render_swanctl_conf()
+            .expect("render without mask");
+        assert!(!original.contains("netmask ="));
+        controller.vip_netmask = Some("255.255.255.0".to_string());
+        let conf = controller.render_swanctl_conf().expect("render with mask");
+        assert!(conf.contains("addrs = 198.51.100.0/24\n      netmask = 255.255.255.0\n"));
+        controller.vip_subnet = None;
+        assert!(
+            !controller
+                .render_swanctl_conf()
+                .expect("no pool")
+                .contains("netmask =")
+        );
     }
 
     #[test]
