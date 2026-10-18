@@ -111,6 +111,7 @@ impl Radio for IqSourceRadio {
     fn tune_forward(&mut self, frequency_hz: f64) -> Result<(), Error> {
         self.tuned_hz = frequency_hz;
         self.pos = 0;
+        self.exhausted = false;
         self.phase = 0.0;
         Ok(())
     }
@@ -172,5 +173,30 @@ impl Radio for IqSourceRadio {
             burst.samples.len(),
             burst.absolute_chip_start
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retuning_an_exhausted_source_restarts_playback() {
+        const SAMPLE_RATE_HZ: f64 = 4_915_200.0;
+        const CENTER_HZ: f64 = 881_520_000.0;
+        let samples = vec![Complex32::new(0.5, -0.25); 16];
+        let mut radio =
+            IqSourceRadio::new(samples.clone(), SAMPLE_RATE_HZ, CENTER_HZ).with_loop(false);
+        let mut out = Vec::new();
+        radio.read_forward(&mut out);
+        assert!(radio.forward_exhausted());
+        assert!(out.iter().all(|sample| *sample == Complex32::new(0.0, 0.0)));
+
+        radio.tune_forward(CENTER_HZ).unwrap();
+        assert!(!radio.forward_exhausted());
+        out.clear();
+        radio.read_forward(&mut out);
+        assert_eq!(out, samples);
+        assert!(radio.forward_exhausted());
     }
 }

@@ -276,6 +276,37 @@ async fn scan_skips_empty_channels_then_camps_on_the_permitted_system() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_camps_after_the_iq_source_was_exhausted_before_power_on() {
+    let iq = node_iq().await;
+    let mut radio = IqSourceRadio::new(
+        iq,
+        support::SAMPLE_RATE_HZ as f64,
+        support::node_forward_hz(),
+    )
+    .with_loop(false);
+    let mut discarded = Vec::new();
+    while !radio.forward_exhausted() {
+        discarded.clear();
+        radio.read_forward(&mut discarded);
+    }
+    let plan = PrlScanPlan::from_parts(
+        7,
+        true,
+        &[
+            (BandClass::Bc0, 777),
+            (BandClass::Bc0, 283),
+            (BandClass::Bc0, support::CDMA_FREQ),
+        ],
+        vec![node_system(true)],
+    );
+    let (station, events) = start(radio, plan, ForwardRxConfig::default());
+    let ev = collect_until(&events, scan_finished, EVENT_TIMEOUT);
+    assert_eq!(tuned_channels(&ev), vec![777, 283, support::CDMA_FREQ]);
+    assert_eq!(finish_result(&ev).as_deref(), Some("camped"));
+    station.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn survey_visits_every_channel_and_camps_on_nothing() {
     let _ = env_logger::builder().is_test(true).try_init();
     let iq = node_iq().await;
