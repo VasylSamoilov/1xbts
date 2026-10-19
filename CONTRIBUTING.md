@@ -72,6 +72,10 @@ pnpm proto
 
 ## Pull Requests
 
+When opening a pull request from a fork, enable **Allow edits from maintainers**
+so maintainers can make fixes and prepare your contribution for merge. Maintainers
+may adjust code and documentation while preserving contributor credit.
+
 In the pull request description, include:
 
 - What changed and why.
