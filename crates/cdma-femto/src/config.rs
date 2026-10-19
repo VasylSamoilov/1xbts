@@ -368,8 +368,7 @@ pub struct SegwConfig {
     pub vip_subnet: Option<String>,
     #[serde(default)]
     pub vip_dns: Option<String>,
-    /// Optional INTERNAL_IP4_NETMASK returned with the virtual IP. Airave 2.5+
-    /// firmware 6.5.01.010 deletes its CHILD_SA when this attribute is absent.
+    /// INTERNAL_IP4_NETMASK returned with the virtual IP, required by Airave 2.5+.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip_netmask: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -602,11 +601,11 @@ pub struct BracketAdmin {
     #[serde(default = "default_xsd_string")]
     pub xsd_type: String,
     /// Read-only status parameter polled after the admin-down. The admin-down is
-    /// asynchronous - config that needs a down element faults 9002 if it lands before
+    /// asynchronous — config that needs a down element faults 9002 if it lands before
     /// the radio finishes tearing it down. When unset, config is sent immediately.
     #[serde(default)]
     pub settle_parameter: Option<String>,
-    /// The `settle_parameter` value meaning "still operating" - config waits until the poll reads anything else.
+    /// The `settle_parameter` value meaning "still operating" — config waits until the poll reads anything else.
     #[serde(default)]
     pub settle_operating_value: Option<String>,
     /// Maximum number of settle polls before applying config regardless.

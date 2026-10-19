@@ -204,20 +204,8 @@ Compose does not start the shared network core. For a femtocell-only
 installation, follow the Femtocell Setup guide to add the femtocell to the MSC,
 configure the PDSN and host return route, and run the shared core without an SDR.
 
-
-For Airave 2.5+ (`cdmaFAP3`, tested with firmware `6.5.01.010`), select the
-`airave-25plus` profile. `segw.vip_netmask` has been set to `255.255.255.0`
-in `config/femto.json` for the default `10.55.100.0/24` VIP pool. The Plus
-deletes its ESP tunnel if the gateway omits the netmask attribute.
-
-Normal 1x service on the tested 2.5+ uses **BC1 / 1900 MHz PCS**. Its 800 MHz
-BC0/BC10 transmitters are **discovery/redirection beacons**, not service
-carriers for calls, SMS, or packet data. BC0/777 beacon RF output was confirmed,
-but this does not enable two-way BC0 service or support BC0-only phones.
-Beacon transmission is not enabled by the supplied profile.
-See [Femtocell configuration and reloads](docs/FEMTOCELLS.md) for additional
-information on the Airave 2.5+.
-
+For Airave 2.5+, use `airave-25plus`. For the original Airave 2.5, use
+`airave-25-2x` for 2.x firmware or `airave-25-5x` for 5.x firmware.
 
 To terminate FAP IPsec on this host while running the femtocell core elsewhere,
 start only StrongSwan, tunnel DNS, and the SeGW configuration controller:
