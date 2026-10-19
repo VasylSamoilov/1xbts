@@ -109,9 +109,9 @@ impl FemtoImsiMapper {
     }
 }
 
-/// Airvana omits the discriminator on traffic-channel OTA replies. Only its
-/// legacy MIME type and a fully validated burst-4 ADDS payload settle the 0x53
-/// collision with Authentication Request. Keep the general IOS parser strict.
+/// ADDS Deliver (DTAP) and Privacy Mode Command (BSMAP) share message type 0x53.
+/// Airvana omits the discriminator, so only its legacy MIME type and a validated
+/// OTASP payload permit this fallback. The general IOS parser remains strict.
 pub(crate) fn decode_femto_body(
     content_type: &str,
     body: &[u8],
@@ -144,9 +144,9 @@ pub(crate) fn decode_femto_body(
         normalized.extend_from_slice(rest);
         if let Ok(message) = FemtoInterfaceMsg::parse(&normalized) {
             let valid = if message_type == MSG_TYPE_ADDS_DELIVER {
-                message
-                    .to_adds_deliver()
-                    .is_ok_and(|deliver| deliver.adds_user_part.burst_type == 4)
+                message.to_adds_deliver().is_ok_and(|deliver| {
+                    deliver.adds_user_part.burst_type == cdma_common::consts::BURST_TYPE_OTASP
+                })
             } else {
                 message.ies.iter().filter(|ie| ie.iei == IE_TAG).count() == 1
                     && message
@@ -966,7 +966,7 @@ mod otasp_transport_tests {
         let fcs = FemtoConvergenceServer::new();
         let deliver = AddsDeliverMessage {
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6],
             },
             tag: Some(Tag(0x80000001)),
@@ -1001,7 +1001,7 @@ mod otasp_transport_tests {
         let transfer = AddsTransferMessage {
             mobile_identity_imsi: MobileIdentity::Imsi("5551239999".into()),
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6, 1],
             },
             mobile_identity_esn: Some(MobileIdentity::Esn(0x80E4D11C)),

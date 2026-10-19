@@ -1,3 +1,6 @@
+mod otasp;
+
+use self::otasp::{AddsAckResponses, AddsAckTransaction, PendingOtaspAnswer, SIP_T1};
 use crate::cell::FemtoCellState;
 use crate::config::{FcsConfig, SipConfig};
 use crate::fap::FapRegistry;
@@ -345,7 +348,8 @@ pub struct ImsCore {
     pending_downlink: Mutex<HashMap<String, PendingDownlink>>,
     pending_adds_page_acks: Mutex<HashMap<String, AddsPageAckMessage>>,
     adds_delivery_calls: Mutex<HashMap<(String, u32), u64>>,
-    pending_otasp_answer: Mutex<HashMap<u64, EncodedA1Message>>,
+    pending_otasp_answer: Mutex<HashMap<u64, PendingOtaspAnswer>>,
+    adds_ack_responses: Mutex<AddsAckResponses>,
     sms_cause_code_tx: mpsc::UnboundedSender<PendingSmsCauseCode>,
     sms_cause_code_rx: Mutex<Option<mpsc::UnboundedReceiver<PendingSmsCauseCode>>>,
     cell_state: std::sync::Arc<FemtoCellState>,
@@ -513,6 +517,7 @@ impl ImsCore {
             pending_adds_page_acks: Mutex::new(HashMap::new()),
             adds_delivery_calls: Mutex::new(HashMap::new()),
             pending_otasp_answer: Mutex::new(HashMap::new()),
+            adds_ack_responses: Mutex::new(AddsAckResponses::default()),
             sms_cause_code_tx,
             sms_cause_code_rx: Mutex::new(Some(sms_cause_code_rx)),
             cell_state,
@@ -878,6 +883,22 @@ impl ImsCore {
             return response(req, SC_BAD_REQUEST, "Bad Request");
         };
         let scoped_sip_call_id = self.scoped_sip_call_id(peer, &sip_call_id);
+        let existing_call = self
+            .mo_voice_by_sip
+            .lock()
+            .expect("MO voice SIP dialog lock")
+            .get(&scoped_sip_call_id)
+            .copied();
+        if let Some(call_id) = existing_call
+            && let Some(answer) = self
+                .pending_otasp_answer
+                .lock()
+                .expect("OTASP answer lock")
+                .get(&call_id)
+            && req.headers.cseq() == answer.response.headers.cseq()
+        {
+            return answer.response.clone();
+        }
         if self
             .mo_voice_by_sip
             .lock()
@@ -1178,54 +1199,6 @@ impl ImsCore {
         Ok((progress, dialog.peer))
     }
 
-    /// The local OTASP coordinator starts after traffic assignment, without a
-    /// remote called party to answer. Complete the SIP INVITE before sending DBMs.
-    fn stage_otasp_answer(
-        &self,
-        encoded: &EncodedA1Message,
-    ) -> Result<Option<(SipResponse, SocketAddr)>, crate::fcs::FcsError> {
-        if encoded.message_type() != MessageType::AddsDeliver {
-            return Ok(None);
-        }
-        let deliver = cdma_ios::AddsDeliverMessage::decode(&encoded.decode()?.payload)?;
-        if deliver.adds_user_part.burst_type != 0x04 {
-            return Ok(None);
-        }
-        let Some(answer) = self.mo_dialog_response(encoded, SC_OK, "OK") else {
-            return Ok(None);
-        };
-        if let Some(call_id) = encoded.call_id() {
-            self.pending_otasp_answer
-                .lock()
-                .expect("OTASP answer lock")
-                .insert(call_id, encoded.clone());
-            log::info!("FCS: OTASP call_id={call_id} waiting for SIP ACK before first data burst");
-        }
-        Ok(Some(answer))
-    }
-
-    fn otasp_after_ack(&self, request: &SipRequest, peer: SocketAddr) -> Option<EncodedA1Message> {
-        if request.method != Method::Ack {
-            return None;
-        }
-        let scoped = self.scoped_sip_call_id(peer, request.headers.call_id()?);
-        let call_id = self
-            .mo_voice_by_sip
-            .lock()
-            .expect("MO voice SIP dialog lock")
-            .get(&scoped)
-            .copied()?;
-        let encoded = self
-            .pending_otasp_answer
-            .lock()
-            .expect("OTASP answer lock")
-            .remove(&call_id)?;
-        log::info!(
-            "FCS: OTASP call_id={call_id} SIP answer acknowledged; sending first data burst"
-        );
-        Some(encoded)
-    }
-
     fn mo_dialog_response(
         &self,
         encoded: &EncodedA1Message,
@@ -1311,36 +1284,6 @@ impl ImsCore {
         response
     }
 
-    /// Airvana returns traffic-channel ADDS delivery acknowledgements in INFO.
-    /// Only accept tags belonging to an outstanding downlink on this same FAP.
-    fn handle_otasp_info(&self, req: &SipRequest, peer: SocketAddr) -> SipResponse {
-        let Some(fap_id) = self.fap_id_for_peer(peer) else {
-            return response(req, SC_BAD_REQUEST, "Bad Request");
-        };
-        let fx2 = self
-            .fap_registry
-            .get(&fap_id)
-            .map(|fap| fap.implementation.fx2());
-        let Some(message) = request_femto_message_with_fx2(req, fx2) else {
-            return response(req, SC_NOT_IMPLEMENTED, "Not Implemented");
-        };
-        let Ok(ack) = message.to_adds_deliver_ack() else {
-            return response(req, SC_NOT_IMPLEMENTED, "Not Implemented");
-        };
-        let Some(tag) = ack.tag else {
-            return response(req, SC_BAD_REQUEST, "Bad Request");
-        };
-        if !self
-            .adds_delivery_calls
-            .lock()
-            .expect("ADDS delivery calls lock")
-            .contains_key(&(fap_id, tag.0))
-        {
-            return response(req, SC_BAD_REQUEST, "Bad Request");
-        }
-        self.handle_message(req, peer)
-    }
-
     fn handle_message(&self, req: &SipRequest, peer: SocketAddr) -> SipResponse {
         let content_type = req.headers.content_type().unwrap_or("").to_string();
         let fx2 = self
@@ -1378,6 +1321,26 @@ impl ImsCore {
         }
         match self.fcs.decode_message(&content_type, &req.body) {
             Ok(FcsMessage::A1(message)) => {
+                let ack_transaction = if message.message_type
+                    == cdma_ios::femto_interface_msg::MSG_TYPE_ADDS_DELIVER_ACK
+                    && message.discriminator
+                        == Some(cdma_ios::femto_interface_msg::Discriminator::Dtap)
+                {
+                    let Some(key) = AddsAckTransaction::from_request(req, peer) else {
+                        return response(req, SC_BAD_REQUEST, "Bad Request");
+                    };
+                    if let Some(cached) = self
+                        .adds_ack_responses
+                        .lock()
+                        .expect("ADDS ACK response lock")
+                        .response(&key, Instant::now())
+                    {
+                        return cached;
+                    }
+                    Some(key)
+                } else {
+                    None
+                };
                 if fx2.is_some() && request_femto_message_with_fx2(req, fx2).is_none() {
                     log::warn!("FCS: rejected profile-incompatible Fx2 body from {peer}");
                     return response(req, SC_BAD_REQUEST, "Bad Request");
@@ -1426,8 +1389,24 @@ impl ImsCore {
                 ) {
                     return response(req, SC_SERVICE_UNAVAILABLE, "Service Unavailable");
                 }
+                let reply = response(req, SC_OK, "OK");
+                if let Some(key) = ack_transaction {
+                    if let (Some(fap_id), Some(tag)) = (
+                        fap_id.as_ref(),
+                        message.to_adds_deliver_ack().ok().and_then(|ack| ack.tag),
+                    ) {
+                        self.adds_delivery_calls
+                            .lock()
+                            .expect("ADDS delivery calls lock")
+                            .remove(&(fap_id.clone(), tag.0));
+                    }
+                    self.adds_ack_responses
+                        .lock()
+                        .expect("ADDS ACK response lock")
+                        .remember(key, reply.clone(), Instant::now());
+                }
                 log::info!("FCS: forwarded SIP MESSAGE to MSC ({summary})");
-                response(req, SC_OK, "OK")
+                reply
             }
             Ok(FcsMessage::Sms(bytes)) => self.handle_mobile_originated_sms(req, peer, bytes),
             Err(err) => {
@@ -1701,7 +1680,7 @@ impl ImsCore {
             return Ok(encoded);
         }
         let deliver = cdma_ios::AddsDeliverMessage::decode(&encoded.decode()?.payload)?;
-        if deliver.adds_user_part.burst_type != 0x04 {
+        if deliver.adds_user_part.burst_type != cdma_common::consts::BURST_TYPE_OTASP {
             return Ok(encoded);
         }
         let identity = encoded
@@ -1759,11 +1738,17 @@ impl ImsCore {
                     .adds_delivery_calls
                     .lock()
                     .expect("ADDS delivery calls lock")
-                    .remove(&(fap_id.clone(), tag.0))
+                    .get(&(fap_id.clone(), tag.0))
+                    .copied()
                 {
                     return Ok(Some(call_id));
                 }
             }
+        }
+        if message.message_type == cdma_ios::femto_interface_msg::MSG_TYPE_ADDS_DELIVER_ACK {
+            return Err(crate::fcs::FcsError::InvalidMobileIdentity(
+                "ADDS acknowledgement has no outstanding delivery tag".to_string(),
+            ));
         }
         if let Some(sip_call_id) = request.headers.call_id() {
             let scoped = format!("{fap_id}\0{sip_call_id}");
@@ -2163,7 +2148,7 @@ impl ImsCore {
             &multipart_boundary,
             femto_content_type,
         )?;
-        // Not published here â€” `next_downlink` publishes every downlink before
+        // Not published here — `next_downlink` publishes every downlink before
         // routing, including the ones that never reach this function. A publish
         // here would be a duplicate row.
         let adds_page_ack = if encoded.message_type() == MessageType::AddsPage {
@@ -3056,7 +3041,7 @@ impl ImsCore {
             .expect("registered FAPs lock")
             .insert(user.feid.clone(), route.clone());
         // Mirror the binding into cell state so an ACS Inform sets the Fx2 downlink
-        // sip_peer like a REGISTER â€” otherwise the cell reports the FAP unregistered.
+        // sip_peer like a REGISTER — otherwise the cell reports the FAP unregistered.
         self.cell_state
             .register_fap(&user.feid, user.impu.clone(), hint.peer);
         log::info!(
@@ -3112,6 +3097,8 @@ impl ImsCore {
             .lock()
             .expect("FAP route hint receiver lock")
             .take();
+        let mut otasp_timer = tokio::time::interval(SIP_T1);
+        otasp_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut voice_dialog_timer = tokio::time::interval(SIP_DIALOG_TIMER_INTERVAL);
         voice_dialog_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         log::info!("IMS/SIP registrar listening on {local}");
@@ -3145,10 +3132,12 @@ impl ImsCore {
                                 peer
                             );
                             // SIP ACK is never answered. For a locally served
-                            // OTASP call it releases the first queued data burst.
+                            // OTASP call it releases the queued data bursts.
                             if request.method == Method::Ack {
-                                if let Some(encoded) = self.otasp_after_ack(&request, peer) {
-                                    self.send_fx2_downlink(&encoded, local, &transport).await;
+                                if let Some(bursts) = self.otasp_after_ack(&request, peer) {
+                                    for encoded in bursts {
+                                        self.send_fx2_downlink(&encoded, local, &transport).await;
+                                    }
                                 }
                                 continue;
                             }
@@ -3358,6 +3347,13 @@ impl ImsCore {
                         }
                     }
                     self.send_fx2_downlink(&encoded, local, &transport).await;
+                }
+                _ = otasp_timer.tick() => {
+                    for (message, peer) in self.otasp_answer_timer(Instant::now(), local) {
+                        if let Err(error) = transport.send(&message, peer).await {
+                            log::warn!("FCS: sending OTASP dialog response to {peer}: {error}");
+                        }
+                    }
                 }
                 _ = voice_dialog_timer.tick() => {
                     for (request, peer) in self.expired_mt_cancels(local) {
@@ -3604,7 +3600,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    fn otasp_test_core() -> (ImsCore, mpsc::Receiver<EncodedA1Message>) {
+    pub(super) fn otasp_test_core() -> (ImsCore, mpsc::Receiver<EncodedA1Message>) {
         let (tx, rx) = mpsc::channel(8);
         let core = ImsCore::with_msc_a1(
             &config(false),
@@ -3648,7 +3644,7 @@ mod tests {
         (core, rx)
     }
 
-    fn otasp_message(body: &FemtoInterfaceMsg) -> SipRequest {
+    pub(super) fn otasp_message(body: &FemtoInterfaceMsg) -> SipRequest {
         let mut req = SipRequest::new(Method::Message, "sip:fcs@example.test");
         req.headers
             .append("From", "5551239999<sip:fap-a@example.test>;tag=ota");
@@ -3656,6 +3652,8 @@ mod tests {
         req.headers
             .append("Call-ID", "new-standalone-otasp-message");
         req.headers.append("CSeq", "1 MESSAGE");
+        req.headers
+            .append("Via", "SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bKmessage");
         req.headers
             .append("Content-Type", "application/FemtoInterfaceMsg");
         req.body = body.encode();
@@ -3667,7 +3665,7 @@ mod tests {
         let (core, mut rx) = otasp_test_core();
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6, 1, 2],
             },
             tag: None,
@@ -3699,7 +3697,7 @@ mod tests {
             let (core, mut rx) = otasp_test_core();
             let deliver = cdma_ios::AddsDeliverMessage {
                 adds_user_part: AddsUserPart {
-                    burst_type: 4,
+                    burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                     data: vec![6, 1, 2],
                 },
                 tag: None,
@@ -3757,6 +3755,8 @@ mod tests {
         req.headers.append("Call-ID", "voice-dialog");
         req.headers.append("CSeq", "11 INFO");
         req.headers
+            .append("Via", "SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bKinfo");
+        req.headers
             .append("Content-Type", "application/FemtoInterfaceMsg");
         req.body = b"54\r\n33=M4AAAAw=\r\n".to_vec();
         assert!(FemtoInterfaceMsg::parse(&req.body).is_err());
@@ -3780,6 +3780,7 @@ mod tests {
                 .tag,
             Some(cdma_ios::Tag(0x8000000c))
         );
+        req.headers.set("CSeq", "12 INFO");
         req.body = b"54\r\n33=M4AAABI=\r\n".to_vec();
         assert_eq!(
             core.handle_request_from(&req, "198.51.100.1:5060".parse().unwrap())
@@ -3806,7 +3807,7 @@ mod tests {
         let (core, mut rx) = otasp_test_core();
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6],
             },
             tag: None,
@@ -3835,7 +3836,7 @@ mod tests {
         let (core, mut rx) = otasp_test_core();
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6],
             },
             tag: Some(Tag(0x80000001)),
@@ -4228,7 +4229,7 @@ mod tests {
 41=QQUBAAAA/Q==\r\n\
 0D=DQjxAAAAAAAA8A==\r\n";
 
-    fn config(allow_unauth: bool) -> SipConfig {
+    pub(super) fn config(allow_unauth: bool) -> SipConfig {
         SipConfig {
             listen: "127.0.0.1:0".to_string(),
             realm: "femto.local.1xbts.org".to_string(),
@@ -4434,7 +4435,7 @@ mod tests {
         request
     }
 
-    fn mo_invite_request() -> SipRequest {
+    pub(super) fn mo_invite_request() -> SipRequest {
         let classmark = vec![
             0xc1, 0x00, 0x66, 0x00, 0x03, 0x01, 0x31, 0x01, 0x03, 0x00, 0x01, 0x06,
         ];
@@ -4776,7 +4777,7 @@ mod tests {
 
         let deliver = cdma_ios::AddsDeliverMessage {
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6],
             },
             tag: Some(Tag(0x80000001)),
@@ -4798,6 +4799,7 @@ mod tests {
         let mut ack = invite.clone();
         ack.method = Method::Ack;
         ack.headers.set("CSeq", "1 ACK");
+        ack.headers.set("To", answer.headers.to().unwrap());
         assert!(
             core.otasp_after_ack(&ack, "198.51.100.2:5060".parse().unwrap())
                 .is_none()
@@ -4809,6 +4811,7 @@ mod tests {
                 .contains_key(&call_id)
         );
         let released = core.otasp_after_ack(&ack, peer).unwrap();
+        let released = &released[0];
         assert_eq!(released.call_id(), Some(call_id));
         assert_eq!(
             cdma_ios::AddsDeliverMessage::decode(&released.decode().unwrap().payload).unwrap(),

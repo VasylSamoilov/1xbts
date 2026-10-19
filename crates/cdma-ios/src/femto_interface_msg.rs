@@ -1,4 +1,4 @@
-//! `FemtoInterfaceMsg` codec (3GPP2 X.S0059-200 Â§8.1.1.2).
+//! `FemtoInterfaceMsg` codec (3GPP2 X.S0059-200 §8.1.1.2).
 //!
 //! Internal BSC/MSC routing tags and transport call IDs must not enter SIP bodies.
 
@@ -23,8 +23,10 @@ const DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT: u8 = 0x05;
 const DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING: u8 = 0x03;
 const DTAP_RESERVED_OCTET: u8 = 0x00;
 const BSMAP_MESSAGE_DISCRIMINATION: u8 = 0x00;
+const DTAP_MESSAGE_DISCRIMINATION: u8 = 0x01;
+const DTAP_LINK_IDENTIFIER: u8 = 0x00;
 
-/// DTAP Message Type Value for `Location Updating Request` (A.S0014 Â§3.1.2.6).
+/// DTAP Message Type Value for `Location Updating Request` (A.S0014 §3.1.2.6).
 pub const MSG_TYPE_LOCATION_UPDATING_REQUEST: u8 = 0x08;
 /// DTAP Message Type Value for `CM Service Request` (A.S0014).
 pub const MSG_TYPE_CM_SERVICE_REQUEST: u8 = 0x24;
@@ -237,7 +239,7 @@ impl Discriminator {
 /// One information element as carried in the femto body: the two-hex IEI prefix
 /// plus the exact bytes the base64 content decodes to. For a Type 3/4 IE those
 /// bytes begin with the IEI itself, so `content[0] == iei`. The struct keeps
-/// them verbatim so any IE â€” including ones this crate has no typed model for â€”
+/// them verbatim so any IE — including ones this crate has no typed model for —
 /// round-trips byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FemtoIe {
@@ -732,7 +734,7 @@ impl FemtoInterfaceMsg {
                 actual: sdu.len(),
             })
         })?;
-        let mut wire = vec![0x01, 0x00, length];
+        let mut wire = vec![DTAP_MESSAGE_DISCRIMINATION, DTAP_LINK_IDENTIFIER, length];
         wire.extend(sdu);
         Ok(wire)
     }
@@ -905,7 +907,7 @@ impl FemtoInterfaceMsg {
     pub fn to_layer3_sdu(&self) -> Vec<u8> {
         let ie_bytes = || {
             self.ies.iter().flat_map(|ie| {
-                // The mandatory ADDS User Part is positional in the DTAP SDU;
+                // The mandatory ADDS User Part is positional in the DTAP SDU.
                 // Fx2 includes its IEI, which must be removed on reconstruction.
                 let content = if self.message_type == MSG_TYPE_ADDS_DELIVER
                     && self.discriminator == Some(Discriminator::Dtap)
@@ -1392,7 +1394,7 @@ mod otasp_transport_tests {
         for length in [0, 1, 32, 244, 245] {
             let deliver = AddsDeliverMessage {
                 adds_user_part: AddsUserPart {
-                    burst_type: 4,
+                    burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                     data: (0..length).map(|n| n as u8).collect(),
                 },
                 tag: Some(Tag(0x80000001)),
@@ -1413,7 +1415,7 @@ mod otasp_transport_tests {
     fn otasp_deliver_rejects_wrong_discriminator_and_invalid_mandatory_ie() {
         let deliver = AddsDeliverMessage {
             adds_user_part: AddsUserPart {
-                burst_type: 4,
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
                 data: vec![6],
             },
             tag: None,
