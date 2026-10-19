@@ -745,20 +745,12 @@ mod tests {
 
     #[tokio::test]
     async fn binds_fap_and_msc_relay_sockets_on_separate_addresses() {
-        let pool = RtpRelayPool::new(
-            Ipv4Addr::LOCALHOST,
-            Ipv4Addr::new(127, 0, 0, 2),
-            19_000,
-            19_003,
-        )
-        .expect("relay pool");
+        let pool = RtpRelayPool::new(Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED, 19_000, 19_003)
+            .expect("relay pool");
 
         let relay = pool.open(cdma_ios::ServiceOption::EVRC_A.0).expect("relay");
 
         assert_eq!(relay.fap_local().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(
-            relay.msc_local().ip(),
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))
-        );
+        assert_eq!(relay.msc_local().ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 }
