@@ -143,7 +143,8 @@ impl FemtoService {
             .with_fap_registry(shared_registry.clone())
             .with_learned_sip_passwords(ims.learned_passwords())
             .with_fap_route_hints(ims.fap_route_hint_sender())
-            .with_term_auth_psk(config.term_auth_psk.clone());
+            .with_term_auth_psk(config.term_auth_psk.clone())
+            .with_a11_provisioning(config.a11_provisioning.clone());
         let acs_credentials = acs.credentials_handle();
         let acs_term_auth_psk = acs.term_auth_psk_handle();
         let ingress = packet::FemtoPacketIngress::new(&config.packet);
@@ -157,6 +158,7 @@ impl FemtoService {
             shared_registry.clone(),
             acs_credentials,
             acs_term_auth_psk,
+            acs.a11_provisioning_handle(),
             served_cells,
             ims.sip_users_handle(),
         );

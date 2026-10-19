@@ -101,12 +101,14 @@ pub struct AcsSession {
     recovering_unlock: bool,
     configuration_verified: bool,
     pending_parameters: HashSet<String>,
+    drifted_parameters: HashSet<String>,
     reapply_stages: HashSet<String>,
     created_objects: HashSet<String>,
     instance_remap: Vec<(String, String)>,
     derived_values: HashMap<String, String>,
     read_sip_password: bool,
     fap_context: Option<FapProvisioningContext>,
+    a11_provisioning: Option<crate::config::A11Provisioning>,
     bracket: Option<BracketStep>,
     outbox: VecDeque<CwmpMessage>,
     gpv_accumulator: Vec<ParameterValue>,
@@ -125,7 +127,11 @@ fn log_outgoing(feid: Option<&str>, action: &AcsAction) {
                 log::info!(
                     "ACS: [{feid}] -> SetParameterValues {} = {}",
                     parameter.name,
-                    parameter.value
+                    if is_sensitive_parameter(&parameter.name) {
+                        "<redacted>"
+                    } else {
+                        &parameter.value
+                    }
                 );
             }
         }
@@ -167,8 +173,21 @@ const ONEX_ADMIN_DOWN: &str = "lock";
 
 impl AcsSession {
     fn resolve_fap_context_value(&self, value: &CwmpFapValue) -> Option<String> {
+        match value {
+            CwmpFapValue::A11Spi => {
+                return self.a11_provisioning.as_ref().map(|a| a.0.spi.to_string());
+            }
+            CwmpFapValue::A11SharedSecretHex => {
+                return self
+                    .a11_provisioning
+                    .as_ref()
+                    .map(|a| a.0.shared_secret_hex.clone());
+            }
+            _ => {}
+        }
         let context = self.fap_context.as_ref()?;
         match value {
+            CwmpFapValue::A11Spi | CwmpFapValue::A11SharedSecretHex => None,
             CwmpFapValue::Feid => Some(context.feid.clone()),
             CwmpFapValue::SiteSid => Some(context.sid.to_string()),
             CwmpFapValue::SiteNid => Some(context.nid.to_string()),
@@ -354,12 +373,14 @@ impl AcsSession {
             recovering_unlock: false,
             configuration_verified: false,
             pending_parameters: HashSet::new(),
+            drifted_parameters: HashSet::new(),
             reapply_stages: HashSet::new(),
             created_objects: HashSet::new(),
             instance_remap: Vec::new(),
             derived_values: HashMap::new(),
             read_sip_password: false,
             fap_context: None,
+            a11_provisioning: None,
             bracket: None,
             outbox: VecDeque::new(),
             gpv_accumulator: Vec::new(),
@@ -443,7 +464,7 @@ impl AcsSession {
             let instance = object.required_instance?;
             let instance_prefix = format!("{}{instance}.", object.name);
             if self
-                .pending_parameters
+                .drifted_parameters
                 .iter()
                 .any(|name| name.starts_with(&instance_prefix))
             {
@@ -533,8 +554,6 @@ impl AcsSession {
                     .iter()
                     .map(|p| ParameterValue {
                         name: self.remap_name(&p.name),
-                        // Only value_from params take a derived value, so a static
-                        // param keeps its literal even when a derived value shares its name.
                         value: if p.value_from.is_some() {
                             self.derived_values
                                 .get(&p.name)
@@ -1127,11 +1146,39 @@ impl AcsSession {
             }
             (AcsPhase::ConfigurationQuerySent, CwmpMessage::GetParameterValuesResponse(resp)) => {
                 self.bracket = None;
+                if self.a11_provisioning.is_none()
+                    && stages.iter().flat_map(|s| &s.params).any(|p| {
+                        matches!(
+                            p.value_from,
+                            Some(CwmpValueSource::FapContext {
+                                context: CwmpFapValue::A11Spi | CwmpFapValue::A11SharedSecretHex
+                            })
+                        )
+                    })
+                {
+                    log::error!(
+                        "ACS: [{}] A11 provisioning credentials are missing",
+                        self.feid_tag()
+                    );
+                    self.configuration_verified = false;
+                    self.phase = AcsPhase::Done;
+                    return AcsAction::EndSession;
+                }
                 self.derive_values(stages, &resp.parameters);
                 let desired = self.settled_parameters(stages);
                 let reapplied = stages
                     .iter()
-                    .filter(|stage| self.reapply_stages.contains(&stage.label))
+                    .filter(|stage| {
+                        self.reapply_stages.contains(&stage.label)
+                            || stage.params.iter().any(|p| {
+                                matches!(
+                                    p.value_from,
+                                    Some(CwmpValueSource::FapContext {
+                                        context: CwmpFapValue::A11SharedSecretHex
+                                    })
+                                )
+                            })
+                    })
                     .flat_map(|stage| stage.params.iter().map(|parameter| parameter.name.clone()))
                     .collect::<HashSet<_>>();
                 let matches = desired.iter().all(|expected| {
@@ -1150,6 +1197,7 @@ impl AcsSession {
                     })
                     .map(|parameter| parameter.name.clone())
                     .collect::<Vec<_>>();
+                self.drifted_parameters = mismatched.iter().cloned().collect();
                 let transient_admin = mismatched
                     .iter()
                     .filter(|name| {
@@ -3496,5 +3544,106 @@ mod tests {
         );
         assert_eq!(action, AcsAction::EndSession);
         assert_eq!(session.phase(), AcsPhase::Done);
+    }
+    #[test]
+    fn a11_keys_are_reapplied_when_spi_matches_and_after_key_rotation() {
+        let mut stages = vec![ProvisioningStage {
+            label: "pdsn".to_string(),
+            atomic: true,
+            replace_object: None,
+            bracket_admin: None,
+            params: vec![
+                CwmpParam {
+                    name: "Pdsn.1.SecurityParameterIndex".to_string(),
+                    value: String::new(),
+                    value_from: Some(CwmpValueSource::FapContext {
+                        context: CwmpFapValue::A11Spi,
+                    }),
+                    xsd_type: "xsd:unsignedInt".to_string(),
+                    verify: true,
+                },
+                CwmpParam {
+                    name: "Pdsn.1.SecurityKey".to_string(),
+                    value: String::new(),
+                    value_from: Some(CwmpValueSource::FapContext {
+                        context: CwmpFapValue::A11SharedSecretHex,
+                    }),
+                    xsd_type: "xsd:string".to_string(),
+                    verify: true,
+                },
+            ],
+        }];
+        stages.insert(
+            0,
+            ProvisioningStage {
+                label: "replace-pdsn".to_string(),
+                atomic: false,
+                replace_object: Some(CwmpObject {
+                    name: "Pdsn.".to_string(),
+                    existence_probe_leaf: None,
+                    next_level: true,
+                    required_instance: Some(1),
+                }),
+                bracket_admin: None,
+                params: vec![],
+            },
+        );
+        for secret in ["00112233", "aabbccdd"] {
+            let mut session = airave_session();
+            session.a11_provisioning = Some(crate::config::A11Provisioning(
+                cdma_a11::A11SecurityConfig {
+                    spi: 256,
+                    shared_secret_hex: secret.to_string(),
+                },
+            ));
+            session.step(&inform(), &stages, &[], false, true);
+            session.step(&CwmpMessage::Empty, &stages, &[], false, true);
+            let response =
+                CwmpMessage::GetParameterValuesResponse(cdma_cwmp::GetParameterValuesResponse {
+                    parameters: vec![ParameterValue {
+                        name: "Pdsn.1.SecurityParameterIndex".to_string(),
+                        value: "256".to_string(),
+                        xsi_type: "xsd:unsignedInt".to_string(),
+                    }],
+                });
+            let AcsAction::Respond(message) = session.step(&response, &stages, &[], false, true)
+            else {
+                panic!("expected key write despite matching SPI");
+            };
+            let CwmpMessage::SetParameterValues(request) = *message else {
+                panic!("expected SetParameterValues");
+            };
+            assert_eq!(
+                request
+                    .parameter_list
+                    .iter()
+                    .map(|p| (p.name.as_str(), p.value.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("Pdsn.1.SecurityKey", secret),
+                    ("Pdsn.1.SecurityParameterIndex", "256")
+                ]
+            );
+            session.step(
+                &CwmpMessage::SetParameterValuesResponse(Default::default()),
+                &stages,
+                &[],
+                false,
+                true,
+            );
+            assert_eq!(session.phase(), AcsPhase::Done);
+        }
+        let mut session = airave_session();
+        session.step(&inform(), &stages, &[], false, true);
+        session.step(&CwmpMessage::Empty, &stages, &[], false, true);
+        let action = session.step(
+            &CwmpMessage::GetParameterValuesResponse(Default::default()),
+            &stages,
+            &[],
+            false,
+            true,
+        );
+        assert_eq!(action, AcsAction::EndSession);
+        assert!(!session.configuration_verified());
     }
 }

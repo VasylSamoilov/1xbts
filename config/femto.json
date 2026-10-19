@@ -425,15 +425,19 @@
               },
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableSecurityParameterIndex",
-                "value": "256",
                 "xsd_type": "xsd:unsignedInt",
-                "verify": true
+                "verify": true,
+                "value_from": {
+                  "context": "a11_spi"
+                }
               },
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableSecurityKey",
-                "value": "e3a276bb0615f4aeac4a047992f234a1",
                 "xsd_type": "xsd:string",
-                "verify": true
+                "verify": true,
+                "value_from": {
+                  "context": "a11_shared_secret_hex"
+                }
               },
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_OneXMO.X_0005B9_BatchTableOneXPcfPdsn.BatchTableOneXPcfPdsnTableEntry.1.OneXbatchTableIOSVersion",
@@ -488,15 +492,19 @@
               },
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableSecurityParameterIndex",
-                "value": "256",
                 "xsd_type": "xsd:unsignedInt",
-                "verify": true
+                "verify": true,
+                "value_from": {
+                  "context": "a11_spi"
+                }
               },
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableSecurityKey",
-                "value": "e3a276bb0615f4aeac4a047992f234a1",
                 "xsd_type": "xsd:string",
-                "verify": true
+                "verify": true,
+                "value_from": {
+                  "context": "a11_shared_secret_hex"
+                }
               },
               {
                 "name": "InternetGatewayDevice.Services.X_0005B9_DOMO.X_0005B9_BatchTableDOPcfPdsn.BatchTableDOPcfPdsnTableEntry.1.batchTableIOSVersion",

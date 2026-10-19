@@ -67,6 +67,7 @@ pub struct FemtoCellManagementService {
     fap_registry: crate::fap::SharedFapRegistry,
     acs_credentials: Arc<std::sync::RwLock<Vec<crate::config::CpeCredential>>>,
     acs_term_auth_psk: Arc<std::sync::RwLock<Option<String>>>,
+    acs_a11_provisioning: Arc<std::sync::RwLock<Option<crate::config::A11Provisioning>>>,
     served_cells: crate::base_station::SharedServedCells,
     sip_users: crate::sip::SharedSipUsers,
 }
@@ -77,6 +78,7 @@ impl FemtoCellManagementService {
         fap_registry: crate::fap::SharedFapRegistry,
         acs_credentials: Arc<std::sync::RwLock<Vec<crate::config::CpeCredential>>>,
         acs_term_auth_psk: Arc<std::sync::RwLock<Option<String>>>,
+        acs_a11_provisioning: Arc<std::sync::RwLock<Option<crate::config::A11Provisioning>>>,
         served_cells: crate::base_station::SharedServedCells,
         sip_users: crate::sip::SharedSipUsers,
     ) -> Self {
@@ -85,6 +87,7 @@ impl FemtoCellManagementService {
             fap_registry,
             acs_credentials,
             acs_term_auth_psk,
+            acs_a11_provisioning,
             served_cells,
             sip_users,
         }
@@ -478,6 +481,10 @@ impl FemtoManagementService for FemtoCellManagementService {
         .map_err(|error| Status::internal(format!("reload: registry build failed: {error}")))?;
         let fap_count = registry.len() as u32;
         let site_count = config.sites.len() as u32;
+        *self
+            .acs_a11_provisioning
+            .write()
+            .expect("A11 provisioning lock") = config.a11_provisioning.clone();
         self.state.reload_from_config(&config);
         *self.fap_registry.write().expect("fap registry lock") = std::sync::Arc::new(registry);
         *self.acs_credentials.write().expect("acs credentials lock") =

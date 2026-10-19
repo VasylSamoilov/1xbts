@@ -11,6 +11,7 @@ pub struct AcsServer {
     fap_registry: Option<SharedFapRegistry>,
     pub(super) fap_route_hint_tx: Option<tokio::sync::mpsc::UnboundedSender<FapRouteHint>>,
     pub(super) learned_sip_passwords: Option<Arc<std::sync::RwLock<HashMap<String, String>>>>,
+    pub(super) a11_provisioning: Arc<std::sync::RwLock<Option<crate::config::A11Provisioning>>>,
     pub(super) term_auth_psk: Arc<std::sync::RwLock<Option<String>>>,
 }
 
@@ -55,8 +56,23 @@ impl AcsServer {
             fap_registry: None,
             fap_route_hint_tx: None,
             learned_sip_passwords: None,
+            a11_provisioning: Arc::new(std::sync::RwLock::new(None)),
             term_auth_psk: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    pub fn with_a11_provisioning(self, value: Option<crate::config::A11Provisioning>) -> Self {
+        *self
+            .a11_provisioning
+            .write()
+            .expect("A11 provisioning lock") = value;
+        self
+    }
+
+    pub fn a11_provisioning_handle(
+        &self,
+    ) -> Arc<std::sync::RwLock<Option<crate::config::A11Provisioning>>> {
+        self.a11_provisioning.clone()
     }
 
     pub fn with_term_auth_psk(self, psk: Option<String>) -> Self {
