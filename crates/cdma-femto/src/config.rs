@@ -368,6 +368,9 @@ pub struct SegwConfig {
     pub vip_subnet: Option<String>,
     #[serde(default)]
     pub vip_dns: Option<String>,
+    /// INTERNAL_IP4_NETMASK returned with the virtual IP, required by Airave 2.5+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vip_netmask: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ike_identity_domain: Option<String>,
 }

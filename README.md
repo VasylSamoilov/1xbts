@@ -204,6 +204,9 @@ Compose does not start the shared network core. For a femtocell-only
 installation, follow the Femtocell Setup guide to add the femtocell to the MSC,
 configure the PDSN and host return route, and run the shared core without an SDR.
 
+For Airave 2.5+, use `airave-25plus`. For the original Airave 2.5, use
+`airave-25-2x` for 2.x firmware or `airave-25-5x` for 5.x firmware.
+
 To terminate FAP IPsec on this host while running the femtocell core elsewhere,
 start only StrongSwan, tunnel DNS, and the SeGW configuration controller:
 
