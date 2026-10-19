@@ -1130,6 +1130,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "cdma-a11",
  "cdma-cave",
  "cdma-common",
  "cdma-cwmp",

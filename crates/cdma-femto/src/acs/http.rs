@@ -276,6 +276,12 @@ pub(super) async fn handle_cwmp(
             .and_then(|feid| state.server.fap_definition(feid))
         {
             session.set_implementation(implementation.implementation.clone());
+            session.a11_provisioning = state
+                .server
+                .a11_provisioning
+                .read()
+                .expect("A11 provisioning lock")
+                .clone();
             session.set_fap_context(
                 &implementation,
                 state

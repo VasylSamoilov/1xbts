@@ -180,6 +180,11 @@ local files, such as `fou-nat` and `speedtest`.
 
 ### Femtocell Profiles
 
+For `airave-25-5x`, set `a11_security.spi` and
+`a11_security.shared_secret_hex` in `config/pdsn.local.json`. Provisioning uses
+these values for both 1x and EV-DO. Restart the PDSN and `femto-core`, then
+sync the femtocell after changing them.
+
 Femtocell containers are disabled during a normal `docker compose up`. Both
 profiles use `config/femto.json` and its `config/femto.local.json` overlay for
 the SeGW and femtocell core. Create the local overlay from the example:

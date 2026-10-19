@@ -13,6 +13,8 @@ pub struct FemtoConfig {
     #[serde(default)]
     pub fcs: FcsConfig,
     pub packet: PacketConfig,
+    #[serde(skip)]
+    pub a11_provisioning: Option<A11Provisioning>,
     #[serde(default)]
     pub fap_profiles: BTreeMap<String, FapProfileConfig>,
     #[serde(default)]
@@ -55,6 +57,7 @@ impl From<FemtoConfigRaw> for FemtoConfig {
             sip: raw.sip,
             fcs: raw.fcs,
             packet: raw.packet,
+            a11_provisioning: None,
             fap_profiles: raw.fap_profiles,
             sites: raw.sites,
             faps: BTreeMap::new(),
@@ -567,6 +570,8 @@ pub enum CwmpFapValue {
     SiteEvdoPnOffset,
     SiteEvdoAdminStatus,
     TermAuthPsk,
+    A11Spi,
+    A11SharedSecretHex,
     #[serde(rename = "site_onex_admin_state")]
     SiteOneXAdminState,
 }
@@ -762,6 +767,10 @@ fn default_fcs_rtp_port_end() -> u16 {
 pub struct PacketConfig {
     pub adapter: PacketAdapter,
     #[serde(default)]
+    pub pdsn_config: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub a11_spi: Option<u32>,
+    #[serde(default)]
     pub direct_ip: Option<DirectIpConfig>,
 }
 
@@ -794,17 +803,105 @@ pub enum ConfigError {
     Validation(String),
 }
 
+#[derive(Clone)]
+pub struct A11Provisioning(pub cdma_a11::A11SecurityConfig);
+
+impl std::fmt::Debug for A11Provisioning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A11Provisioning")
+            .field("spi", &self.0.spi)
+            .field("shared_secret_hex", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct PdsnA11Config {
+    a11_security: cdma_a11::A11SecurityConfig,
+    #[serde(default)]
+    a11_peers: Vec<cdma_a11::A11SecurityConfig>,
+}
+
 impl FemtoConfig {
+    fn load_a11_provisioning(&mut self, femto_path: &Path) -> Result<(), ConfigError> {
+        let required = self
+            .fap_profiles
+            .values()
+            .filter_map(|p| p.acs.as_ref())
+            .flat_map(|a| &a.stages)
+            .flat_map(|s| &s.params)
+            .any(|p| {
+                matches!(
+                    p.value_from,
+                    Some(CwmpValueSource::FapContext {
+                        context: CwmpFapValue::A11Spi | CwmpFapValue::A11SharedSecretHex
+                    })
+                )
+            });
+        if !required {
+            return Ok(());
+        }
+        let parent = femto_path.parent().unwrap_or_else(|| Path::new("."));
+        let path = parent.join(
+            self.packet
+                .pdsn_config
+                .as_deref()
+                .unwrap_or_else(|| Path::new("pdsn.json")),
+        );
+        let value =
+            cdma_common::config_load::load_json_with_local_override(&path).map_err(|source| {
+                ConfigError::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+            })?;
+        let source: PdsnA11Config =
+            serde_json::from_value(value).map_err(|source| ConfigError::Parse {
+                path: path.display().to_string(),
+                source,
+            })?;
+        let mut seen = std::collections::HashSet::new();
+        for association in std::iter::once(&source.a11_security).chain(&source.a11_peers) {
+            association
+                .validate("PDSN A11 provisioning")
+                .map_err(ConfigError::Validation)?;
+            if !seen.insert(association.spi) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate PDSN A11 SPI {}",
+                    association.spi
+                )));
+            }
+        }
+        let mut association = match self.packet.a11_spi {
+            None => source.a11_security,
+            Some(spi) if spi == source.a11_security.spi => source.a11_security,
+            Some(spi) => source
+                .a11_peers
+                .into_iter()
+                .find(|a| a.spi == spi)
+                .ok_or_else(|| {
+                    ConfigError::Validation(format!(
+                        "packet.a11_spi {spi} is not configured on the PDSN"
+                    ))
+                })?,
+        };
+        association.shared_secret_hex = association.shared_secret_hex.trim().to_ascii_lowercase();
+        self.a11_provisioning = Some(A11Provisioning(association));
+        Ok(())
+    }
+
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         let value = cdma_common::config_load::load_json_with_local_override(Path::new(path))
             .map_err(|source| ConfigError::Io {
                 path: path.to_string(),
                 source,
             })?;
-        let config: Self = serde_json::from_value(value).map_err(|source| ConfigError::Parse {
-            path: path.to_string(),
-            source,
-        })?;
+        let mut config: Self =
+            serde_json::from_value(value).map_err(|source| ConfigError::Parse {
+                path: path.to_string(),
+                source,
+            })?;
+        config.load_a11_provisioning(Path::new(path))?;
         config.validate()?;
         Ok(config)
     }
@@ -1026,5 +1123,127 @@ mod tests {
             matches!(error, ConfigError::Validation(ref m) if m.contains("floor")),
             "got {error:?}"
         );
+    }
+    struct A11ConfigFixture(std::path::PathBuf);
+
+    impl A11ConfigFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "femto-a11-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(
+                path.join("femto.json"),
+                include_str!("../../../config/femto.json"),
+            )
+            .unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, value: serde_json::Value) {
+            std::fs::write(self.0.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+
+        fn load(&self) -> Result<FemtoConfig, ConfigError> {
+            FemtoConfig::load(self.0.join("femto.json").to_str().unwrap())
+        }
+    }
+
+    impl Drop for A11ConfigFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn a11_provisioning_uses_pdsn_local_overrides_and_reloads_rotated_keys() {
+        let fixture = A11ConfigFixture::new();
+        fixture.write(
+            "pdsn.json",
+            serde_json::json!({"a11_security": {"spi":256, "shared_secret_hex":"00112233"}}),
+        );
+        fixture.write(
+            "pdsn.local.json",
+            serde_json::json!({"a11_security": {"spi":512, "shared_secret_hex":"aabbccdd"}}),
+        );
+        let config = fixture.load().unwrap();
+        let a11 = config.a11_provisioning.unwrap();
+        assert_eq!(
+            (a11.0.spi, a11.0.shared_secret_hex.as_str()),
+            (512, "aabbccdd")
+        );
+        assert!(!format!("{a11:?}").contains("aabbccdd"));
+        fixture.write(
+            "pdsn.local.json",
+            serde_json::json!({"a11_security": {"shared_secret_hex":"11223344"}}),
+        );
+        let config = fixture.load().unwrap();
+        assert_eq!(
+            config.a11_provisioning.unwrap().0.shared_secret_hex,
+            "11223344"
+        );
+    }
+
+    #[test]
+    fn a11_provisioning_selects_explicit_peer_from_configured_pdsn_path() {
+        let fixture = A11ConfigFixture::new();
+        fixture.write(
+            "femto.local.json",
+            serde_json::json!({"packet":{"pdsn_config":"other.json", "a11_spi":512}}),
+        );
+        fixture.write("other.json", serde_json::json!({"a11_security":{"spi":256,"shared_secret_hex":"00112233"},"a11_peers":[{"spi":512,"shared_secret_hex":"aabbccdd","feid":"0005B9000001"}]}));
+        let a11 = fixture.load().unwrap().a11_provisioning.unwrap();
+        assert_eq!(
+            (a11.0.spi, a11.0.shared_secret_hex.as_str()),
+            (512, "aabbccdd")
+        );
+        fixture.write(
+            "femto.local.json",
+            serde_json::json!({"packet":{"pdsn_config":"other.json", "a11_spi":1024}}),
+        );
+        assert!(
+            fixture
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("not configured")
+        );
+    }
+
+    #[test]
+    fn a11_provisioning_rejects_missing_and_invalid_credentials() {
+        let fixture = A11ConfigFixture::new();
+        assert!(fixture.load().is_err());
+        for (spi, key) in [(255, "00112233"), (256, ""), (256, "not-hex")] {
+            fixture.write(
+                "pdsn.json",
+                serde_json::json!({"a11_security":{"spi":spi,"shared_secret_hex":key}}),
+            );
+            assert!(fixture.load().is_err());
+        }
+    }
+    #[test]
+    fn a11_provisioning_rejects_duplicate_spis_and_allows_profiles_without_a11() {
+        let fixture = A11ConfigFixture::new();
+        fixture.write(
+            "pdsn.json",
+            serde_json::json!({
+                "a11_security":{"spi":256,"shared_secret_hex":"00112233"},
+                "a11_peers":[{"spi":256,"shared_secret_hex":"aabbccdd"}]
+            }),
+        );
+        assert!(
+            fixture
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        fixture.write("femto.local.json", serde_json::json!({"fap_profiles":null}));
+        std::fs::remove_file(fixture.0.join("pdsn.json")).unwrap();
+        assert!(fixture.load().unwrap().a11_provisioning.is_none());
     }
 }
