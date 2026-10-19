@@ -1,5 +1,6 @@
 # HEAD
 
+- Fixed OTASP provisioning through Airvana femtocells (@dondaplayer1).
 - Added Airave 2.5+ provisioning support (@dondaplayer1).
 - Added support for femtocells (Airvana Airave FAPs): ACS/CWMP provisioning over an IPsec SeGW, SIP voice and SMS, and packet data, managed as ordinary cells. Configure in `config/femto.json`, `config/femto.local.json`, and `config/pdsn.local.json`.
 - Fixed band class channel validation and PRL scanning in cdma-ms, which now tunes by band class and channel alone.

@@ -3,10 +3,10 @@
 //! Internal BSC/MSC routing tags and transport call IDs must not enter SIP bodies.
 
 use crate::typed::{
-    AddsPageAckMessage, AddsPageMessage, AddsTransferAckMessage, AddsTransferMessage,
-    AssignmentCompleteMessage, AssignmentRequestMessage, CmServiceRequestMessage,
-    LocationUpdatingAcceptMessage, LocationUpdatingRequestMessage, MobileIdentity,
-    PagingRequestMessage, PagingResponseMessage,
+    AddsDeliverAckMessage, AddsDeliverMessage, AddsPageAckMessage, AddsPageMessage,
+    AddsTransferAckMessage, AddsTransferMessage, AssignmentCompleteMessage,
+    AssignmentRequestMessage, CmServiceRequestMessage, LocationUpdatingAcceptMessage,
+    LocationUpdatingRequestMessage, MobileIdentity, PagingRequestMessage, PagingResponseMessage,
 };
 
 pub const CONTENT_TYPE_FEMTO: &str = "application/vnd.3gpp2.FemtoInterfaceMsg";
@@ -23,6 +23,8 @@ const DTAP_PROTOCOL_DISCRIMINATOR_MOBILITY_MANAGEMENT: u8 = 0x05;
 const DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING: u8 = 0x03;
 const DTAP_RESERVED_OCTET: u8 = 0x00;
 const BSMAP_MESSAGE_DISCRIMINATION: u8 = 0x00;
+const DTAP_MESSAGE_DISCRIMINATION: u8 = 0x01;
+const DTAP_LINK_IDENTIFIER: u8 = 0x00;
 
 /// DTAP Message Type Value for `Location Updating Request` (A.S0014 §3.1.2.6).
 pub const MSG_TYPE_LOCATION_UPDATING_REQUEST: u8 = 0x08;
@@ -32,6 +34,8 @@ pub const MSG_TYPE_LOCATION_UPDATING_ACCEPT: u8 = 0x02;
 pub const MSG_TYPE_ASSIGNMENT_REQUEST: u8 = 0x01;
 pub const MSG_TYPE_ASSIGNMENT_COMPLETE: u8 = 0x02;
 pub const MSG_TYPE_PAGING_REQUEST: u8 = 0x52;
+pub const MSG_TYPE_ADDS_DELIVER: u8 = 0x53;
+pub const MSG_TYPE_ADDS_DELIVER_ACK: u8 = 0x54;
 pub const MSG_TYPE_ADDS_PAGE: u8 = 0x65;
 pub const MSG_TYPE_ADDS_PAGE_ACK: u8 = 0x66;
 pub const MSG_TYPE_ADDS_TRANSFER: u8 = 0x67;
@@ -635,6 +639,116 @@ impl FemtoInterfaceMsg {
         })
     }
 
+    /// Fx2 includes the IEI even for the mandatory positional ADDS User Part.
+    pub fn from_adds_deliver(msg: &AddsDeliverMessage) -> Result<Self> {
+        let mut ies = vec![FemtoIe::tlv(
+            IE_ADDS_USER_PART,
+            &msg.adds_user_part.encode_body_public(),
+        )?];
+        if let Some(tag) = msg.tag {
+            ies.push(FemtoIe::tv(IE_TAG, &tag.encode()));
+        }
+        Ok(Self {
+            message_type: MSG_TYPE_ADDS_DELIVER,
+            discriminator: Some(Discriminator::Dtap),
+            message_name: Some("ADDS Deliver".to_string()),
+            ies,
+        })
+    }
+
+    pub fn to_adds_deliver(&self) -> Result<AddsDeliverMessage> {
+        self.require_adds_dtap(MSG_TYPE_ADDS_DELIVER)?;
+        let user_parts: Vec<_> = self
+            .ies
+            .iter()
+            .filter(|ie| ie.iei == IE_ADDS_USER_PART)
+            .collect();
+        if user_parts.len() != 1 {
+            return Err(FemtoError::A1Codec(crate::Error::InvalidValue {
+                context: "ADDS Deliver",
+                reason: "exactly one ADDS User Part is required",
+            }));
+        }
+        let user_part = &user_parts[0].content;
+        if user_part.first() != Some(&IE_ADDS_USER_PART)
+            || user_part.get(1).map(|n| *n as usize + 2) != Some(user_part.len())
+        {
+            return Err(FemtoError::A1Codec(crate::Error::InvalidValue {
+                context: "ADDS Deliver",
+                reason: "invalid ADDS User Part framing",
+            }));
+        }
+        let mut wire = vec![
+            DTAP_PROTOCOL_DISCRIMINATOR_CALL_PROCESSING,
+            DTAP_RESERVED_OCTET,
+            MSG_TYPE_ADDS_DELIVER,
+        ];
+        wire.extend_from_slice(&user_part[1..]);
+        for ie in self.ies.iter().filter(|ie| ie.iei != IE_ADDS_USER_PART) {
+            if ie.content.first() != Some(&ie.iei) {
+                return Err(FemtoError::A1Codec(crate::Error::InvalidValue {
+                    context: "ADDS Deliver",
+                    reason: "IEI missing from information element",
+                }));
+            }
+            wire.extend_from_slice(&ie.content);
+        }
+        Ok(AddsDeliverMessage::decode(&Self::adds_dtap_frame(wire)?)?)
+    }
+
+    pub fn from_adds_deliver_ack(msg: &AddsDeliverAckMessage) -> Result<Self> {
+        let mut ies = Vec::new();
+        if let Some(tag) = msg.tag {
+            ies.push(FemtoIe::tv(IE_TAG, &tag.encode()));
+        }
+        if let Some(cause) = msg.cause {
+            ies.push(FemtoIe::tv(IE_CAUSE, &cause.encode()));
+        }
+        Ok(Self {
+            message_type: MSG_TYPE_ADDS_DELIVER_ACK,
+            discriminator: Some(Discriminator::Dtap),
+            message_name: Some("ADDS Deliver Ack".to_string()),
+            ies,
+        })
+    }
+
+    pub fn to_adds_deliver_ack(&self) -> Result<AddsDeliverAckMessage> {
+        self.require_adds_dtap(MSG_TYPE_ADDS_DELIVER_ACK)?;
+        for ie in &self.ies {
+            if ie.content.first() != Some(&ie.iei) {
+                return Err(FemtoError::A1Codec(crate::Error::InvalidValue {
+                    context: "ADDS Deliver Ack",
+                    reason: "IEI missing from information element",
+                }));
+            }
+        }
+        Ok(AddsDeliverAckMessage::decode(&Self::adds_dtap_frame(
+            self.to_layer3_sdu(),
+        )?)?)
+    }
+
+    fn adds_dtap_frame(sdu: Vec<u8>) -> Result<Vec<u8>> {
+        let length = u8::try_from(sdu.len()).map_err(|_| {
+            FemtoError::A1Codec(crate::Error::InvalidLength {
+                expected: u8::MAX as usize,
+                actual: sdu.len(),
+            })
+        })?;
+        let mut wire = vec![DTAP_MESSAGE_DISCRIMINATION, DTAP_LINK_IDENTIFIER, length];
+        wire.extend(sdu);
+        Ok(wire)
+    }
+
+    fn require_adds_dtap(&self, expected: u8) -> Result<()> {
+        if self.message_type != expected || self.discriminator != Some(Discriminator::Dtap) {
+            return Err(FemtoError::A1Codec(crate::Error::InvalidValue {
+                context: "FemtoInterfaceMsg",
+                reason: "expected ADDS DTAP message",
+            }));
+        }
+        Ok(())
+    }
+
     pub fn from_adds_page(msg: &AddsPageMessage) -> Result<Self> {
         let mut ies = vec![
             FemtoIe::tlv(IE_MOBILE_IDENTITY, &msg.mobile_identity.encode()?)?,
@@ -791,7 +905,21 @@ impl FemtoInterfaceMsg {
     /// its own IEI. A malformed or nonconforming element should still be visible
     /// to an operator rather than collapsing the whole view.
     pub fn to_layer3_sdu(&self) -> Vec<u8> {
-        let ie_bytes = || self.ies.iter().flat_map(|ie| ie.content.iter().copied());
+        let ie_bytes = || {
+            self.ies.iter().flat_map(|ie| {
+                // The mandatory ADDS User Part is positional in the DTAP SDU.
+                // Fx2 includes its IEI, which must be removed on reconstruction.
+                let content = if self.message_type == MSG_TYPE_ADDS_DELIVER
+                    && self.discriminator == Some(Discriminator::Dtap)
+                    && ie.iei == IE_ADDS_USER_PART
+                {
+                    ie.content.get(1..).unwrap_or_default()
+                } else {
+                    &ie.content
+                };
+                content.iter().copied()
+            })
+        };
         if matches!(self.discriminator, Some(Discriminator::Bsmap)) {
             // BSMAP framing: discrimination octet, length, message type, IEs.
             // The length field is one octet, so a well-formed BSMAP message can
@@ -1254,4 +1382,67 @@ fn strip_one_crlf_suffix(input: &[u8]) -> &[u8] {
 
 fn is_blank(input: &[u8]) -> bool {
     input.iter().all(|&b| b == b'\r' || b == b'\n')
+}
+
+#[cfg(test)]
+mod otasp_transport_tests {
+    use super::*;
+    use crate::{AddsUserPart, Cause, Tag};
+
+    #[test]
+    fn otasp_deliver_round_trips_payload_and_full_width_tag() {
+        for length in [0, 1, 32, 244, 245] {
+            let deliver = AddsDeliverMessage {
+                adds_user_part: AddsUserPart {
+                    burst_type: cdma_common::consts::BURST_TYPE_OTASP,
+                    data: (0..length).map(|n| n as u8).collect(),
+                },
+                tag: Some(Tag(0x80000001)),
+            };
+            let femto = FemtoInterfaceMsg::from_adds_deliver(&deliver).unwrap();
+            assert!(
+                femto
+                    .encode()
+                    .starts_with(b"53 (=\"0 ADDS Deliver\")\r\n3D=")
+            );
+            let parsed = FemtoInterfaceMsg::parse(&femto.encode()).unwrap();
+            assert_eq!(parsed.to_layer3_sdu(), deliver.encode().unwrap()[3..]);
+            assert_eq!(parsed.to_adds_deliver().unwrap(), deliver);
+        }
+    }
+
+    #[test]
+    fn otasp_deliver_rejects_wrong_discriminator_and_invalid_mandatory_ie() {
+        let deliver = AddsDeliverMessage {
+            adds_user_part: AddsUserPart {
+                burst_type: cdma_common::consts::BURST_TYPE_OTASP,
+                data: vec![6],
+            },
+            tag: None,
+        };
+        let mut femto = FemtoInterfaceMsg::from_adds_deliver(&deliver).unwrap();
+        femto.discriminator = Some(Discriminator::Bsmap);
+        assert!(femto.to_adds_deliver().is_err());
+        femto.discriminator = Some(Discriminator::Dtap);
+        femto.ies[0].content[1] = 99;
+        assert!(femto.to_adds_deliver().is_err());
+        femto = FemtoInterfaceMsg::from_adds_deliver(&deliver).unwrap();
+        femto.ies.push(femto.ies[0].clone());
+        assert!(femto.to_adds_deliver().is_err());
+        femto.ies.clear();
+        assert!(femto.to_adds_deliver().is_err());
+    }
+
+    #[test]
+    fn otasp_delivery_ack_preserves_success_and_failure() {
+        for cause in [None, Some(Cause(0x20))] {
+            let ack = AddsDeliverAckMessage {
+                tag: Some(Tag(0x80000001)),
+                cause,
+            };
+            let femto = FemtoInterfaceMsg::from_adds_deliver_ack(&ack).unwrap();
+            let parsed = FemtoInterfaceMsg::parse(&femto.encode()).unwrap();
+            assert_eq!(parsed.to_adds_deliver_ack().unwrap(), ack);
+        }
+    }
 }
