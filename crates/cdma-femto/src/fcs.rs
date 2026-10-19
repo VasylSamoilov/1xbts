@@ -1,10 +1,12 @@
 use cdma_ios::femto_interface_msg::{
-    FemtoInterfaceMsg, MSG_TYPE_ADDS_PAGE_ACK, MSG_TYPE_CM_SERVICE_REQUEST,
-    MSG_TYPE_LOCATION_UPDATING_REQUEST, MSG_TYPE_PAGING_RESPONSE, MimePart, Multipart,
+    FemtoInterfaceMsg, MSG_TYPE_ADDS_DELIVER, MSG_TYPE_ADDS_DELIVER_ACK, MSG_TYPE_ADDS_PAGE_ACK,
+    MSG_TYPE_ADDS_TRANSFER, MSG_TYPE_CM_SERVICE_REQUEST, MSG_TYPE_LOCATION_UPDATING_REQUEST,
+    MSG_TYPE_PAGING_RESPONSE, MimePart, Multipart,
 };
 use cdma_ios::transport::A1TransportEvent;
 use cdma_ios::{
-    AddsPageAckMessage, AddsPageMessage, AddsTransferAckMessage, AssignmentRequestMessage, CellId,
+    AddsDeliverAckMessage, AddsDeliverMessage, AddsPageAckMessage, AddsPageMessage,
+    AddsTransferAckMessage, AddsTransferMessage, AssignmentRequestMessage, CellId,
     CompleteLayer3InformationMessage, EncodedA1Message, Layer3Information,
     LocationUpdatingAcceptMessage, Message, MessageType, PagingRequestMessage,
 };
@@ -107,6 +109,62 @@ impl FemtoImsiMapper {
     }
 }
 
+/// Airvana omits the discriminator on traffic-channel OTA replies. Only its
+/// legacy MIME type and a fully validated burst-4 ADDS payload settle the 0x53
+/// collision with Authentication Request. Keep the general IOS parser strict.
+pub(crate) fn decode_femto_body(
+    content_type: &str,
+    body: &[u8],
+) -> Result<FemtoInterfaceMsg, cdma_ios::femto_interface_msg::FemtoError> {
+    use cdma_ios::femto_interface_msg::{FemtoError, IE_CAUSE, IE_TAG};
+    let parsed = FemtoInterfaceMsg::parse(body);
+    let message_type = match &parsed {
+        Err(FemtoError::MissingDiscriminatorOnConflict { message_type }) => *message_type,
+        _ => return parsed,
+    };
+    if !content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case(CT_FEMTO_AIRAVE)
+        || !matches!(
+            message_type,
+            MSG_TYPE_ADDS_DELIVER | MSG_TYPE_ADDS_DELIVER_ACK
+        )
+    {
+        return parsed;
+    }
+    if let Some(rest) = body
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .map(|end| &body[end + 2..])
+    {
+        let mut normalized = format!("{message_type:02X} (=\"0 ADDS\")\r\n").into_bytes();
+        normalized.extend_from_slice(rest);
+        if let Ok(message) = FemtoInterfaceMsg::parse(&normalized) {
+            let valid = if message_type == MSG_TYPE_ADDS_DELIVER {
+                message
+                    .to_adds_deliver()
+                    .is_ok_and(|deliver| deliver.adds_user_part.burst_type == 4)
+            } else {
+                message.ies.iter().filter(|ie| ie.iei == IE_TAG).count() == 1
+                    && message
+                        .ies
+                        .iter()
+                        .all(|ie| matches!(ie.iei, IE_TAG | IE_CAUSE))
+                    && message
+                        .to_adds_deliver_ack()
+                        .is_ok_and(|ack| ack.tag.is_some())
+            };
+            if valid {
+                return Ok(message);
+            }
+        }
+    }
+    parsed
+}
+
 pub struct FemtoConvergenceServer {
     imsi: FemtoImsiMapper,
 }
@@ -140,7 +198,7 @@ impl FemtoConvergenceServer {
     pub fn decode_message(&self, content_type: &str, body: &[u8]) -> Result<FcsMessage, FcsError> {
         let base = content_type.split(';').next().unwrap_or("").trim();
         if is_femto_content_type(base) {
-            return Ok(FcsMessage::A1(FemtoInterfaceMsg::parse(body)?));
+            return Ok(FcsMessage::A1(decode_femto_body(base, body)?));
         }
         if base.eq_ignore_ascii_case(CT_SMS) {
             return Ok(FcsMessage::Sms(body.to_vec()));
@@ -153,7 +211,10 @@ impl FemtoConvergenceServer {
                 .iter()
                 .find(|part| is_femto_content_type(&part.content_type))
             {
-                return Ok(FcsMessage::A1(FemtoInterfaceMsg::parse(&part.body)?));
+                return Ok(FcsMessage::A1(decode_femto_body(
+                    &part.content_type,
+                    &part.body,
+                )?));
             }
             if let Some(part) = multipart.part_by_content_type(CT_SMS) {
                 return Ok(FcsMessage::Sms(part.body.clone()));
@@ -202,6 +263,25 @@ impl FemtoConvergenceServer {
                 let encoded = Message::new(MessageType::AddsPageAck, ack.encode()?);
                 return Ok(EncodedA1Message::from_message_for_call(&encoded, None));
             }
+            MSG_TYPE_ADDS_DELIVER => {
+                let deliver = message.to_adds_deliver()?;
+                let encoded = Message::new(MessageType::AddsDeliver, deliver.encode()?);
+                return Ok(EncodedA1Message::from_message_for_call(&encoded, call_id));
+            }
+            MSG_TYPE_ADDS_DELIVER_ACK => {
+                let ack = message.to_adds_deliver_ack()?;
+                let encoded = Message::new(MessageType::AddsDeliverAck, ack.encode()?);
+                return Ok(EncodedA1Message::from_message_for_call(&encoded, call_id));
+            }
+            MSG_TYPE_ADDS_TRANSFER => {
+                let mut transfer = AddsTransferMessage::decode(&message.to_bsmap_wire()?)?;
+                self.map_identity_to_full(&mut transfer.mobile_identity_imsi)?;
+                transfer.mobile_identity_meid = transfer
+                    .mobile_identity_meid
+                    .map(crate::cell::canonical_meid_identity);
+                let encoded = Message::new(MessageType::AddsTransfer, transfer.encode()?);
+                return Ok(EncodedA1Message::from_message_for_call(&encoded, call_id));
+            }
             other => return Err(FcsError::UnsupportedA1Message(other)),
         };
         let complete_layer3 = CompleteLayer3InformationMessage {
@@ -243,6 +323,14 @@ impl FemtoConvergenceServer {
                     *imsi = self.imsi.to_imsi_s(imsi)?;
                 }
                 Ok(FemtoInterfaceMsg::from_adds_transfer_ack(&ack)?)
+            }
+            MessageType::AddsDeliver => {
+                let deliver = AddsDeliverMessage::decode(&message.payload)?;
+                Ok(FemtoInterfaceMsg::from_adds_deliver(&deliver)?)
+            }
+            MessageType::AddsDeliverAck => {
+                let ack = AddsDeliverAckMessage::decode(&message.payload)?;
+                Ok(FemtoInterfaceMsg::from_adds_deliver_ack(&ack)?)
             }
             other => Err(FcsError::UnsupportedA1Message(other as u8)),
         }
@@ -865,5 +953,80 @@ mod tests {
         let decoded = MobileIdentity::decode(&mobile_identity_ie.content[2..])
             .expect("typed Mobile Identity");
         assert_eq!(decoded, MobileIdentity::Imsi("5551239876".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod otasp_transport_tests {
+    use super::*;
+    use cdma_ios::{AddsUserPart, MobileIdentity, Tag};
+
+    #[test]
+    fn otasp_downlink_and_uplink_preserve_call_payload_and_tag() {
+        let fcs = FemtoConvergenceServer::new();
+        let deliver = AddsDeliverMessage {
+            adds_user_part: AddsUserPart {
+                burst_type: 4,
+                data: vec![6],
+            },
+            tag: Some(Tag(0x80000001)),
+        };
+        let encoded = EncodedA1Message::from_message_for_call(
+            &Message::new(MessageType::AddsDeliver, deliver.encode().unwrap()),
+            Some(41),
+        );
+        let downlink = fcs.downlink_from_msc(&encoded, "unused").unwrap();
+        assert_eq!(downlink.content_type, CT_FEMTO_AIRAVE);
+        let femto = FemtoInterfaceMsg::parse(&downlink.body).unwrap();
+        let returned = fcs
+            .to_msc_a1(
+                &femto,
+                CellId {
+                    cell: 403,
+                    sector: 0,
+                },
+                Some(41),
+            )
+            .unwrap();
+        assert_eq!(returned.call_id(), Some(41));
+        assert_eq!(
+            AddsDeliverMessage::decode(&returned.decode().unwrap().payload).unwrap(),
+            deliver
+        );
+    }
+
+    #[test]
+    fn otasp_transfer_expands_imsi_and_preserves_hardware_identity() {
+        let fcs = FemtoConvergenceServer::new();
+        let transfer = AddsTransferMessage {
+            mobile_identity_imsi: MobileIdentity::Imsi("5551239999".into()),
+            adds_user_part: AddsUserPart {
+                burst_type: 4,
+                data: vec![6, 1],
+            },
+            mobile_identity_esn: Some(MobileIdentity::Esn(0x80E4D11C)),
+            mobile_identity_meid: None,
+            cell_identifier: None,
+            tag: Some(Tag(1)),
+            service_option: None,
+        };
+        let femto = FemtoInterfaceMsg::from_adds_transfer(&transfer).unwrap();
+        let returned = fcs
+            .to_msc_a1(
+                &femto,
+                CellId {
+                    cell: 403,
+                    sector: 0,
+                },
+                Some(41),
+            )
+            .unwrap();
+        let decoded = AddsTransferMessage::decode(&returned.decode().unwrap().payload).unwrap();
+        assert_eq!(
+            decoded.mobile_identity_imsi,
+            MobileIdentity::Imsi("310005551239999".into())
+        );
+        assert_eq!(decoded.adds_user_part, transfer.adds_user_part);
+        assert_eq!(decoded.mobile_identity_esn, transfer.mobile_identity_esn);
     }
 }
