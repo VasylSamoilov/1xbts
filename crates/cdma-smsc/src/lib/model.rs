@@ -47,9 +47,10 @@ pub struct SmsSubmission {
     /// emits these verbatim as the bearer-data User Data sub-parameter
     /// (MSG_ENCODING=0x00 octet) instead of encoding `text`.
     pub raw_user_data: Option<Vec<u8>>,
+    /// Inbound interconnect messages must not be routed back out, or they loop.
+    pub from_interconnect: bool,
 }
 
-/// Lifecycle state of an SMS submission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmsState {
     Accepted,
@@ -57,6 +58,8 @@ pub enum SmsState {
     PageResponseReceived,
     Sent,
     Delivered,
+    /// The hub owns delivery and retries. This site must not resend.
+    Forwarded,
     Failed,
     Expired,
 }
@@ -70,6 +73,7 @@ impl SmsState {
             Self::PageResponseReceived => "page_response_received",
             Self::Sent => "sent",
             Self::Delivered => "delivered",
+            Self::Forwarded => "forwarded",
             Self::Failed => "failed",
             Self::Expired => "expired",
         }
@@ -83,6 +87,7 @@ impl SmsState {
             "page_response_received" => Some(Self::PageResponseReceived),
             "sent" => Some(Self::Sent),
             "delivered" => Some(Self::Delivered),
+            "forwarded" => Some(Self::Forwarded),
             "failed" => Some(Self::Failed),
             "expired" => Some(Self::Expired),
             _ => None,
@@ -90,7 +95,33 @@ impl SmsState {
     }
 }
 
-/// A single delivery attempt for an SMS submission.
+#[cfg(test)]
+mod sms_state_tests {
+    use super::SmsState;
+
+    #[test]
+    fn every_state_round_trips_through_its_stored_string() {
+        for state in [
+            SmsState::Accepted,
+            SmsState::Paging,
+            SmsState::PageResponseReceived,
+            SmsState::Sent,
+            SmsState::Delivered,
+            SmsState::Forwarded,
+            SmsState::Failed,
+            SmsState::Expired,
+        ] {
+            assert_eq!(SmsState::from_str(state.as_str()), Some(state.clone()));
+        }
+    }
+
+    #[test]
+    fn forwarded_is_not_accepted() {
+        // Forwarded messages must not remain accepted, or both operators retry them.
+        assert_ne!(SmsState::Forwarded.as_str(), SmsState::Accepted.as_str());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SmsDeliveryAttempt {
     pub sms_delivery_attempt_id: Uuid,

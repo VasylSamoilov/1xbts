@@ -2530,6 +2530,7 @@ impl SmscRepository for FakeSmscRepository {
             updated_at: now,
             teleservice_id: options.teleservice_id,
             raw_user_data: options.raw_user_data.map(<[u8]>::to_vec),
+            from_interconnect: false,
         };
         self.submissions
             .lock()
@@ -2580,6 +2581,7 @@ impl SmscRepository for FakeSmscRepository {
             updated_at: now,
             teleservice_id: None,
             raw_user_data: None,
+            from_interconnect: false,
         };
         self.submissions
             .lock()
@@ -2962,6 +2964,7 @@ fn test_sms_submission(sms_id: Uuid, state: SmsState, destination_number: &str) 
         updated_at: now,
         teleservice_id: None,
         raw_user_data: None,
+        from_interconnect: false,
     }
 }
 
@@ -2987,6 +2990,7 @@ fn test_sms_submission_for_esn(
         updated_at: now,
         teleservice_id: None,
         raw_user_data: None,
+        from_interconnect: false,
     }
 }
 
@@ -3535,6 +3539,74 @@ async fn traffic_mo_sms_with_a1_call_id_uses_adds_deliver() {
     let deliver = cdma_ios::AddsDeliverMessage::decode(&decoded.payload)
         .expect("ADDS Deliver payload should decode");
     assert_eq!(deliver.adds_user_part.burst_type, 0x03);
+}
+
+#[tokio::test]
+async fn packet_traffic_mo_sms_carries_identity_without_msc_call_context() {
+    let (msc_client, msc_endpoint) = crate::a1_edge::InProcessMscClient::pair(4);
+    let (mut bsc, mut traffic_rx, walsh_code) =
+        test_bsc_with_active_traffic_channel_and_msc_client(
+            SERVICE_OPTION_PACKET_DATA_RC3,
+            Arc::new(msc_client),
+        )
+        .await;
+    bsc.mobiles[0].imsi = Some("000000000002280".to_string());
+    bsc.mobiles[0].esn = Some(0x8085_7e58);
+    bsc.mobiles[0].phone_number = Some("5551234567".to_string());
+    bsc.mobiles[0].subscriber_id = Some(Uuid::new_v4());
+    bsc.mobiles.update_tc(TEST_CELL, walsh_code, |_, tc| {
+        tc.a1_call_id = Some(42);
+    });
+
+    while traffic_rx.try_recv().is_ok() {}
+    while tokio::time::timeout(Duration::from_millis(20), msc_endpoint.recv_from_bsc())
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {}
+
+    let mut data_burst = test_access_event();
+    data_burst.message_id = MessageId::DataBurst;
+    data_burst.msg_type_name = "Data Burst Message".to_string();
+    data_burst.msg_seq = Some(1);
+    data_burst.ack_seq = Some(3);
+    data_burst.ack_req = true;
+    data_burst.valid_ack = true;
+    data_burst.traffic_walsh_code = Some(walsh_code);
+    data_burst.burst_type = Some(3);
+    data_burst.data_burst_num_msgs = Some(1);
+    data_burst.data_burst_msg_number = Some(1);
+    data_burst.data_burst_fields = Some(vec![
+        0x00, 0x00, 0x02, 0x10, 0x02, 0x04, 0x05, 0x01, 0x95, 0x54, 0x48, 0x80, 0x06, 0x01, 0x84,
+        0x08, 0x18, 0x00, 0x03, 0x20, 0x0A, 0x90, 0x01, 0x05, 0x10, 0x1C, 0x8D, 0x3A, 0x40, 0x0A,
+        0x01, 0x40, 0x0E, 0x07, 0x05, 0x48, 0xBB, 0x49, 0xB1, 0x34, 0x80,
+    ]);
+
+    let expected_payload = data_burst.data_burst_fields.clone().unwrap();
+    bsc.inject_access_event(data_burst).await;
+
+    let outbound = tokio::time::timeout(Duration::from_secs(1), msc_endpoint.recv_from_bsc())
+        .await
+        .expect("ADDS Transfer should be sent")
+        .expect("A1 endpoint should receive ADDS Transfer");
+    assert_eq!(outbound.message_type(), cdma_ios::MessageType::AddsTransfer);
+    assert_eq!(outbound.call_id(), None);
+    let decoded = outbound.decode().unwrap();
+    let transfer = cdma_ios::AddsTransferMessage::decode(&decoded.payload).unwrap();
+    assert_eq!(transfer.adds_user_part.data, expected_payload);
+    assert_eq!(
+        transfer.mobile_identity_imsi,
+        cdma_ios::MobileIdentity::Imsi("000000000002280".to_string())
+    );
+    assert_eq!(
+        transfer.mobile_identity_esn,
+        Some(cdma_ios::MobileIdentity::Esn(0x8085_7e58))
+    );
+    assert_eq!(
+        transfer.adds_user_part.burst_type,
+        cdma_common::consts::BURST_TYPE_SMS
+    );
 }
 
 #[tokio::test]

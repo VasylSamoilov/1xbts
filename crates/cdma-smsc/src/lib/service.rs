@@ -5,25 +5,61 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::delivery::{AttemptResult, DeliveryHub};
+use crate::dispatcher::{DispatchQueue, Dispatcher};
 use crate::model::{
     DeliveryAttemptState, SmsDeliveryAttempt, SmsDestination, SmsState, SmsSubmission,
 };
 use crate::proto::{
     CreateDeliveryAttemptRequest, CreateDeliveryAttemptResponse, CreateSmsSubmissionRequest,
-    CreateSmsSubmissionResponse, GetSmsSubmissionRequest, GetSmsSubmissionResponse,
-    ListSmsSubmissionsRequest, ListSmsSubmissionsResponse, UpdateDeliveryAttemptStateRequest,
-    UpdateDeliveryAttemptStateResponse, UpdateSmsSubmissionStateRequest,
-    UpdateSmsSubmissionStateResponse, smsc_service_server::SmscService,
+    CreateSmsSubmissionResponse, DeliveryCommand, DeliveryOutcome, GetSmsSubmissionRequest,
+    GetSmsSubmissionResponse, ListSmsSubmissionsRequest, ListSmsSubmissionsResponse,
+    SubmitMoRequest, SubmitMoResponse, SubmitMtRequest, SubmitMtResponse,
+    UpdateDeliveryAttemptStateRequest, UpdateDeliveryAttemptStateResponse,
+    UpdateSmsSubmissionStateRequest, UpdateSmsSubmissionStateResponse,
+    smsc_service_server::SmscService,
 };
 use crate::repository::{PostgresSmscRepository, SmscRepository};
+use cdma_interconnect_smpp::InterconnectLink;
 
 pub struct SmscServiceImpl {
     repo: Arc<dyn SmscRepository>,
+    deliveries: Arc<DeliveryHub>,
+    /// Accepted messages must have a dispatcher or they are never delivered.
+    dispatcher: Option<Arc<Dispatcher>>,
+    dispatch_queue: Option<DispatchQueue>,
 }
 
 impl SmscServiceImpl {
     pub fn new(repo: Arc<dyn SmscRepository>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            deliveries: DeliveryHub::new(),
+            dispatcher: None,
+            dispatch_queue: None,
+        }
+    }
+
+    pub fn with_hub(repo: Arc<dyn SmscRepository>, deliveries: Arc<DeliveryHub>) -> Self {
+        Self {
+            repo,
+            deliveries,
+            dispatcher: None,
+            dispatch_queue: None,
+        }
+    }
+
+    pub fn with_dispatcher(repo: Arc<dyn SmscRepository>, dispatcher: Arc<Dispatcher>) -> Self {
+        Self {
+            repo,
+            deliveries: dispatcher.deliveries(),
+            dispatch_queue: Some(DispatchQueue::start(dispatcher.clone())),
+            dispatcher: Some(dispatcher),
+        }
+    }
+
+    pub fn deliveries(&self) -> Arc<DeliveryHub> {
+        self.deliveries.clone()
     }
 }
 
@@ -31,9 +67,30 @@ pub async fn run_grpc_server(
     addr: SocketAddr,
     repo: Arc<dyn SmscRepository>,
 ) -> Result<(), tonic::transport::Error> {
+    run_grpc_server_with_hub(addr, repo, DeliveryHub::new()).await
+}
+
+pub async fn run_grpc_server_with_hub(
+    addr: SocketAddr,
+    repo: Arc<dyn SmscRepository>,
+    deliveries: Arc<DeliveryHub>,
+) -> Result<(), tonic::transport::Error> {
     Server::builder()
         .add_service(crate::proto::smsc_service_server::SmscServiceServer::new(
-            SmscServiceImpl::new(repo),
+            SmscServiceImpl::with_hub(repo, deliveries),
+        ))
+        .serve(addr)
+        .await
+}
+
+pub async fn run_grpc_server_with_dispatcher(
+    addr: SocketAddr,
+    repo: Arc<dyn SmscRepository>,
+    dispatcher: Arc<Dispatcher>,
+) -> Result<(), tonic::transport::Error> {
+    Server::builder()
+        .add_service(crate::proto::smsc_service_server::SmscServiceServer::new(
+            SmscServiceImpl::with_dispatcher(repo, dispatcher),
         ))
         .serve(addr)
         .await
@@ -48,9 +105,33 @@ pub async fn spawn_configured_smsc_service(
     config: crate::SmscNodeConfig,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = config.grpc_listen_addr;
-    let repo = PostgresSmscRepository::connect_from_config(&config).await?;
+    let repo: Arc<dyn SmscRepository> =
+        Arc::new(PostgresSmscRepository::connect_from_config(&config).await?);
+    let hlr = cdma_hlr::repository::GrpcHlrRepository::connect_lazy(&config.hlr_endpoint)
+        .map_err(|e| format!("invalid HLR endpoint {:?}: {e}", config.hlr_endpoint))?;
+    let mut dispatcher = Dispatcher::new(
+        repo.clone(),
+        crate::routing::Router::new(Arc::new(hlr)),
+        DeliveryHub::new(),
+    );
+    if let Some(settings) = &config.smpp {
+        log::info!(
+            "SMSC interconnect as {} to {:?}",
+            settings.system_id,
+            settings.endpoint()
+        );
+        dispatcher = dispatcher.with_interconnect(Arc::new(InterconnectLink::start(
+            settings.clone(),
+            Arc::new(crate::ingress::RepositoryMtSink::new(repo.clone())),
+        )));
+    }
+    let dispatcher = Arc::new(dispatcher);
+    tokio::spawn(
+        crate::scheduler::Scheduler::new(repo.clone(), dispatcher.clone(), (&config.sweep).into())
+            .run(),
+    );
     let served = tokio::spawn(async move {
-        if let Err(error) = run_grpc_server(addr, Arc::new(repo)).await {
+        if let Err(error) = run_grpc_server_with_dispatcher(addr, repo, dispatcher).await {
             log::error!("SMSC gRPC server error: {error}");
         }
     });
@@ -80,6 +161,7 @@ fn submission_to_proto(s: &SmsSubmission) -> crate::proto::SmsSubmission {
         updated_at: Some(datetime_to_timestamp(s.updated_at)),
         teleservice_id: s.teleservice_id.map(u32::from),
         raw_user_data: s.raw_user_data.clone(),
+        from_interconnect: s.from_interconnect,
     }
 }
 
@@ -110,6 +192,7 @@ fn cdma_smsc_lib_options<'a>(
     crate::repository::CreateSubmissionOptions {
         teleservice_id,
         raw_user_data,
+        from_interconnect: false,
     }
 }
 
@@ -368,5 +451,146 @@ impl SmscService for SmscServiceImpl {
                 Status::internal("internal error")
             })?;
         Ok(Response::new(()))
+    }
+
+    async fn submit_mo(
+        &self,
+        request: Request<SubmitMoRequest>,
+    ) -> Result<Response<SubmitMoResponse>, Status> {
+        let req = request.into_inner();
+        let originating_subscriber_id = req
+            .originating_subscriber_id
+            .as_deref()
+            .map(|id| parse_uuid(id, "originating_subscriber_id"))
+            .transpose()?;
+        // Handset retransmissions preserve the teleservice ID, message type, and message ID.
+        let wire = req
+            .fingerprint
+            .ok_or_else(|| Status::invalid_argument("fingerprint is required"))?;
+        let fingerprint = crate::model::MoSmsFingerprint {
+            teleservice_id: u16::try_from(wire.teleservice_id)
+                .map_err(|_| Status::invalid_argument("teleservice_id > 65535"))?,
+            message_type: u8::try_from(wire.message_type)
+                .map_err(|_| Status::invalid_argument("message_type > 255"))?,
+            message_id: u16::try_from(wire.message_id)
+                .map_err(|_| Status::invalid_argument("message_id > 65535"))?,
+        };
+        let (submission, created) = self
+            .repo
+            .create_or_get_recent_mo_submission(
+                &req.originating_number,
+                &req.destination_number,
+                &req.text,
+                originating_subscriber_id,
+                None,
+                &fingerprint,
+            )
+            .await
+            .map_err(|e| {
+                log::error!("db error: {e}");
+                Status::internal("internal error")
+            })?;
+        if created && let Some(queue) = &self.dispatch_queue {
+            queue.enqueue(submission.clone(), None);
+        }
+        Ok(Response::new(SubmitMoResponse {
+            sms_id: submission.sms_id.to_string(),
+            accepted: created,
+        }))
+    }
+
+    async fn submit_mt(
+        &self,
+        request: Request<SubmitMtRequest>,
+    ) -> Result<Response<SubmitMtResponse>, Status> {
+        use crate::proto::submit_mt_request::Destination;
+        let req = request.into_inner();
+        let destination = match req.destination {
+            Some(Destination::Number(number)) => SmsDestination::PhoneNumber(number),
+            Some(Destination::Esn(esn)) => SmsDestination::Esn(
+                u32::try_from(esn).map_err(|_| Status::invalid_argument("esn > 32 bits"))?,
+            ),
+            Some(Destination::Imsi(imsi)) => SmsDestination::Imsi(imsi),
+            None => return Err(Status::invalid_argument("a destination is required")),
+        };
+        let destination_subscriber_id = req
+            .destination_subscriber_id
+            .as_deref()
+            .map(|id| parse_uuid(id, "destination_subscriber_id"))
+            .transpose()?;
+        let submission = self
+            .repo
+            .create_submission(
+                &req.originating_number,
+                destination,
+                &req.text,
+                None,
+                destination_subscriber_id,
+                cdma_smsc_lib_options(
+                    req.teleservice_id.map(|t| t as u16),
+                    req.raw_user_data.as_deref(),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                log::error!("db error: {e}");
+                Status::internal("internal error")
+            })?;
+
+        if let Some(queue) = &self.dispatch_queue {
+            queue.enqueue(submission.clone(), req.serving_node);
+        }
+        Ok(Response::new(SubmitMtResponse {
+            sms_id: submission.sms_id.to_string(),
+        }))
+    }
+
+    type DeliveryStreamStream = DeliveryCommandStream;
+
+    async fn delivery_stream(
+        &self,
+        request: Request<tonic::Streaming<DeliveryOutcome>>,
+    ) -> Result<Response<Self::DeliveryStreamStream>, Status> {
+        let mut outcomes = request.into_inner();
+        let commands = self.deliveries.attach().await;
+        log::info!("SMSC: an MSC opened the delivery stream");
+
+        let hub = self.deliveries.clone();
+        let dispatcher = self.dispatcher.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(outcome)) = outcomes.message().await {
+                let Ok(sms_id) = Uuid::parse_str(&outcome.sms_id) else {
+                    log::warn!("SMSC: an outcome arrived for {}", outcome.sms_id);
+                    continue;
+                };
+                let Ok(attempt_id) = Uuid::parse_str(&outcome.attempt_id) else {
+                    log::warn!("SMSC: outcome for {sms_id} has no valid attempt ID");
+                    continue;
+                };
+                let result = AttemptResult::from_outcome(&outcome);
+                log::info!("SMSC: {sms_id} attempt result {result:?}");
+                match dispatcher.as_ref() {
+                    Some(dispatcher) => dispatcher.record_outcome(sms_id, attempt_id, result).await,
+                    None => log::error!("SMSC: nothing to record the outcome for {sms_id}"),
+                }
+            }
+            log::info!("SMSC: the delivery stream closed");
+            hub.detach().await;
+        });
+
+        Ok(Response::new(DeliveryCommandStream(commands)))
+    }
+}
+
+pub struct DeliveryCommandStream(tokio::sync::mpsc::Receiver<DeliveryCommand>);
+
+impl futures_core::Stream for DeliveryCommandStream {
+    type Item = Result<DeliveryCommand, Status>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx).map(|next| next.map(Ok))
     }
 }

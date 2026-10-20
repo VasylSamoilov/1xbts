@@ -227,6 +227,11 @@ message ResolveSubscriberByIdentityResponse {
   optional SubscriberIdentity primary_identity = 3;
 }
 
+message ResolveSubscriberByRegisteredImsiRequest {
+  string imsi = 1;
+  string serving_bs_id = 2;
+}
+
 // Resolves an ESN and/or MEID hardware identity to a provisioned subscriber.
 message ResolveSubscriberByHardwareIdentityRequest {
   HardwareIdentityKey identity = 1;
@@ -373,6 +378,8 @@ service HlrService {
   rpc GetSubscriber(GetSubscriberRequest) returns (GetSubscriberResponse);
   // Resolves a complete mobile identity to subscriber state.
   rpc ResolveSubscriberByIdentity(ResolveSubscriberByIdentityRequest) returns (ResolveSubscriberByIdentityResponse);
+  // Requires a unique subscriber with a matching provisioned hardware identity in its registration.
+  rpc ResolveSubscriberByRegisteredImsi(ResolveSubscriberByRegisteredImsiRequest) returns (ResolveSubscriberByIdentityResponse);
   // Resolves a hardware identity observed from HRPD to subscriber state.
   rpc ResolveSubscriberByHardwareIdentity(ResolveSubscriberByHardwareIdentityRequest) returns (ResolveSubscriberByHardwareIdentityResponse);
   // Updates the serving-node registration binding for a subscriber.

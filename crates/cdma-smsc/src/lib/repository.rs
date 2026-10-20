@@ -10,8 +10,38 @@ use crate::model::{
 };
 use crate::proto;
 
-/// Window within which duplicate MO SMS submissions are de-duplicated.
+#[derive(Debug, Clone)]
+pub enum DeliveryCompletion {
+    Delivered,
+    Forwarded,
+    Retry(Option<String>),
+    Failed(Option<String>),
+}
+
+pub struct DeliveryStates {
+    pub submission: SmsState,
+    pub attempt: DeliveryAttemptState,
+    pub reason: Option<String>,
+}
+
+impl DeliveryCompletion {
+    pub fn states(self) -> DeliveryStates {
+        let (submission, attempt, reason) = match self {
+            Self::Delivered => (SmsState::Delivered, DeliveryAttemptState::ForwardSent, None),
+            Self::Forwarded => (SmsState::Forwarded, DeliveryAttemptState::ForwardSent, None),
+            Self::Retry(reason) => (SmsState::Accepted, DeliveryAttemptState::Failed, reason),
+            Self::Failed(reason) => (SmsState::Failed, DeliveryAttemptState::Failed, reason),
+        };
+        DeliveryStates {
+            submission,
+            attempt,
+            reason,
+        }
+    }
+}
+
 const MO_SMS_DEDUP_WINDOW_MINUTES: i32 = 10;
+const MO_DEDUP_HASH_SEED: i64 = 0;
 
 /// Bearer-data payload for a forward SMS submission. Defaults to plain text
 /// under teleservice WMT; the typed variant carries a C.S0015-B teleservice
@@ -24,10 +54,30 @@ pub struct CreateSubmissionOptions<'a> {
     /// as the bearer-data User Data sub-parameter (MSG_ENCODING=0x00 octet)
     /// and ignore the submission text.
     pub raw_user_data: Option<&'a [u8]>,
+    pub from_interconnect: bool,
 }
 
 #[async_trait]
 pub trait SmscRepository: Send + Sync {
+    /// Claims the submission and creates its attempt atomically.
+    async fn claim_delivery(
+        &self,
+        _sms_id: Uuid,
+        _target_subscriber_id: Option<Uuid>,
+    ) -> Result<Option<SmsDeliveryAttempt>, String> {
+        Err("delivery claims require the SMSC's database repository".into())
+    }
+
+    /// Updates the submission and attempt atomically. Rejects stale outcomes.
+    async fn finish_delivery(
+        &self,
+        _sms_id: Uuid,
+        _attempt_id: Uuid,
+        _outcome: DeliveryCompletion,
+    ) -> Result<bool, String> {
+        Err("delivery completion requires the SMSC's database repository".into())
+    }
+
     async fn create_submission(
         &self,
         originating_number: &str,
@@ -163,6 +213,7 @@ fn submission_from_proto(value: proto::SmsSubmission) -> Result<SmsSubmission, S
             .map(|v| u16::try_from(v).map_err(|_| "teleservice_id > 65535".to_string()))
             .transpose()?,
         raw_user_data: value.raw_user_data,
+        from_interconnect: value.from_interconnect,
     })
 }
 
@@ -228,6 +279,7 @@ impl SmscRepository for GrpcSmscRepository {
                 destination_imsi,
                 teleservice_id: options.teleservice_id.map(u32::from),
                 raw_user_data: options.raw_user_data.map(<[u8]>::to_vec),
+                from_interconnect: options.from_interconnect,
             })
             .await
             .map_err(|e| format!("SMSC CreateSmsSubmission: {e}"))?
@@ -427,16 +479,12 @@ impl SmscRepository for GrpcSmscRepository {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PostgreSQL implementation
-// ---------------------------------------------------------------------------
-
 const SUBMISSION_COLUMNS: &str = "sms_id, originating_number, \
     destination_number, destination_esn, destination_imsi, \
     originating_subscriber_id, destination_subscriber_id, text, \
     mo_teleservice_id, mo_message_type, mo_message_id, \
     state, failure_reason, created_at, updated_at, \
-    teleservice_id, raw_user_data";
+    teleservice_id, raw_user_data, from_interconnect";
 
 #[derive(sqlx::FromRow)]
 struct SmsSubmissionRow {
@@ -460,6 +508,7 @@ struct SmsSubmissionRow {
     pub updated_at: DateTime<Utc>,
     pub teleservice_id: Option<i32>,
     pub raw_user_data: Option<Vec<u8>>,
+    pub from_interconnect: bool,
 }
 
 impl SmsSubmissionRow {
@@ -485,6 +534,7 @@ impl SmsSubmissionRow {
             updated_at: self.updated_at,
             teleservice_id,
             raw_user_data: self.raw_user_data,
+            from_interconnect: self.from_interconnect,
         })
     }
 }
@@ -577,6 +627,87 @@ fn format_postgres_connect_error(component: &str, error: &sqlx::Error) -> String
 
 #[async_trait]
 impl SmscRepository for PostgresSmscRepository {
+    async fn claim_delivery(
+        &self,
+        sms_id: Uuid,
+        target_subscriber_id: Option<Uuid>,
+    ) -> Result<Option<SmsDeliveryAttempt>, String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE sms_submissions SET state='paging', updated_at=NOW() \
+             WHERE sms_id=$1 AND state='accepted' RETURNING sms_id",
+        )
+        .bind(sms_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if claimed.is_none() {
+            return Ok(None);
+        }
+        // The submission row lock serializes attempt numbering across SMSC processes.
+        let attempt = sqlx::query_as::<_, SmsDeliveryAttemptRow>(
+            "INSERT INTO sms_delivery_attempts \
+             (sms_delivery_attempt_id, sms_id, target_subscriber_id, attempt_number, state) \
+             VALUES ($1, $2, $3, COALESCE((SELECT MAX(attempt_number) \
+             FROM sms_delivery_attempts WHERE sms_id=$2), 0)+1, 'paging') \
+             RETURNING sms_delivery_attempt_id, sms_id, attempt_number::bigint as attempt_number, \
+             state, target_subscriber_id, failure_reason, requested_at, completed_at, created_at, updated_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(sms_id)
+        .bind(target_subscriber_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(Some(attempt.try_into_attempt()?))
+    }
+
+    async fn finish_delivery(
+        &self,
+        sms_id: Uuid,
+        attempt_id: Uuid,
+        outcome: DeliveryCompletion,
+    ) -> Result<bool, String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM sms_submissions WHERE sms_id=$1 FOR UPDATE",
+        )
+        .bind(sms_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if state.as_deref() != Some("paging") {
+            return Ok(false);
+        }
+        let states = outcome.states();
+        let updated = sqlx::query(
+            "UPDATE sms_delivery_attempts SET state=$3, failure_reason=$4, \
+             completed_at=NOW(), updated_at=NOW() WHERE sms_id=$1 \
+             AND sms_delivery_attempt_id=$2 AND state='paging' \
+             AND attempt_number=(SELECT MAX(attempt_number) FROM sms_delivery_attempts WHERE sms_id=$1)",
+        )
+        .bind(sms_id)
+        .bind(attempt_id)
+        .bind(states.attempt.as_str())
+        .bind(&states.reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if updated.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE sms_submissions SET state=$2, failure_reason=$3, updated_at=NOW() WHERE sms_id=$1")
+            .bind(sms_id)
+            .bind(states.submission.as_str())
+            .bind(states.reason)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     async fn create_submission(
         &self,
         originating_number: &str,
@@ -601,9 +732,9 @@ impl SmscRepository for PostgresSmscRepository {
                 destination_number, destination_esn, destination_imsi,
                 text, originating_subscriber_id, destination_subscriber_id,
                 mo_teleservice_id, mo_message_type, mo_message_id,
-                teleservice_id, raw_user_data
+                teleservice_id, raw_user_data, from_interconnect
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, $9, $10, $11)
             RETURNING {SUBMISSION_COLUMNS}
             "#,
             SUBMISSION_COLUMNS = SUBMISSION_COLUMNS
@@ -618,6 +749,7 @@ impl SmscRepository for PostgresSmscRepository {
         .bind(destination_subscriber_id)
         .bind(options.teleservice_id.map(i32::from))
         .bind(options.raw_user_data)
+        .bind(options.from_interconnect)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| format!("db error: {}", e))?;
@@ -634,6 +766,24 @@ impl SmscRepository for PostgresSmscRepository {
         destination_subscriber_id: Option<Uuid>,
         fingerprint: &MoSmsFingerprint,
     ) -> Result<(SmsSubmission, bool), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let key = serde_json::to_string(&(
+            originating_subscriber_id,
+            originating_number,
+            destination_number,
+            text,
+            fingerprint.teleservice_id,
+            fingerprint.message_type,
+            fingerprint.message_id,
+        ))
+        .map_err(|e| e.to_string())?;
+        // Concurrent retransmissions must share one submission.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+            .bind(key)
+            .bind(MO_DEDUP_HASH_SEED)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
         let query = format!(
             r#"
             SELECT {cols}
@@ -660,11 +810,12 @@ impl SmscRepository for PostgresSmscRepository {
             .bind(fingerprint.teleservice_id as i32)
             .bind(fingerprint.message_type as i32)
             .bind(fingerprint.message_id as i32)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| format!("db error: {}", e))?;
 
         if let Some(row) = existing {
+            tx.commit().await.map_err(|e| e.to_string())?;
             return Ok((row.try_into_submission()?, false));
         }
 
@@ -692,10 +843,11 @@ impl SmscRepository for PostgresSmscRepository {
         .bind(fingerprint.teleservice_id as i32)
         .bind(fingerprint.message_type as i32)
         .bind(fingerprint.message_id as i32)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| format!("db error: {}", e))?;
 
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok((row.try_into_submission()?, true))
     }
 

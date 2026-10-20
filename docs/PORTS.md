@@ -18,6 +18,7 @@ addresses default to `127.0.0.1` and can be overridden in config files.
 | 17046 | UDP      | PCF A9        | HRPD A9 signaling endpoint toward the AN | `pcf.json: a9_bind_addr`, `bts.json: evdo.a9.pcf_addr` |
 | 17014 | UDP      | BTS -> BSC    | Abis bearer BTS-side (fwd frames from BSC) | `bts.json: bearer.bind_addr`, `bsc.json: bts_peers[].bearer_remote_addr` |
 | 17022 | UDP      | BSC -> BTS    | Abis bearer BSC-side (rev frames from BTS) | `bsc.json: bts_peers[].bearer_bind_addr`, `bts.json: bearer.remote_addr` |
+| 2775  | TCP      | SMSC <-> hub  | SMPP v3.4 to the operator interconnect hub. The site listens when the hub binds to it, or dials the hub's 2775 when the roles are reversed | `smsc.json: smpp.bind_addr`, `smsc.json: smpp.hub_addr` |
 
 The launcher runs every element as a child process over localhost Abis TCP
 and UDP bearer transports. Split BTS/BSC operation uses the same config
@@ -70,6 +71,7 @@ Abis signaling ....... 127.0.0.1:5604
 Abis bearer BTS ...... 127.0.0.1:17014
 Abis bearer BSC ...... 127.0.0.1:17022
 Voice gateway ........ 127.0.0.1:17015
+SMPP to hub .......... 2775 (interconnect only)
 PDSN FOU remote ...... 127.0.0.1:17010
 PDSN FOU local ....... 127.0.0.1:17011
 FOU-TCP relay ........ 127.0.0.1:17012

@@ -16,7 +16,7 @@ use cdma_common::sms as air_sms;
 use log::{info, warn};
 use uuid::Uuid;
 
-use crate::addressing::{format_ms_address, parse_sms_target_address};
+use crate::addressing::{format_ms_address, is_packet_data_so, parse_sms_target_address};
 
 use super::{AccessCellId, Bsc, DEFAULT_PAGE_TIMEOUT_MS, MobileStation, MsState, PendingPage};
 
@@ -901,7 +901,17 @@ impl Bsc {
             return;
         }
 
-        self.send_traffic_mo_sms_to_msc(cell, walsh_code, fields);
+        let packet_mobile = self.mobiles.get_by_walsh(cell, walsh_code).filter(|ms| {
+            ms.traffic_channel
+                .as_ref()
+                .is_some_and(|tc| is_packet_data_so(tc.service_option))
+        });
+        if let Some(mobile) = packet_mobile {
+            // Packet assignment releases the MSC call context, so ADDS Transfer must carry identity.
+            self.route_decoded_mo_sms(&sms, &mobile.fwd_address, fields);
+        } else {
+            self.send_traffic_mo_sms_to_msc(cell, walsh_code, fields);
+        }
 
         self.send_traffic_sms_cause_code(cell, walsh_code, ack_seq, reply_seq, 0, None);
     }

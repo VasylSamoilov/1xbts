@@ -22,6 +22,7 @@ pub mod node;
 pub mod otasp;
 pub mod runtime;
 pub(crate) mod sms;
+pub mod sms_delivery;
 pub mod voice_gateway_client;
 
 pub use base_station::{A1Event, BaseStationId, BaseStations, MscA1Endpoint, ServedCell};

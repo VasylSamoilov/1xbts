@@ -73,6 +73,16 @@ pub trait HlrRepository: Send + Sync {
         identity: &MobileIdentityKey,
     ) -> Result<Option<ResolvedSubscriber>, String>;
 
+    async fn resolve_registered_imsi(
+        &self,
+        _imsi: &str,
+        _serving_bs_id: &str,
+    ) -> Result<Option<ResolvedSubscriber>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "registered IMSI lookup is unavailable",
+        ))
+    }
+
     async fn resolve_by_hardware_identity(
         &self,
         esn: Option<u32>,
@@ -781,6 +791,29 @@ impl HlrRepository for GrpcHlrRepository {
             response.primary_identity,
             response.binding,
         )
+    }
+
+    async fn resolve_registered_imsi(
+        &self,
+        imsi: &str,
+        serving_bs_id: &str,
+    ) -> Result<Option<ResolvedSubscriber>, tonic::Status> {
+        let response = self
+            .client()
+            .resolve_subscriber_by_registered_imsi(
+                proto::ResolveSubscriberByRegisteredImsiRequest {
+                    imsi: imsi.to_string(),
+                    serving_bs_id: serving_bs_id.to_string(),
+                },
+            )
+            .await?
+            .into_inner();
+        resolved_from_proto(
+            response.subscriber,
+            response.primary_identity,
+            response.binding,
+        )
+        .map_err(tonic::Status::internal)
     }
 
     async fn resolve_by_hardware_identity(
@@ -1968,6 +2001,60 @@ impl HlrRepository for PostgresHlrRepository {
         let subscriber: Subscriber = row.try_into()?;
         let sid = subscriber.subscriber_id;
         Ok(Some(self.assemble_resolved(subscriber, sid).await?))
+    }
+
+    async fn resolve_registered_imsi(
+        &self,
+        imsi: &str,
+        serving_bs_id: &str,
+    ) -> Result<Option<ResolvedSubscriber>, tonic::Status> {
+        validate_imsi(imsi).map_err(tonic::Status::invalid_argument)?;
+        if serving_bs_id.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument("serving node is required"));
+        }
+        const AMBIGUITY_DETECTION_LIMIT: i64 = 2;
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT DISTINCT b.subscriber_id
+            FROM registration_bindings b
+            JOIN subscriber_identities i ON i.subscriber_id = b.subscriber_id AND i.imsi = b.imsi
+            WHERE b.imsi = $1 AND b.serving_bs_id = $2
+              AND b.state = ANY($3)
+              AND (b.esn IS NOT NULL OR b.meid IS NOT NULL)
+              AND (b.esn IS NULL OR b.esn = i.esn)
+              AND (b.meid IS NULL OR b.meid = i.meid)
+            LIMIT $4
+            "#,
+        )
+        .bind(imsi)
+        .bind(serving_bs_id)
+        .bind(
+            [
+                RegistrationState::Registered.as_str(),
+                RegistrationState::Paged.as_str(),
+                RegistrationState::PageResponseReceived.as_str(),
+            ]
+            .as_slice(),
+        )
+        .bind(AMBIGUITY_DETECTION_LIMIT)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            log::error!("HLR registered IMSI lookup failed: {error}");
+            tonic::Status::internal("registered IMSI lookup failed")
+        })?;
+        if ids.len() > 1 {
+            return Err(tonic::Status::failed_precondition(
+                "multiple subscribers share this registered IMSI",
+            ));
+        }
+        let Some(id) = ids.first() else {
+            return Ok(None);
+        };
+        self.get_subscriber_by_id(*id).await.map_err(|error| {
+            log::error!("HLR registered subscriber lookup failed: {error}");
+            tonic::Status::internal("registered subscriber lookup failed")
+        })
     }
 
     async fn resolve_by_hardware_identity(

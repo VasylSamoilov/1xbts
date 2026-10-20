@@ -1,5 +1,6 @@
 # HEAD
 
+- Added SMPP SMS support.
 - Improve RC3 traffic acquisition.
 - Airvana femtocell provisioning now uses the configured PDSN A11 key and SPI.
 - Fixed OTASP provisioning through Airvana femtocells (@dondaplayer1).

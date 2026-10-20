@@ -437,6 +437,34 @@ impl proto::hlr_service_server::HlrService for HlrServiceImpl {
         }))
     }
 
+    async fn resolve_subscriber_by_registered_imsi(
+        &self,
+        request: Request<proto::ResolveSubscriberByRegisteredImsiRequest>,
+    ) -> Result<Response<proto::ResolveSubscriberByIdentityResponse>, Status> {
+        let req = request.into_inner();
+        model::validate_imsi(&req.imsi).map_err(Status::invalid_argument)?;
+        if req.serving_bs_id.trim().is_empty() {
+            return Err(Status::invalid_argument("serving node is required"));
+        }
+        let resolved = self
+            .repo
+            .resolve_registered_imsi(&req.imsi, &req.serving_bs_id)
+            .await?;
+        Ok(Response::new(proto::ResolveSubscriberByIdentityResponse {
+            subscriber: resolved
+                .as_ref()
+                .map(|r| subscriber_to_proto(&r.subscriber)),
+            binding: resolved
+                .as_ref()
+                .and_then(|r| r.binding.as_ref())
+                .map(binding_to_proto),
+            primary_identity: resolved
+                .as_ref()
+                .and_then(|r| r.primary_identity.as_ref())
+                .map(identity_to_proto),
+        }))
+    }
+
     async fn resolve_subscriber_by_hardware_identity(
         &self,
         request: Request<proto::ResolveSubscriberByHardwareIdentityRequest>,

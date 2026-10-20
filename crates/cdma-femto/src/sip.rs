@@ -1596,7 +1596,7 @@ impl ImsCore {
                 fap_id: String::new(),
             },
         ) {
-            log::warn!("FCS: could not refresh SMS acknowledgement mobile binding: {error}");
+            log::warn!("FCS: could not refresh SMS acknowledgment mobile binding: {error}");
             return response(req, SC_BAD_REQUEST, "Bad Request");
         }
         let payload = match ack.encode() {
@@ -1747,7 +1747,7 @@ impl ImsCore {
         }
         if message.message_type == cdma_ios::femto_interface_msg::MSG_TYPE_ADDS_DELIVER_ACK {
             return Err(crate::fcs::FcsError::InvalidMobileIdentity(
-                "ADDS acknowledgement has no outstanding delivery tag".to_string(),
+                "ADDS acknowledgment has no outstanding delivery tag".to_string(),
             ));
         }
         if let Some(sip_call_id) = request.headers.call_id() {
@@ -1959,6 +1959,16 @@ impl ImsCore {
             .registered_mobiles
             .lock()
             .expect("registered mobiles lock");
+        if mobile.esn.is_none()
+            && mobile.meid.is_none()
+            && let Some(known) = registered
+                .get(&canonical_imsi)
+                .filter(|known| known.fap_id == mobile.fap_id)
+        {
+            // IMSI-only acknowledgments must preserve the hardware identity used by HLR.
+            mobile.esn = known.esn.clone();
+            mobile.meid = known.meid.clone();
+        }
         for alias in aliases {
             registered.insert(alias, mobile.clone());
         }
@@ -5852,65 +5862,93 @@ mod tests {
 
     #[test]
     fn airvana_empty_message_acknowledges_adds_page_before_sip_response() {
-        let (msc_tx, mut msc_rx) = mpsc::channel(1);
-        let core = ImsCore::with_msc_a1(
-            &config(false),
-            CellId {
-                cell: 0x193,
-                sector: 0,
-            },
-            Some(msc_tx),
-        );
-        let peer: SocketAddr = "198.51.100.1:5060".parse().expect("peer");
-        core.remember_registered_fap(&register_request(), peer);
-        attach_mobile(&core, "310005551239876", "fap");
-        let adds_page = AddsPageMessage {
-            mobile_identity: MobileIdentity::Imsi("310005551239876".to_string()),
-            adds_user_part: AddsUserPart {
-                burst_type: 0x03,
-                data: vec![0x01, 0x02, 0x03],
-            },
-            tag: Some(Tag(48)),
-            slot_cycle_index: None,
-        };
-        let encoded = EncodedA1Message::from_message(&Message::new(
-            MessageType::AddsPage,
-            adds_page.encode().expect("ADDS Page"),
-        ));
-        let (request, _, call_id, pending) = core
-            .downlink_request(&encoded, "10.4.58.140:5060".parse().expect("local"))
-            .expect("Fx2 downlink");
-        assert_eq!(request.uri, "sip:5551239876@femto.local.1xbts.org");
-        assert_eq!(
-            request.headers.to(),
-            Some("<sip:5551239876@femto.local.1xbts.org>")
-        );
-        core.stage_airave_adds_page_ack(&pending);
-        core.pending_downlink
-            .lock()
-            .expect("pending downlink lock")
-            .insert(call_id, pending);
+        for known_fap in ["fap", "different-fap"] {
+            let (msc_tx, mut msc_rx) = mpsc::channel(1);
+            let core = ImsCore::with_msc_a1(
+                &config(false),
+                CellId {
+                    cell: 0x193,
+                    sector: 0,
+                },
+                Some(msc_tx),
+            );
+            let peer: SocketAddr = "198.51.100.1:5060".parse().expect("peer");
+            core.remember_registered_fap(&register_request(), peer);
+            attach_mobile(&core, "310005551239876", "fap");
+            let hardware_esn = MobileIdentity::Esn(0x80b6_6bd7);
+            let hardware_meid = MobileIdentity::Meid([0xa0, 0x00, 0x00, 0x2c, 0xc8, 0x1a, 0x35]);
+            {
+                let mut mobiles = core.registered_mobiles.lock().unwrap();
+                let mobile = mobiles.get_mut("310005551239876").unwrap();
+                mobile.esn = Some(hardware_esn.clone());
+                mobile.meid = Some(hardware_meid.clone());
+            }
+            let adds_page = AddsPageMessage {
+                mobile_identity: MobileIdentity::Imsi("310005551239876".to_string()),
+                adds_user_part: AddsUserPart {
+                    burst_type: 0x03,
+                    data: vec![0x01, 0x02, 0x03],
+                },
+                tag: Some(Tag(48)),
+                slot_cycle_index: None,
+            };
+            let encoded = EncodedA1Message::from_message(&Message::new(
+                MessageType::AddsPage,
+                adds_page.encode().expect("ADDS Page"),
+            ));
+            let (request, _, call_id, pending) = core
+                .downlink_request(&encoded, "10.4.58.140:5060".parse().expect("local"))
+                .expect("Fx2 downlink");
+            assert_eq!(request.uri, "sip:5551239876@femto.local.1xbts.org");
+            assert_eq!(
+                request.headers.to(),
+                Some("<sip:5551239876@femto.local.1xbts.org>")
+            );
+            core.stage_airave_adds_page_ack(&pending);
+            core.pending_downlink
+                .lock()
+                .expect("pending downlink lock")
+                .insert(call_id, pending);
 
-        let mut empty = SipRequest::new(Method::Message, "sip:fap@femto.local.1xbts.org");
-        empty
-            .headers
-            .append("From", "5551239876<sip:5551239876@femto.local.1xbts.org>");
-        empty
-            .headers
-            .append("To", "<sip:fap@femto.local.1xbts.org>");
-        empty.headers.append("Call-ID", "airvana-generated-call-id");
-        empty.headers.append("CSeq", "1 MESSAGE");
+            let mut empty = SipRequest::new(Method::Message, "sip:fap@femto.local.1xbts.org");
+            empty
+                .headers
+                .append("From", "5551239876<sip:5551239876@femto.local.1xbts.org>");
+            empty
+                .headers
+                .append("To", "<sip:fap@femto.local.1xbts.org>");
+            empty.headers.append("Call-ID", "airvana-generated-call-id");
+            empty.headers.append("CSeq", "1 MESSAGE");
 
-        let result = core.handle_request(&empty);
+            core.registered_mobiles
+                .lock()
+                .unwrap()
+                .get_mut("310005551239876")
+                .unwrap()
+                .fap_id = known_fap.to_string();
+            let result = core.handle_request(&empty);
 
-        assert_eq!(result.status, SC_OK);
-        let forwarded = msc_rx.try_recv().expect("forwarded ADDS Page Ack");
-        assert_eq!(forwarded.message_type(), MessageType::AddsPageAck);
-        let decoded = forwarded.decode().expect("A1 envelope");
-        let ack = AddsPageAckMessage::decode(&decoded.payload).expect("ADDS Page Ack");
-        assert_eq!(ack.mobile_identity, adds_page.mobile_identity);
-        assert_eq!(ack.tag, adds_page.tag);
-        assert_eq!(ack.cause, None);
+            assert_eq!(result.status, SC_OK);
+            let forwarded = msc_rx.try_recv().expect("forwarded ADDS Page Ack");
+            assert_eq!(forwarded.message_type(), MessageType::AddsPageAck);
+            let decoded = forwarded.decode().expect("A1 envelope");
+            let ack = AddsPageAckMessage::decode(&decoded.payload).expect("ADDS Page Ack");
+            assert_eq!(ack.mobile_identity, adds_page.mobile_identity);
+            assert_eq!(ack.tag, adds_page.tag);
+            assert_eq!(ack.cause, None);
+            let mobiles = core.registered_mobiles.lock().unwrap();
+            for alias in ["310005551239876", "5551239876"] {
+                let mobile = mobiles.get(alias).unwrap();
+                assert_eq!(
+                    mobile.esn,
+                    (known_fap == "fap").then(|| hardware_esn.clone())
+                );
+                assert_eq!(
+                    mobile.meid,
+                    (known_fap == "fap").then(|| hardware_meid.clone())
+                );
+            }
+        }
     }
 
     #[test]

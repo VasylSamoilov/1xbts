@@ -71,6 +71,11 @@ pub async fn run_node(
     let mut runtime_config = MscRuntimeConfig::from_node_config(&config, hlr_repo);
     runtime_config.smsc_repo = Some(smsc_repo);
     let mut runtime = MscRuntime::new(runtime_config);
+    runtime.set_delivery_link(crate::sms_delivery::spawn(config.smsc_endpoint.clone()));
+    match cdma_smsc::client::GrpcMoSubmitter::connect_lazy(&config.smsc_endpoint) {
+        Ok(submitter) => runtime.set_mo_submitter(Arc::new(submitter)),
+        Err(e) => return Err(format!("invalid SMSC endpoint for MO handover: {e}").into()),
+    }
     info!("MSC management gRPC server on {mgmt_addr}");
     tokio::select! {
         _ = runtime.run_with_grpc(mgmt_addr, base_stations.clone(), net_mgmt) => {

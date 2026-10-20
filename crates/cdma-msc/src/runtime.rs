@@ -243,29 +243,26 @@ pub struct MscRuntime {
     pub(crate) mt_page_retry: crate::mt_page_retry::MtPageRetryService,
     pub(crate) smsc: Option<crate::sms::MscSmsCoordinator>,
     pub(crate) otasp: Option<crate::otasp::OtaspCoordinator>,
-    /// Shared history of recent OTASP sessions; cloned into the gRPC service so
-    /// `ListOtaspSessions` / `GetOtaspSession` can read it concurrently with
-    /// the runtime appending new records.
     pub(crate) otasp_history: std::sync::Arc<crate::otasp::OtaspHistory>,
-    /// Broadcast channel for live `MscNetworkEvent`s — fans out to any number
-    /// of `StreamOtaspEvents` subscribers without blocking the producer.
     pub(crate) otasp_event_tx:
         tokio::sync::broadcast::Sender<crate::grpc::events_proto::v1::MscNetworkEvent>,
-    /// Origination contexts for calls recognized as OTASP at MO CL3 but whose
-    /// traffic channel has not yet come up. Key is the MSC call id; the value
-    /// is the data needed to start the OTASP session at AssignmentComplete.
-    /// Per C.S0016-D §3.2.1 the MS originates with a voice/data SO (not 18),
-    /// so we cannot tell from `service_option` alone that a call is OTASP —
-    /// the dialed-digits match recorded here is what gates voice suppression
-    /// and session start.
+    /// C.S0016-D §3.2.1 permits a voice/data SO for OTASP, so dialed digits identify these calls.
     pub(crate) pending_otasp_originations:
         std::collections::HashMap<CallId, PendingOtaspOrigination>,
+    pub(crate) deliveries: Option<crate::sms_delivery::DeliveryLink>,
     pub(crate) pending_sms_traffic:
         std::collections::HashMap<CallId, crate::sms::SmsTrafficDelivery>,
 }
 
-/// Stashed at MO CL3 for an OTASP-recognized call until the traffic channel
-/// comes up at `AssignmentComplete`.
+async fn recv_delivery(
+    link: Option<&mut crate::sms_delivery::DeliveryLink>,
+) -> Option<cdma_smsc::proto::DeliveryCommand> {
+    match link {
+        Some(link) => link.commands.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 pub(crate) struct PendingOtaspOrigination {
     pub device: crate::otasp::HardwareIdentity,
     pub feature_code: String,
@@ -277,7 +274,19 @@ pub(crate) struct PendingOtaspOrigination {
 }
 
 impl MscRuntime {
-    /// Creates a new MSC runtime.
+    pub fn set_mo_submitter(&mut self, submitter: Arc<dyn cdma_smsc::client::MoSubmitter>) {
+        if let Some(smsc) = self.smsc.as_mut() {
+            smsc.set_mo_submitter(submitter);
+        }
+    }
+
+    pub fn set_delivery_link(&mut self, link: crate::sms_delivery::DeliveryLink) {
+        if let Some(smsc) = self.smsc.as_mut() {
+            smsc.set_outcome_reporter(link.outcomes.clone());
+        }
+        self.deliveries = Some(link);
+    }
+
     pub fn new(config: MscRuntimeConfig) -> Self {
         let smsc = config.smsc_repo.as_ref().map(|smsc_repo| {
             crate::sms::MscSmsCoordinator::new(Arc::clone(smsc_repo), Arc::clone(&config.hlr_repo))
@@ -313,6 +322,7 @@ impl MscRuntime {
             otasp_history,
             otasp_event_tx,
             pending_otasp_originations: std::collections::HashMap::new(),
+            deliveries: None,
             pending_sms_traffic: std::collections::HashMap::new(),
         }
     }
@@ -364,8 +374,6 @@ impl MscRuntime {
         }
     }
 
-    /// Shared snapshot of the OTASP session ring buffer; safe to clone into a
-    /// long-lived gRPC service.
     pub fn otasp_history(&self) -> std::sync::Arc<crate::otasp::OtaspHistory> {
         std::sync::Arc::clone(&self.otasp_history)
     }
@@ -391,12 +399,6 @@ impl MscRuntime {
     ) {
         let mut sms_expiry_interval = tokio::time::interval(Duration::from_secs(10));
         sms_expiry_interval.tick().await; // consume the immediate first tick
-        let mut sms_retry_interval = tokio::time::interval(Duration::from_secs(
-            self.config.sms_retry.sweep_interval_secs.max(1),
-        ));
-        sms_retry_interval.tick().await; // consume the immediate first tick
-        let sms_retry_after = Duration::from_secs(self.config.sms_retry.retry_after_secs);
-        let sms_retry_enabled = self.config.sms_retry.enabled;
         let mut otasp_timeout_interval = tokio::time::interval(Duration::from_secs(1));
         otasp_timeout_interval.tick().await;
 
@@ -406,9 +408,6 @@ impl MscRuntime {
         // process and the retry sweep will skip it forever otherwise.
         // Threshold is 2× the regular in-flight timeout so we don't fight
         // with `expire_pending` over genuinely fresh attempts.
-        if sms_retry_enabled && let Some(smsc) = self.smsc.as_mut() {
-            smsc.recover_stuck_paging(Duration::from_secs(120)).await;
-        }
 
         loop {
             let delayed_wav_sleep = async {
@@ -539,19 +538,21 @@ impl MscRuntime {
                         smsc.expire_pending(Duration::from_secs(60)).await;
                     }
                 }
-                _ = sms_retry_interval.tick(), if sms_retry_enabled => {
-                    let deliveries = if let Some(smsc) = self.smsc.as_mut() {
-                        smsc.retry_eligible_sweep(a1, sms_retry_after).await;
-                        smsc.take_traffic_deliveries()
-                    } else {
-                        Vec::new()
-                    };
-                    for delivery in deliveries {
-                        self.start_mt_sms_traffic(a1, delivery).await;
-                    }
-                }
                 _ = otasp_timeout_interval.tick() => {
                     self.tick_otasp_timeouts(a1).await;
+                }
+                command = recv_delivery(self.deliveries.as_mut()) => {
+                    if let Some(command) = command {
+                        let deliveries = if let Some(smsc) = self.smsc.as_mut() {
+                            smsc.deliver_from_smsc(command, a1).await;
+                            smsc.take_traffic_deliveries()
+                        } else {
+                            Vec::new()
+                        };
+                        for delivery in deliveries {
+                            self.start_mt_sms_traffic(a1, delivery).await;
+                        }
+                    }
                 }
             }
         }
@@ -646,7 +647,7 @@ impl MscRuntime {
                 response_tx,
             } => {
                 let result = if let Some(smsc) = self.smsc.as_mut() {
-                    smsc.send_sms(request, a1).await
+                    smsc.send_sms(request).await
                 } else {
                     warn!("MSC: send_sms requested but SMSC coordinator is not configured");
                     None
@@ -1229,12 +1230,7 @@ impl MscRuntime {
                             call_id.0
                         );
                     } else if let Some(smsc) = self.smsc.as_mut() {
-                        smsc.begin_pending(
-                            delivery.tag,
-                            delivery.sms_id,
-                            delivery.delivery_attempt_id,
-                            delivery.mobile_identity.clone(),
-                        );
+                        smsc.begin_pending(delivery.tag, delivery.sms_id, delivery.attempt_id);
                     }
                     // Delivery completes on the later ADDS Page Ack. The FAP
                     // keeps the channel until it finishes the burst and its own
@@ -2709,7 +2705,7 @@ impl MscRuntime {
                             }
                             Err(error) => warn!("MSC: failed to encode ADDS Transfer Ack: {error}"),
                         }
-                        smsc.handle_adds_transfer(&msg, a1).await;
+                        smsc.handle_adds_transfer(&msg, node).await;
                     }
                     Err(e) => warn!("MSC: failed to decode ADDS Transfer: {e}"),
                 }
@@ -2730,13 +2726,8 @@ impl MscRuntime {
                         let mobile_identity_esn = snapshot
                             .as_ref()
                             .and_then(|snap| snap.mobile_identity_esn.as_ref());
-                        smsc.handle_adds_deliver_mo(
-                            &msg,
-                            &mobile_identity,
-                            mobile_identity_esn,
-                            a1,
-                        )
-                        .await;
+                        smsc.handle_adds_deliver_mo(&msg, &mobile_identity, mobile_identity_esn)
+                            .await;
                     }
                     Err(e) => warn!("MSC: failed to decode ADDS Deliver (MO): {e}"),
                 }
@@ -2922,26 +2913,18 @@ impl MscRuntime {
                 return;
             }
         };
-        smsc.send_sms(
-            crate::sms::SmsSendRequest {
-                originating_number: welcome_cfg.originating_number.clone(),
-                text: welcome_cfg.text.clone(),
-                destination,
-                timeout_ms: 30_000,
-                teleservice_id: None,
-                raw_user_data: None,
-                serving_node: Some(node.clone()),
-            },
-            a1,
-        )
+        smsc.send_sms(crate::sms::SmsSendRequest {
+            originating_number: welcome_cfg.originating_number.clone(),
+            text: welcome_cfg.text.clone(),
+            destination,
+            timeout_ms: 30_000,
+            teleservice_id: None,
+            raw_user_data: None,
+            serving_node: Some(node.clone()),
+        })
         .await;
-        let deliveries = smsc.take_traffic_deliveries();
-        for delivery in deliveries {
-            self.start_mt_sms_traffic(a1, delivery).await;
-        }
     }
 
-    /// Cleans up every call a base station held when its A1 link dropped.
     /// Nothing can clear them with the node, so the MSC releases its own
     /// side and lets the node release the air side when it comes back.
     async fn handle_base_station_detached(
@@ -2980,7 +2963,7 @@ fn extract_hardware_identity(
     (esn, meid)
 }
 
-fn meid_hex(identity: &cdma_ios::MobileIdentity) -> Option<String> {
+pub(crate) fn meid_hex(identity: &cdma_ios::MobileIdentity) -> Option<String> {
     let cdma_ios::MobileIdentity::Meid(bytes) = identity else {
         return None;
     };

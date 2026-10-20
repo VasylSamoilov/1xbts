@@ -18,6 +18,8 @@ members = [
     "crates/cdma-cwmp",
     "crates/cdma-sip",
     "crates/cdma-hlr",
+    "crates/cdma-interconnect",
+    "crates/cdma-interconnect-smpp",
     "crates/cdma-ios",
     "crates/cdma-modem",
     "crates/cdma-ms",

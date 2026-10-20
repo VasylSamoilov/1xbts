@@ -1177,6 +1177,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdma-interconnect"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "cdma-interconnect-smpp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cdma-interconnect",
+ "smpp-core",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cdma-ios"
 version = "0.1.0"
 dependencies = [
@@ -1382,8 +1403,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cdma-common",
+ "cdma-hlr",
+ "cdma-interconnect",
+ "cdma-interconnect-smpp",
  "chrono",
  "clap",
+ "futures-core",
  "log",
  "prost",
  "prost-types",
@@ -1391,6 +1416,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing-subscriber",
@@ -5737,6 +5763,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "smpp-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d00926c65cbd66df92f2853cb65954fd8d362f030305ed44ea01eb5ee5dc0a0c"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
