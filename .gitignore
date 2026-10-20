@@ -1,6 +1,7 @@
 target/
 .DS_Store
 *.wav
+/captures/
 !test/iq/**/*.wav
 test/capture/*
 !test/capture/README.md

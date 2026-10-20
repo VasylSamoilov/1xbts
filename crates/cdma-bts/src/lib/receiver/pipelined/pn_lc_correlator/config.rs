@@ -96,6 +96,8 @@ pub struct PnLcConfig {
     /// Set to 2 for RC3+ HPSK; leave at 1 for IS-95/RC1/RC2.
     pub lc_decimation: usize,
 
+    pub rc3_pilot_verification: bool,
+
     /// Optional long-code reload period in chips. HRPD reverse channels
     /// reload the long-code generator at the start of every short-code
     /// period; 1x leaves this unset and uses the ordinary long sequence.
@@ -244,6 +246,7 @@ impl PnLcConfig {
             hpsk_signal_conjugated: true,
             reanchor_origin: false,
             lc_decimation: 1,
+            rc3_pilot_verification: false,
             lc_period_chips: None,
             lc_period_initial_state: 1u64 << 41,
             suppress_search_when_locked: false,
@@ -372,6 +375,11 @@ impl PnLcConfig {
 
     pub fn with_reanchor_origin(mut self, reanchor: bool) -> Self {
         self.reanchor_origin = reanchor;
+        self
+    }
+
+    pub fn with_rc3_pilot_verification(mut self, enabled: bool) -> Self {
+        self.rc3_pilot_verification = enabled;
         self
     }
 

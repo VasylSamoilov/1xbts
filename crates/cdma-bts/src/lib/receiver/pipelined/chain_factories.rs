@@ -27,6 +27,7 @@ use super::{generic_rake_receiver, pn_lc_correlator};
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESSION: bool = true;
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESS_SAMPLES: i32 = 0;
 const RC1_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.15;
+const RC3_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.20;
 /// Reverse-access finger budget, fixed to the value the access capture
 /// regression suite exercises.
 const REVERSE_ACCESS_MAX_FINGERS: usize = 10;
@@ -454,6 +455,8 @@ pub fn reverse_traffic_chain_rc3(settings: ReverseTrafficSettings) -> Vec<Pipeli
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
         pn_lc_correlator::PnLcConfig::default_4x()
             .with_snr_threshold(snr_threshold)
+            .with_preamble_coh_norm_min(RC3_TRAFFIC_PREAMBLE_COH_NORM_MIN)
+            .with_rc3_pilot_verification(true)
             .with_lc_half_span(4)
             // Match the conservative traffic acquisition gate used for RC1.
             // The 1-hit default was introduced for access-channel PN_RAN work;

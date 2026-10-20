@@ -799,11 +799,6 @@ impl PnLcCorrelator {
         )
     }
 
-    /// HPSK composite verification: builds the full PN×LC composite reference
-    /// at each LC phase hypothesis and correlates directly with the raw signal.
-    ///
-    /// This replaces the two-stage (PN despread → LC sweep) approach which does
-    /// not work for HPSK because PN and LC are intertwined in the Q branch.
     fn verify_lc_hpsk_composite(
         &self,
         window: &[Complex32],
@@ -816,19 +811,22 @@ impl PnLcCorrelator {
         let half = self.cfg.lc_half_span;
         let n_chips = self.cfg.coherent_chips;
         let window_len = window.len();
-        let n_seg = 4usize;
+        const VERIFICATION_SEGMENTS: usize = 4;
+        // C.S0002-E, reverse power-control subchannel structure.
+        const RC3_PCG_CHIPS: usize = 1_536;
+        const RC3_PILOT_CHIPS: usize = 1_152;
+
+        let n_seg = VERIFICATION_SEGMENTS;
         let seg_len = n_chips.max(1) / n_seg.max(1);
 
-        // Pre-compute PN_I and PN_Q at chip centers.
         let pn_i_chips: Vec<f32> = (0..n_chips)
             .map(|k| self.pn_fft_seq[(base_phase + k * os) % pp].re)
             .collect();
-        // pn_fft_seq stores conj(PN) so .im = -PN_Q; negate to get true PN_Q.
+        // pn_fft_seq stores conj(PN) so .im = -PN_Q. Negate to get true PN_Q.
         let pn_q_chips: Vec<f32> = (0..n_chips)
             .map(|k| -self.pn_fft_seq[(base_phase + k * os) % pp].im)
             .collect();
 
-        // Pre-generate LC at chip rate over the whole hypothesis span.
         let n_lc = (2 * half + 1) as usize;
         let lc_global_start = (expected_abs_chip as i64 - half as i64).max(0) as usize;
         let lc_total = n_lc + n_chips + 1;
@@ -842,7 +840,7 @@ impl PnLcCorrelator {
         let mut second_score = f32::MIN;
         let mut best_coh_norm = 0.0f32;
         let mut best_nc_coh_norm = 0.0f32;
-        let mut best_seg_pilots: Vec<Complex32> = Vec::new();
+        let mut best_seg_pilots: Vec<(Complex32, f32)> = Vec::new();
 
         for phase in -half..=half {
             let slice_start = ((phase + half) as i64 - lc_base_offset) as usize;
@@ -852,22 +850,20 @@ impl PnLcCorrelator {
             let mut nc_power_sum = 0.0f32;
             let mut seg_coh = Complex32::new(0.0, 0.0);
             let mut seg_count = 0usize;
+            let mut seg_chip_sum = 0usize;
             let mut seg_pilots = Vec::with_capacity(n_seg);
 
             for k in 0..n_chips {
-                // Sample from the window at the candidate's delay.
                 let sample_idx =
                     modulo(k as i32 * os as i32 + delay_samples, window_len as i32) as usize;
                 let sig = window[sample_idx];
 
                 let abs_chip = abs_chip_base + k;
 
-                // Build composite reference for this chip.
                 let pn_i = pn_i_chips[k];
                 let lc_i = lc_i_chips[slice_start + k];
                 let s_i = pn_i * lc_i;
 
-                // W12 and decimation based on absolute chip index.
                 let w12: f32 = if abs_chip % 2 == 0 { 1.0 } else { -1.0 };
                 let abs_even = abs_chip & !1;
                 let even_k = abs_even as isize - abs_chip_base as isize;
@@ -885,7 +881,7 @@ impl PnLcCorrelator {
                 let s_q = w12 * s_i * dec_q;
 
                 // Despread: signal × conj(composite). Existing 1x HPSK paths
-                // use the conjugated `I-jQ` sample convention; HRPD reverse
+                // use the conjugated `I-jQ` sample convention. HRPD reverse
                 // access captures use ordinary `I+jQ` IQ samples.
                 let ref_conj = if self.cfg.hpsk_signal_conjugated {
                     Complex32::new(s_i, s_q)
@@ -894,20 +890,22 @@ impl PnLcCorrelator {
                 };
                 let d = sig * ref_conj;
 
-                abs_sum += d.re.abs() + d.im.abs();
-                coh += d;
-                seg_coh += d;
-                seg_count += 1;
-                if seg_count >= seg_len.max(1) {
-                    nc_power_sum += seg_coh.norm_sqr();
-                    seg_pilots.push(seg_coh);
+                if !self.cfg.rc3_pilot_verification || abs_chip % RC3_PCG_CHIPS < RC3_PILOT_CHIPS {
+                    abs_sum += d.re.abs() + d.im.abs();
+                    coh += d;
+                    seg_coh += d;
+                    seg_count += 1;
+                    seg_chip_sum += k;
+                }
+                if (k + 1) % seg_len.max(1) == 0 || k + 1 == n_chips {
+                    if seg_count > 0 {
+                        nc_power_sum += seg_coh.norm_sqr();
+                        seg_pilots.push((seg_coh, seg_chip_sum as f32 / seg_count as f32));
+                    }
                     seg_coh = Complex32::new(0.0, 0.0);
                     seg_count = 0;
+                    seg_chip_sum = 0;
                 }
-            }
-            if seg_count > 0 {
-                nc_power_sum += seg_coh.norm_sqr();
-                seg_pilots.push(seg_coh);
             }
 
             let abs_sum_safe = abs_sum.max(1e-6);
@@ -935,16 +933,21 @@ impl PnLcCorrelator {
 
         let cfo_rad_per_chip = if best_seg_pilots.len() >= 2 {
             let mut total_delta = 0.0f32;
-            let mut count = 0u32;
+            let mut total_chip_span = 0.0f32;
             for pair in best_seg_pilots.windows(2) {
-                let cross = pair[1] * Complex32::new(pair[0].re, -pair[0].im);
+                let cross = pair[1].0 * pair[0].0.conj();
                 if cross.norm_sqr() > 1e-12 {
                     total_delta += cross.im.atan2(cross.re);
-                    count += 1;
+                    // Pilot-only segments have unequal phase centers across control-chip gaps.
+                    total_chip_span += if self.cfg.rc3_pilot_verification {
+                        pair[1].1 - pair[0].1
+                    } else {
+                        seg_len as f32
+                    };
                 }
             }
-            if count > 0 {
-                total_delta / (count as f32 * seg_len as f32)
+            if total_chip_span > 0.0 {
+                total_delta / total_chip_span
             } else {
                 0.0
             }
