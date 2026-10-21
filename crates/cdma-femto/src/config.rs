@@ -232,9 +232,8 @@ pub struct EvdoConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteAcsCreds {
+    pub username: String,
     pub password: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,11 +265,6 @@ pub struct SiteSegwCreds {
     pub segw_cert: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segw_key: Option<String>,
-}
-
-fn derive_cwmp_username(feid: &str) -> String {
-    let oui = feid.get(..6).unwrap_or(feid);
-    format!("{oui}-cdmaFAP-{feid}")
 }
 
 impl UnifiedSite {
@@ -310,11 +304,7 @@ impl UnifiedSite {
 
     pub fn cpe_credential(&self) -> CpeCredential {
         CpeCredential {
-            username: self
-                .acs
-                .username
-                .clone()
-                .unwrap_or_else(|| derive_cwmp_username(&self.feid)),
+            username: self.acs.username.clone(),
             password: self.acs.password.clone(),
             feid: Some(self.feid.clone()),
         }
@@ -943,10 +933,16 @@ impl FemtoConfig {
                     site.profile
                 )));
             }
-            if site.acs.password.is_empty() {
-                return Err(ConfigError::Validation(format!(
-                    "site {name}: empty ACS password"
-                )));
+            for (field, value) in [
+                ("acs.username", &site.acs.username),
+                ("acs.password", &site.acs.password),
+                ("sip.password", &site.sip.password),
+            ] {
+                if value.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "site {name}: empty {field}"
+                    )));
+                }
             }
             if let Some(dbm) = site.onex.max_sector_power_dbm {
                 if dbm < MIN_SECTOR_POWER_DBM {
@@ -1037,7 +1033,7 @@ mod tests {
                     "feid": "0005B9AABBCC", "profile": "p", "name": "TestFAP",
                     "cell": { "mcc": "310", "imsi_11_12": "00", "cell_id": 403 },
                     "1x": { "sid": 4107, "nid": 65535, "band_class": 1, "channel": 50 },
-                    "acs": { "password": "acspw" },
+                    "acs": { "username": "0005B9-cdmaFAP3-0005B9AABBCC", "password": "acspw" },
                     "sip": { "password": "sippw" },
                     "segw": { "security_profile": "legacy", "ike_group_key": "gk", "eap_password": "ep" }
                 }
@@ -1048,7 +1044,7 @@ mod tests {
         assert_eq!(cfg.flat_sites["test-fap"].sid, 4107);
         assert_eq!(
             cfg.acs.cpe_credentials[0].username,
-            "0005B9-cdmaFAP-0005B9AABBCC"
+            "0005B9-cdmaFAP3-0005B9AABBCC"
         );
         assert_eq!(cfg.acs.cpe_credentials[0].password, "acspw");
         assert_eq!(cfg.segw.connections[0].feid, "0005B9AABBCC");
@@ -1076,13 +1072,13 @@ mod tests {
                     "feid": "0005B90000AA", "profile": "p",
                     "cell": { "mcc": "310", "imsi_11_12": "00", "cell_id": 403 },
                     "1x": { "sid": 1, "nid": 65535, "band_class": 1, "channel": 50 },
-                    "acs": { "password": "x" }, "sip": { "password": "x" }, "segw": {}
+                    "acs": { "username": "x", "password": "x" }, "sip": { "password": "x" }, "segw": {}
                 },
                 "b": {
                     "feid": "0005B90000BB", "profile": "p",
                     "cell": { "mcc": "310", "imsi_11_12": "00", "cell_id": 403 },
                     "1x": { "sid": 1, "nid": 65535, "band_class": 1, "channel": 50 },
-                    "acs": { "password": "x" }, "sip": { "password": "x" }, "segw": {}
+                    "acs": { "username": "x", "password": "x" }, "sip": { "password": "x" }, "segw": {}
                 }
             }
         }"#;
@@ -1111,7 +1107,7 @@ mod tests {
                     "feid": "0005B90000AA", "profile": "p",
                     "cell": { "mcc": "310", "imsi_11_12": "00", "cell_id": 403 },
                     "1x": { "sid": 1, "nid": 65535, "band_class": 1, "channel": 50, "max_sector_power_dbm": -43 },
-                    "acs": { "password": "x" }, "sip": { "password": "x" }, "segw": {}
+                    "acs": { "username": "x", "password": "x" }, "sip": { "password": "x" }, "segw": {}
                 }
             }
         }"#;
@@ -1124,6 +1120,66 @@ mod tests {
             "got {error:?}"
         );
     }
+
+    fn site_credentials_config(acs: &str, sip: &str) -> String {
+        format!(
+            r#"{{
+            "home_domain": "femto.local.1xbts.org",
+            "event_bus_addr": "http://127.0.0.1:17023",
+            "segw": {{ "listen": "0.0.0.0:500" }},
+            "acs": {{ "listen": "0.0.0.0:7003" }},
+            "sip": {{ "listen": "0.0.0.0:5060", "realm": "ims.example" }},
+            "packet": {{ "adapter": "external_pdsn" }},
+            "fap_profiles": {{ "p": {{ "implementation": "airvana_airave2" }} }},
+            "sites": {{
+                "a": {{
+                    "feid": "0005B90000AA", "profile": "p",
+                    "cell": {{ "mcc": "310", "imsi_11_12": "00", "cell_id": 403 }},
+                    "1x": {{ "sid": 1, "nid": 65535, "band_class": 1, "channel": 50 }},
+                    "acs": {acs}, "sip": {sip}, "segw": {{}}
+                }}
+            }}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn rejects_sites_without_an_acs_username() {
+        let json = site_credentials_config(r#"{ "password": "x" }"#, r#"{ "password": "x" }"#);
+        let error = serde_json::from_str::<FemtoConfig>(&json)
+            .expect_err("a site without acs.username must not parse");
+        assert!(error.to_string().contains("username"), "got {error}");
+    }
+
+    #[test]
+    fn rejects_sites_with_empty_credentials() {
+        for (acs, sip, field) in [
+            (
+                r#"{ "username": "", "password": "x" }"#,
+                r#"{ "password": "x" }"#,
+                "acs.username",
+            ),
+            (
+                r#"{ "username": "x", "password": "" }"#,
+                r#"{ "password": "x" }"#,
+                "acs.password",
+            ),
+            (
+                r#"{ "username": "x", "password": "x" }"#,
+                r#"{ "password": "" }"#,
+                "sip.password",
+            ),
+        ] {
+            let cfg: FemtoConfig =
+                serde_json::from_str(&site_credentials_config(acs, sip)).expect("parse");
+            let error = cfg.validate().expect_err("empty credential must fail");
+            assert!(
+                matches!(error, ConfigError::Validation(ref m) if m.contains(field)),
+                "got {error:?}"
+            );
+        }
+    }
+
     struct A11ConfigFixture(std::path::PathBuf);
 
     impl A11ConfigFixture {

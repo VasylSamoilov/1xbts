@@ -23,6 +23,7 @@
         "enabled": false
       },
       "acs": {
+        "username": "<device ACS username>",
         "password": "<device provisioning password>"
       },
       "sip": {

@@ -1,5 +1,6 @@
 # HEAD
 
+- Femtocell site configuration now forces ACS username, password, and SIP password to be set.
 - Added SMPP SMS support.
 - Improve RC3 traffic acquisition.
 - Airvana femtocell provisioning now uses the configured PDSN A11 key and SPI.

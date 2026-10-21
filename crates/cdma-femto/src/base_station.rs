@@ -92,7 +92,7 @@ mod tests {
             r#"{"feid":"0005B9AABBCC","profile":"airave-25-5x","name":"TestFAP",
                 "cell":{"mcc":"310","imsi_11_12":"00","cell_id":403},
                 "1x":{"sid":4107,"nid":65535,"band_class":1,"channel":50},
-                "acs":{"password":"x"},"sip":{"password":"x"},"segw":{}}"#,
+                "acs":{"username":"x","password":"x"},"sip":{"password":"x"},"segw":{}}"#,
         )
         .unwrap();
         config.sites.insert("test-fap".to_string(), test_fap);
