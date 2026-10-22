@@ -83,10 +83,7 @@ impl Default for HrpdForwardMacEncoder {
 impl HrpdForwardMacEncoder {
     pub fn new() -> Self {
         Self {
-            // BPSK bit 1 maps to -1 SoftRAB, which subtype-3 RTC MAC treats
-            // as Unloaded. Advertising bit 0 (+1/Loaded) drains T2P inflow.
-            // TODO: This is set to false now to indicate "not busy" so reverse rate
-            // can move up. At some point based on BTS load this can be set dynamically.
+            // C.S0024-A §10.8.6.1.5 defines RA bit 1 as busy.
             ra: false,
             actives: Vec::new(),
             harq_bus: None,

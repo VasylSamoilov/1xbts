@@ -17,8 +17,8 @@ use cdma_common::hrpd::traffic::physical_crc24;
 
 use super::rri_subtype2::{RriSubtype2Detection, is_rri_subtype2_null};
 use super::subtype2_data::{
-    MAX_SUBPACKETS, Subtype2DataFormat, accumulate_subpacket_llrs, demap_subpacket,
-    mother_llrs_from_harq_buffer,
+    MAX_SUBPACKETS, ModulationFormat, Subtype2DataFormat, accumulate_subpacket_llrs,
+    demap_subpacket, mother_llrs_from_harq_buffer,
 };
 
 pub const REVERSE_INTERLACES: usize = 3;
@@ -33,8 +33,9 @@ const ARQ_RESPONSE_SLOTS: u64 = 3;
 /// Physical packet FCS + tail bits excluded from the CRC input.
 const PACKET_FCS_BITS: usize = 24;
 const PACKET_TAIL_BITS: usize = 6;
+const B4_PHASE_MIN_SIGNIFICANCE_SQUARED: f64 = 16.0;
+const B4_PHASE_MAX_CORRECTION_RAD: f32 = std::f32::consts::FRAC_PI_4;
 
-/// One interlace's in-flight packet.
 #[derive(Clone)]
 struct PacketState {
     format: &'static Subtype2DataFormat,
@@ -64,12 +65,11 @@ pub struct SubframeOutcome {
     pub delivered: Option<Vec<u8>>,
     pub decoded: bool,
     pub payload_bits: u32,
-    /// Sub-packet ID reported by RRI.
     pub subpacket_id: u8,
     pub interlace: u8,
     pub subpackets_accumulated: u8,
-    /// Turbo iterations used by this sub-packet's decode attempt. Zero means
-    /// the packet had already decoded on an earlier sub-packet.
+    pub first_subpacket_start_slot: Option<u64>,
+    /// Zero means an earlier subpacket already decoded this packet.
     pub turbo_iterations: u8,
     pub llr_mean_abs: f32,
     pub mother_mean_abs: f32,
@@ -157,13 +157,13 @@ impl SubframeHarq {
         let starts_new_packet = match slot_of_interlace.as_ref() {
             None => true,
             Some(state) => {
+                let subpacket_advance = rri.subpacket_id.saturating_sub(state.last_subpacket_id);
                 let expected_slot = state
                     .last_subpacket_start_slot
-                    .saturating_add(SUBPACKET_SPACING_SLOTS);
-                let expected_subpacket_id = state.last_subpacket_id.saturating_add(1);
+                    .checked_add(u64::from(subpacket_advance) * SUBPACKET_SPACING_SLOTS);
                 let expected_continuation = std::ptr::eq(state.format, format)
-                    && start_slot == expected_slot
-                    && rri.subpacket_id == expected_subpacket_id
+                    && subpacket_advance > 0
+                    && expected_slot == Some(start_slot)
                     && usize::from(rri.subpacket_id) < MAX_SUBPACKETS;
                 !expected_continuation
             }
@@ -193,6 +193,7 @@ impl SubframeHarq {
         }
         let state = slot_of_interlace.as_mut().expect("state just ensured");
 
+        outcome.first_subpacket_start_slot = Some(state.first_subpacket_start_slot);
         state.last_subpacket_start_slot = start_slot;
         state.last_subpacket_id = rri.subpacket_id;
         state.subpackets_accumulated = state.subpackets_accumulated.saturating_add(1);
@@ -213,6 +214,33 @@ impl SubframeHarq {
             outcome.turbo_iterations = first.iterations_used as u8;
             if let Some(payload) = first.decoded_payload {
                 state.decoded_payload = Some(payload);
+            } else if matches!(format.modulation, ModulationFormat::B4)
+                && let Some(rotor) = b4_residual_phase_rotor(w24)
+            {
+                let corrected: Vec<_> = w24.iter().map(|symbol| *symbol * rotor).collect();
+                let mut delta = demap_subpacket(format, &corrected, w12);
+                for (value, original) in delta.iter_mut().zip(&llrs) {
+                    *value -= original;
+                }
+                let mut candidate = state.harq.clone();
+                accumulate_subpacket_llrs(format, &mut candidate, rri_harq_subpacket, &delta);
+                let retry =
+                    decode_harq_candidate(format, &candidate, interlace, self.turbo_iterations);
+                outcome.turbo_iterations = outcome
+                    .turbo_iterations
+                    .saturating_add(retry.iterations_used as u8);
+                if let Some(payload) = retry.decoded_payload {
+                    log::debug!(
+                        "hrpd_reverse_b4_phase_recovered: start_slot={} payload_bits={} correction_rad={:.3} iterations={}",
+                        start_slot,
+                        format.payload_bits,
+                        -rotor.arg(),
+                        outcome.turbo_iterations
+                    );
+                    state.harq = candidate;
+                    state.decoded_payload = Some(payload);
+                    outcome.mother_mean_abs = retry.mother_mean_abs;
+                }
             }
         }
         outcome.decoded = state.decoded_payload.is_some();
@@ -332,6 +360,30 @@ struct DecodeHarqCandidate {
     mother_mean_abs: f32,
     decoded_payload: Option<Vec<u8>>,
     iterations_used: usize,
+}
+
+fn b4_residual_phase_rotor(symbols: &[Complex32]) -> Option<Complex32> {
+    if symbols.len() < 2 {
+        return None;
+    }
+    let mut axis = Complex32::new(0.0, 0.0);
+    let mut fourth_moment_sum = 0.0f64;
+    for symbol in symbols {
+        // B4 is antipodal on Q, so negating its square removes the data sign.
+        axis -= *symbol * *symbol;
+        fourth_moment_sum += f64::from(symbol.norm_sqr()).powi(2);
+    }
+    let axis_power = f64::from(axis.norm_sqr());
+    let variance = (fourth_moment_sum - axis_power / symbols.len() as f64).max(0.0);
+    let phase = axis.arg() / 2.0;
+    if !phase.is_finite()
+        || axis_power <= B4_PHASE_MIN_SIGNIFICANCE_SQUARED * variance
+        || phase.abs() >= B4_PHASE_MAX_CORRECTION_RAD
+        || phase == 0.0
+    {
+        return None;
+    }
+    Some(Complex32::from_polar(1.0, -phase))
 }
 
 fn decode_harq_candidate(
@@ -469,11 +521,55 @@ mod tests {
     }
 
     #[test]
+    fn b4_phase_retry_failure_preserves_combining_buffer() {
+        let format = Subtype2DataFormat::for_payload_bits(512).unwrap();
+        let rotor = Complex32::from_polar(1.0, 0.4);
+        let symbols: Vec<_> = lcg_bits(format.subframe_w24_symbols(), 0x1278)
+            .into_iter()
+            .map(|bit| rotor * Complex32::new(0.0, if bit == 0 { 1.0 } else { -1.0 }))
+            .collect();
+        let mut expected = format.new_harq_buffer();
+        accumulate_subpacket_llrs(
+            format,
+            &mut expected,
+            0,
+            &demap_subpacket(format, &symbols, &[]),
+        );
+        let mut harq = SubframeHarq::new();
+        let outcome = harq.ingest_subframe(120, 0, &detection(512, 0), &symbols, &[]);
+        assert!(!outcome.decoded);
+        assert!(outcome.delivered.is_none());
+        assert_eq!(outcome.turbo_iterations, 8);
+        let state = harq.interlaces[0].as_ref().unwrap();
+        assert_eq!(state.harq, expected);
+        assert_eq!(state.subpackets_accumulated, 1);
+    }
+
+    #[test]
+    fn b4_residual_phase_retains_pilot_quadrant_and_rejects_isotropic_energy() {
+        for phase in [-0.6, 0.6] {
+            let symbols: Vec<_> = lcg_bits(512, 0x1991)
+                .into_iter()
+                .map(|bit| {
+                    Complex32::from_polar(1.0, phase)
+                        * Complex32::new(0.0, if bit == 0 { 1.0 } else { -1.0 })
+                })
+                .collect();
+            let rotor = b4_residual_phase_rotor(&symbols).unwrap();
+            for symbol in symbols {
+                assert!((symbol * rotor).re.abs() < 1.0e-5);
+            }
+        }
+        let isotropic = [Complex32::new(1.0, 0.0), Complex32::new(0.0, 1.0)].repeat(256);
+        assert!(b4_residual_phase_rotor(&isotropic).is_none());
+        assert!(b4_residual_phase_rotor(&vec![Complex32::new(1.0, 0.0); 512]).is_none());
+        assert!(b4_residual_phase_rotor(&vec![Complex32::new(0.0, 0.0); 512]).is_none());
+    }
+
+    #[test]
     fn early_termination_delivers_once_and_acks() {
         let format = Subtype2DataFormat::for_payload_bits(1024).expect("format");
         let packet = build_packet_bits(1024, 0xA5A5_0001);
-        // Packet starts at an interlace-0 sub-frame: frame_offset 0,
-        // start slot 120 → interlace ((120−0)/4) % 3 = 0.
         let start_slot = 120u64;
         let (w24, w12) = tx_subframe_symbols(format, &packet, 0, 0);
 
@@ -518,6 +614,47 @@ mod tests {
             again.terminal_packets.is_empty(),
             "terminal outcome emitted exactly once"
         );
+    }
+
+    #[test]
+    fn missed_subpacket_preserves_combining_and_single_delivery() {
+        let format = Subtype2DataFormat::for_payload_bits(1024).expect("format");
+        let packet = build_packet_bits(1024, 0xA5A5_0012);
+        let mac_end = packet.len() - PACKET_FCS_BITS - PACKET_TAIL_BITS;
+        let start_slot = 120;
+        for first_decodes in [false, true] {
+            let (mut first_w24, first_w12) = tx_subframe_symbols(format, &packet, 0, 0);
+            if !first_decodes {
+                for symbol in &mut first_w24 {
+                    *symbol *= -0.01;
+                }
+            }
+            let mut harq = SubframeHarq::new();
+            let first =
+                harq.ingest_subframe(start_slot, 0, &detection(1024, 0), &first_w24, &first_w12);
+            assert_eq!(first.decoded, first_decodes);
+            let (third_w24, third_w12) = tx_subframe_symbols(format, &packet, 2, 0);
+            let third = harq.ingest_subframe(
+                start_slot + 2 * SUBPACKET_SPACING_SLOTS,
+                0,
+                &detection(1024, 2),
+                &third_w24,
+                &third_w12,
+            );
+            assert!(third.decoded);
+            assert_eq!(third.subpackets_accumulated, 2);
+            assert!(
+                !third
+                    .terminal_packets
+                    .iter()
+                    .any(|terminal| terminal.disposition == TerminalPacketDisposition::Abandoned)
+            );
+            let delivered = [first.delivered, third.delivered]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(delivered, vec![packet[..mac_end].to_vec()]);
+        }
     }
 
     #[test]

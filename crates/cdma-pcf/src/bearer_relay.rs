@@ -9,6 +9,7 @@ enum HrpdPcfBearerCommand {
     Register {
         a8: cdma_a8::BearerSession,
         a10: cdma_a10::BearerSession,
+        peer: std::net::SocketAddr,
     },
     Release {
         a8_id: u32,
@@ -22,10 +23,15 @@ pub struct HrpdPcfBearerRuntime {
 }
 
 impl HrpdPcfBearerRuntime {
-    pub fn register(&self, a8: cdma_a8::BearerSession, a10: cdma_a10::BearerSession) {
+    pub fn register(
+        &self,
+        a8: cdma_a8::BearerSession,
+        a10: cdma_a10::BearerSession,
+        peer: std::net::SocketAddr,
+    ) {
         if self
             .tx
-            .send(HrpdPcfBearerCommand::Register { a8, a10 })
+            .send(HrpdPcfBearerCommand::Register { a8, a10, peer })
             .is_err()
         {
             warn!("HRPD PCF bearer relay stopped before session registration");
@@ -52,12 +58,20 @@ fn apply_hrpd_pcf_bearer_command(
     a8_peers: &mut HashMap<u32, std::net::SocketAddr>,
 ) {
     match command {
-        HrpdPcfBearerCommand::Register { a8, a10 } => {
+        HrpdPcfBearerCommand::Register { a8, a10, peer } => {
             let a8_id = a8.session_id;
             let a10_id = a10.session_id;
             match a8_table.apply_session(a8) {
                 Ok(a8_outcome) => match a10_table.apply_session(a10) {
                     Ok(a10_outcome) => {
+                        // A refresh must preserve a learned UDP port on the same signaling host.
+                        match a8_peers.get_mut(&a8_id) {
+                            Some(learned) if learned.ip() == peer.ip() => {}
+                            Some(learned) => *learned = peer,
+                            None => {
+                                a8_peers.insert(a8_id, peer);
+                            }
+                        }
                         a8_to_a10.insert(a8_id, a10_id);
                         a10_to_a8.insert(a10_id, a8_id);
                         info!(
@@ -346,13 +360,8 @@ async fn relay_one_a10_to_a8(
             return true;
         }
     };
-    // Send back to the access network this session's traffic came from. Until
-    // one arrives there is nowhere to send, and the configured peer would be
-    // right for only one of them.
     let Some(peer) = a8_peers.get(&a8_session).copied() else {
-        warn!(
-            "HRPD PCF A8: no access network seen yet for A8 session=0x{a8_session:08x}, dropping"
-        );
+        warn!("HRPD PCF A8: no return address for A8 session=0x{a8_session:08x}, dropping");
         return true;
     };
     if let Err(err) = a8_tx.send_wire_packet_to(&outbound.wire_bytes, peer).await {
@@ -372,6 +381,94 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn downlink_starts_before_uplink_and_preserves_learned_peers_on_refresh() {
+        const A8_ID: u32 = 11;
+        const A10_ID: u32 = 21;
+        const OTHER_A8_ID: u32 = 12;
+        const OTHER_A10_ID: u32 = 22;
+        const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+        const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+        let an_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let learned_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let pdsn_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let an_addr = an_socket.local_addr().unwrap();
+        let other_addr = other_socket.local_addr().unwrap();
+        let pdsn_addr = pdsn_socket.local_addr().unwrap();
+        let pcf_a8_addr = free_udp_addr();
+        let pcf_a10_addr = free_udp_addr();
+        let endpoint = cdma_a8::BearerEndpoint::new(LOOPBACK, LOOPBACK);
+        let a10_endpoint = cdma_a10::BearerEndpoint::new(LOOPBACK, LOOPBACK);
+        let runtime = spawn_hrpd_pcf_bearer_relay(
+            cdma_a8::BearerTransportConfig::udp_encapsulated_gre(pcf_a8_addr, an_addr),
+            endpoint,
+            cdma_a10::BearerTransportConfig::udp_encapsulated_gre(pcf_a10_addr, pdsn_addr),
+            a10_endpoint,
+        )
+        .unwrap();
+        let register = |a8_id, a10_id, peer| {
+            runtime.register(
+                cdma_a8::BearerSession::new(a8_id, endpoint),
+                cdma_a10::BearerSession::new(a10_id, a10_endpoint),
+                peer,
+            )
+        };
+        register(A8_ID, A10_ID, an_addr);
+        register(OTHER_A8_ID, OTHER_A10_ID, other_addr);
+        let an = cdma_a8::UdpGreEndpoint::from_socket(an_socket, pcf_a8_addr)
+            .into_tokio()
+            .unwrap();
+        let learned = cdma_a8::UdpGreEndpoint::from_socket(learned_socket, pcf_a8_addr)
+            .into_tokio()
+            .unwrap();
+        let other = cdma_a8::UdpGreEndpoint::from_socket(other_socket, pcf_a8_addr)
+            .into_tokio()
+            .unwrap();
+        let pdsn = cdma_a8::UdpGreEndpoint::from_socket(pdsn_socket, pcf_a10_addr)
+            .into_tokio()
+            .unwrap();
+        let mut buf = [0_u8; 128];
+        pdsn.send_gre_packet(&cdma_a8::GrePacket::octet_stream(A10_ID, Some(0), [1]))
+            .await
+            .unwrap();
+        let (packet, _) = tokio::time::timeout(RECV_TIMEOUT, an.recv_gre_packet(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((packet.key, packet.payload), (Some(A8_ID), vec![1]));
+        pdsn.send_gre_packet(&cdma_a8::GrePacket::octet_stream(
+            OTHER_A10_ID,
+            Some(0),
+            [2],
+        ))
+        .await
+        .unwrap();
+        let (packet, _) = tokio::time::timeout(RECV_TIMEOUT, other.recv_gre_packet(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((packet.key, packet.payload), (Some(OTHER_A8_ID), vec![2]));
+        learned
+            .send_gre_packet(&cdma_a8::GrePacket::octet_stream(A8_ID, Some(0), [3]))
+            .await
+            .unwrap();
+        let (packet, _) = tokio::time::timeout(RECV_TIMEOUT, pdsn.recv_gre_packet(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.payload, [3]);
+        register(A8_ID, A10_ID, an_addr);
+        pdsn.send_gre_packet(&cdma_a8::GrePacket::octet_stream(A10_ID, Some(1), [4]))
+            .await
+            .unwrap();
+        let (packet, _) = tokio::time::timeout(RECV_TIMEOUT, learned.recv_gre_packet(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((packet.key, packet.payload), (Some(A8_ID), vec![4]));
     }
 
     #[tokio::test]
@@ -416,6 +513,7 @@ mod tests {
                 a10_endpoint,
                 cdma_a10::BearerProfile::standard_packet_data(),
             ),
+            an_addr,
         );
         let an = cdma_a8::UdpGreEndpoint::from_socket(an_socket, pcf_a8_addr)
             .into_tokio()

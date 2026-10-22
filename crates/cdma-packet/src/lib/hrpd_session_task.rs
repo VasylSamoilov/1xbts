@@ -26,6 +26,10 @@ use crate::session_task::{
     PppSessionCacheLookup, PppSessionStore, SessionMetadata, SessionStatus, ppp_identity_key,
 };
 
+const HRPD_PACKET_TICK_MS: u64 = 20;
+// RFC 1661 §3.7 requires one Restart interval after sending Terminate-Ack before disconnecting.
+const HRPD_LCP_TERMINATION_WAIT: Duration =
+    Duration::from_millis(HRPD_PACKET_TICK_MS * crate::ppp::lcp::CONFIGURE_RESTART_TICKS as u64);
 const HRPD_IP_SAMPLE_LIMIT: u32 = 24;
 const HRPD_TCP_DOWNLINK_STALL_THRESHOLD: Duration = Duration::from_millis(100);
 
@@ -750,13 +754,14 @@ impl HrpdA10Session {
         let mut ip_log_state = HrpdIpLogState::default();
         let mut last_ppp_activity_at = Instant::now();
         let mut peer_requested_lcp_terminate = false;
+        let mut termination_deadline = None;
         let mut path_health_interval = tokio::time::interval(Duration::from_secs(5));
         path_health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut path_stats = HrpdPathStats::default();
         let mut tcp_diagnostics = HrpdTcpDiagnostics::default();
         let session_started = Instant::now();
 
-        let mut tick_interval = tokio::time::interval(Duration::from_millis(20));
+        let mut tick_interval = tokio::time::interval(Duration::from_millis(HRPD_PACKET_TICK_MS));
         tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         log::info!(
@@ -817,11 +822,11 @@ impl HrpdA10Session {
                     }
                     if session.take_peer_requested_lcp_terminate() {
                         peer_requested_lcp_terminate = true;
+                        termination_deadline = None;
                         log::info!(
-                            "hrpd-packet-service: session {} peer requested LCP terminate; closing HRPD A10 packet task",
+                            "hrpd-packet-service: session {} peer requested LCP terminate, allowing acknowledgment delivery before bearer release",
                             self.session_id
                         );
-                        break;
                     }
                 }
                 _ = tick_interval.tick() => {
@@ -855,11 +860,19 @@ impl HrpdA10Session {
                     }
                     if session.take_peer_requested_lcp_terminate() {
                         peer_requested_lcp_terminate = true;
+                        termination_deadline = None;
                         log::info!(
-                            "hrpd-packet-service: session {} peer requested LCP terminate; closing HRPD A10 packet task",
+                            "hrpd-packet-service: session {} peer requested LCP terminate, allowing acknowledgment delivery before bearer release",
                             self.session_id
                         );
-                        break;
+                    }
+                    if peer_requested_lcp_terminate {
+                        let now = Instant::now();
+                        let deadline = termination_deadline
+                            .get_or_insert(now + HRPD_LCP_TERMINATION_WAIT);
+                        if now >= *deadline {
+                            break;
+                        }
                     }
                 }
                 _ = path_health_interval.tick() => {
@@ -1858,14 +1871,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hrpd_task_originates_first_a10_byte_stream_chunk() {
+    async fn hrpd_task_sends_initial_ppp_and_drains_termination_acknowledgments() {
         let allocator = Arc::new(TestAllocator::default());
         let (uplink_tx, uplink_rx) = mpsc::channel(8);
         let (downlink_tx, mut downlink_rx) = mpsc::channel(8);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let task_allocator = allocator.clone();
-        let handle = tokio::spawn(async move {
+        let mut handle = tokio::spawn(async move {
             run_hrpd_a10_byte_stream_session(
                 "uati-80058001".to_string(),
                 u32::from(cdma_common::consts::SERVICE_OPTION_PACKET_DATA_RC3),
@@ -1917,8 +1930,47 @@ mod tests {
 
         assert!(downlink.starts_with(&[0x7e]));
         assert!(downlink.ends_with(&[0x7e]));
+        const TERMINATE_ACK: u8 = 6;
+        let terminate = crate::ppp::lcp::LcpPacket {
+            code: crate::ppp::lcp::TERMINATE_REQUEST,
+            identifier: 7,
+            data: Vec::new(),
+        }
+        .to_ppp();
+        let terminate_bytes = crate::ppp::framing::frame(&terminate);
+        let mut deframer = crate::ppp::framing::HdlcDeframer::new();
+        for _ in 0..2 {
+            uplink_tx.send(terminate_bytes.clone()).await.unwrap();
+            let acknowledgment = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let chunk = downlink_rx
+                        .recv()
+                        .await
+                        .expect("bearer closed before Terminate-Ack");
+                    for packet in deframer.feed(&chunk) {
+                        if packet.protocol == crate::ppp::lcp::LCP_PROTOCOL
+                            && packet.payload.first() == Some(&TERMINATE_ACK)
+                        {
+                            return packet;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("Terminate-Ack must leave the packet task");
+            assert_eq!(acknowledgment.payload, [TERMINATE_ACK, 7, 0, 4]);
+            assert!(!handle.is_finished());
+        }
+        let acknowledged_at = Instant::now();
+        tokio::time::timeout(HRPD_LCP_TERMINATION_WAIT * 2, &mut handle)
+            .await
+            .expect("termination must finish after the grace interval")
+            .unwrap();
+        assert!(
+            acknowledged_at.elapsed()
+                >= HRPD_LCP_TERMINATION_WAIT - Duration::from_millis(HRPD_PACKET_TICK_MS)
+        );
         drop(uplink_tx);
-        handle.await.unwrap();
         assert_eq!(
             allocator.released.lock().unwrap().as_slice(),
             &["hrpd-mobile:uati:80058001"]

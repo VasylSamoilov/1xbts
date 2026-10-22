@@ -90,6 +90,8 @@ struct HarqAckFeedbackStats {
     nak_terminal: u32,
     nak_nonterminal: u32,
     gated: u32,
+    low_confidence_positive: u32,
+    low_confidence_negative: u32,
     short_frame: u32,
     ack_soft_sum: f64,
     nak_terminal_soft_sum: f64,
@@ -343,7 +345,7 @@ impl HrpdReverseTrafficAckProcessor {
                 self.feedback_stats.nak_nonterminal,
             );
             log::debug!(
-                "rx_hrpd_traffic[m{}]: harq_ack_summary window_start_slot={} window_slots={} expected={} ack={} nak_terminal={} nak_nonterminal={} gated={} short_frame={} ack_soft_avg={} nak_terminal_soft_avg={} nak_nonterminal_soft_avg={} gated_abs_max={:.3} pilot_amp_min={:.2e} pilot_amp_max={:.2e} pilot_coh_min={:.3}",
+                "rx_hrpd_traffic[m{}]: harq_ack_summary window_start_slot={} window_slots={} expected={} ack={} nak_terminal={} nak_nonterminal={} gated={} low_confidence_positive={} low_confidence_negative={} short_frame={} ack_soft_avg={} nak_terminal_soft_avg={} nak_nonterminal_soft_avg={} gated_abs_max={:.3} pilot_amp_min={:.2e} pilot_amp_max={:.2e} pilot_coh_min={:.3}",
                 mac_index,
                 start_slot,
                 window_slots,
@@ -352,6 +354,8 @@ impl HrpdReverseTrafficAckProcessor {
                 self.feedback_stats.nak_terminal,
                 self.feedback_stats.nak_nonterminal,
                 self.feedback_stats.gated,
+                self.feedback_stats.low_confidence_positive,
+                self.feedback_stats.low_confidence_negative,
                 self.feedback_stats.short_frame,
                 ack_avg,
                 nak_terminal_avg,
@@ -439,7 +443,8 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
             .get(TAG_PILOT_COHERENCE_X1000)
             .map(|v| *v as f32 / 1000.0)
             .unwrap_or(HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE);
-        if pilot_coherence < HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE {
+        if physical_layer_subtype != 2 && pilot_coherence < HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE
+        {
             let mut keep = Vec::with_capacity(self.pending_emissions.len());
             let mut pilot_unlocked = Vec::new();
             for ev in self.pending_emissions.drain(..) {
@@ -481,23 +486,28 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
         let mut expected_gated = 0u32;
         let mut expected_seen = 0u32;
         let mut unexpected_seen: Vec<(u32, bool)> = Vec::new();
-        let mut expected_issues: Vec<(HarqAckIssue, HarqEmissionEvent, Option<f32>)> = Vec::new();
-        // Soft despread-to-pilot ratio for every slot. A real NAK pattern
-        // appears only in the slots tied to our forward transmissions (and
-        // their 4-slot interlace companions); pilot/DRC leakage from a
-        // timing or phase offset is uniform across all 16 slots. Logging
-        // the full profile separates the two even below the gate.
+        let mut expected_issues: Vec<(HarqAckIssue, HarqEmissionEvent, Option<f32>, f32)> =
+            Vec::new();
         let mut soft_profile = [f32::NAN; HRPD_TRAFFIC_SLOTS_PER_FRAME];
         for slot_idx in 0..HRPD_TRAFFIC_SLOTS_PER_FRAME as u32 {
             let start = (slot_idx as usize) * HRPD_SLOT_CHIPS;
             let end = start + ACK_CHIPS_PER_BIT;
-            let despread = if end <= block.samples.len() {
-                decoder.despread_slot(&block.samples[start..end])
+            let referenced = if end <= block.samples.len() {
+                if physical_layer_subtype == 2 {
+                    decoder.observe_pilot_referenced_slot(&block.samples[start..end])
+                } else {
+                    decoder
+                        .observe_slot(&block.samples[start..end])
+                        .map(|observation| (observation, pilot_amplitude))
+                }
             } else {
                 None
             };
+            let slot_pilot_amplitude = referenced.as_ref().map_or(0.0, |(_, amplitude)| *amplitude);
+            let observation = referenced.map(|(observation, _)| observation);
+            let despread = observation.as_ref().map(|observation| observation.mean);
             if let Some(avg) = despread {
-                soft_profile[slot_idx as usize] = avg.re / pilot_amplitude.max(1e-12);
+                soft_profile[slot_idx as usize] = avg.re / slot_pilot_amplitude.max(1e-12);
             }
             let abs_reverse_slot = frame_start_slot + slot_idx as u64;
             let expected_emission = if slot_expected_in_mask(mask, slot_idx) {
@@ -508,15 +518,20 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
             } else {
                 None
             };
-            let symbol = despread
-                .map(|avg| decoder.classify(avg, pilot_amplitude))
+            let symbol = observation
+                .as_ref()
+                .map(|observation| decoder.classify_observation(observation, slot_pilot_amplitude))
                 .unwrap_or(AckSymbol::Gated);
             if let Some(emission) = expected_emission.as_ref() {
-                // Soft value is avg.re/pilot: a real ACK lands near the AT's
-                // ACK-channel-to-pilot gain (well above threshold); a value
-                // hugging the gate is a false positive from an AT that did not
-                // actually decode the forward packet. Logs whether the handset
-                // is really decoding our subtype-2 forward or the ACK is noise.
+                if symbol == AckSymbol::Gated
+                    && let Some(mean) = despread
+                {
+                    match decoder.classify(mean, slot_pilot_amplitude) {
+                        AckSymbol::Ack => self.feedback_stats.low_confidence_positive += 1,
+                        AckSymbol::Nak => self.feedback_stats.low_confidence_negative += 1,
+                        AckSymbol::Gated => {}
+                    }
+                }
                 log::log!(
                     if symbol == AckSymbol::Nak {
                         log::Level::Info
@@ -603,7 +618,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
                             abs_reverse_slot,
                             &emission,
                             Some(soft_profile[slot_idx as usize]),
-                            Some(pilot_amplitude),
+                            Some(slot_pilot_amplitude),
                             pilot_coherence,
                         );
                         log::debug!("{log_line}");
@@ -653,12 +668,13 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
                         },
                         emission.clone(),
                         despread.map(|_| soft_profile[slot_idx as usize]),
+                        slot_pilot_amplitude,
                     ));
                 }
             }
         }
 
-        for (issue, emission, soft_ratio) in &expected_issues {
+        for (issue, emission, soft_ratio, slot_pilot_amplitude) in &expected_issues {
             self.record_harq_ack_issue(
                 *issue,
                 mac_index,
@@ -668,7 +684,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
                 emission.expected_ack_reverse_slot,
                 emission,
                 *soft_ratio,
-                Some(pilot_amplitude),
+                Some(*slot_pilot_amplitude),
                 pilot_coherence,
             );
         }

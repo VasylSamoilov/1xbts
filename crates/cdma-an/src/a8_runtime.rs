@@ -1381,6 +1381,13 @@ fn flush_hrpd_a8_downlink(
                 });
                 continue;
             }
+            // Repair priority would let new bytes overtake older queued data.
+            if segments
+                .first()
+                .is_some_and(|segment| segment.retransmission)
+            {
+                break;
+            }
             let Some(chunk) = session.pending_downlink.pop_front() else {
                 break;
             };
@@ -1518,10 +1525,14 @@ fn migrate_hrpd_a8_downlink(
     pending_traffic_setup: &mut HashSet<u32>,
     include_open_sessions: bool,
 ) -> usize {
+    let target_session_uati = sessions
+        .get(&target_uati)
+        .map_or(target_uati, |session| session.session_uati);
     let stale_uatis: Vec<u32> = sessions
         .iter()
         .filter_map(|(&uati, session)| {
             (uati != target_uati
+                && session.session_uati == target_session_uati
                 && (include_open_sessions || !session.traffic_open)
                 && !session.pending_downlink.is_empty())
             .then_some(uati)
@@ -3077,6 +3088,83 @@ mod tests {
     }
 
     #[test]
+    fn hrpd_a8_migration_preserves_other_terminals() {
+        const FIRST_SESSION: u32 = 0x0005_8001;
+        const FIRST_TRAFFIC: u32 = 0x1a05_8001;
+        const SECOND_SESSION: u32 = 0x0005_8002;
+        const SECOND_TRAFFIC: u32 = 0x1a05_8002;
+        for include_open in [false, true] {
+            for target in [SECOND_SESSION, SECOND_TRAFFIC] {
+                let mut first = HrpdAnA8Session::new(FIRST_SESSION, 6);
+                first.traffic_open = include_open;
+                first.pending_downlink.push_back(vec![1, 2, 3]);
+                let mut sessions = HashMap::from([(FIRST_TRAFFIC, first)]);
+                let mut table = cdma_a8::BearerTable::new();
+                table
+                    .apply_session(cdma_a8::BearerSession::new(
+                        FIRST_TRAFFIC,
+                        cdma_a8::BearerEndpoint::new([127, 0, 0, 1], [127, 0, 0, 1]),
+                    ))
+                    .unwrap();
+                let mut open = HashSet::from([FIRST_TRAFFIC]);
+                let mut setup = HashSet::from([FIRST_TRAFFIC]);
+                assert_eq!(
+                    migrate_hrpd_a8_downlink(
+                        target,
+                        &mut table,
+                        &mut sessions,
+                        &mut open,
+                        &mut setup,
+                        include_open
+                    ),
+                    0
+                );
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(
+                    sessions[&FIRST_TRAFFIC].pending_downlink.front(),
+                    Some(&vec![1, 2, 3])
+                );
+                assert!(table.has_session(FIRST_TRAFFIC));
+                assert!(!table.has_session(target));
+                assert!(open.contains(&FIRST_TRAFFIC));
+                assert!(setup.contains(&FIRST_TRAFFIC));
+            }
+        }
+    }
+
+    #[test]
+    fn hrpd_a8_migration_moves_only_verified_session_alias() {
+        const SESSION: u32 = 0x0005_8001;
+        const TRAFFIC: u32 = 0x1a05_8001;
+        const OTHER: u32 = 0x0005_8002;
+        let mut source = HrpdAnA8Session::new(SESSION, 6);
+        source.pending_downlink.push_back(vec![1]);
+        let mut other = HrpdAnA8Session::new(OTHER, 7);
+        other.pending_downlink.push_back(vec![2]);
+        let mut sessions = HashMap::from([
+            (SESSION, source),
+            (TRAFFIC, HrpdAnA8Session::new(SESSION, 6)),
+            (OTHER, other),
+        ]);
+        let mut table = cdma_a8::BearerTable::new();
+        let mut open = HashSet::new();
+        let mut setup = HashSet::new();
+        assert_eq!(
+            migrate_closed_hrpd_a8_downlink(
+                TRAFFIC,
+                &mut table,
+                &mut sessions,
+                &mut open,
+                &mut setup
+            ),
+            1
+        );
+        assert!(!sessions.contains_key(&SESSION));
+        assert_eq!(sessions[&TRAFFIC].pending_downlink.front(), Some(&vec![1]));
+        assert_eq!(sessions[&OTHER].pending_downlink.front(), Some(&vec![2]));
+    }
+
+    #[test]
     fn hrpd_a8_data_ready_uses_control_and_open_traffic_ftc() {
         let (signaling_tx, mut signaling_rx) =
             tokio::sync::mpsc::unbounded_channel::<hrpd_air::HrpdForwardSignalingRequest>();
@@ -3643,6 +3731,70 @@ mod tests {
         assert_eq!(session.traffic_window_stats.rlp_full_packets, 1);
         assert_eq!(session.traffic_window_stats.rlp_partial_packets, 0);
         assert_eq!(session.traffic_window_stats.rlp_partial_deferred, 2);
+    }
+
+    #[test]
+    fn hrpd_a8_repair_packet_does_not_promote_new_data() {
+        const UATI: u32 = 0x1a05_8001;
+        const NEXT_SEQUENCE: u32 = 6000;
+        const PAYLOAD_BITS: usize = 5120;
+        let (signaling_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (traffic_tx, mut traffic_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = HrpdAnA8Session::new(0x8005_8001, 6);
+        session.traffic_open = true;
+        session.session_configuration_complete = true;
+        session.traffic_configuration_complete = true;
+        session.default_packet_flow_open = true;
+        session.forward_traffic_mac_subtype =
+            cdma_common::hrpd::traffic::FORWARD_TRAFFIC_MAC_SUBTYPE_ENHANCED;
+        session.last_drc_index = Some(0x0e);
+        session.last_drc_at = Some(Instant::now());
+        session.rlp_seq = NEXT_SEQUENCE;
+        session
+            .pending_retransmit
+            .push_back(HrpdRlpRetransmitSegment {
+                sequence: 0,
+                octets: vec![0x11],
+            });
+        let segment_count = hrpd_a8_default_ftc_rlp_segments_per_packet(
+            PAYLOAD_BITS,
+            session.forward_traffic_mac_subtype,
+        );
+        for _ in 0..segment_count {
+            session
+                .pending_downlink
+                .push_back(vec![0x22; HRPD_A8_FORWARD_MAX_STREAM_OCTETS]);
+        }
+        assert!(flush_hrpd_a8_downlink(
+            UATI,
+            &mut session,
+            &signaling_tx,
+            &traffic_tx
+        ));
+        let repair = traffic_rx.try_recv().expect("repair packet");
+        assert!(repair.high_priority);
+        let expected_repair =
+            cdma_common::hrpd::traffic::default_packet_ftc_payload_bits_many_for_mac_subtype(
+                session.default_packet_stream_id,
+                &[(0, &[0x11])],
+                PAYLOAD_BITS,
+                session.forward_traffic_mac_subtype,
+            )
+            .unwrap();
+        assert_eq!(
+            repair.payload, expected_repair,
+            "priority repair must contain no new bytes"
+        );
+        let new_data = traffic_rx
+            .try_recv()
+            .expect("new data remains normal priority");
+        assert!(!new_data.high_priority);
+        assert!(traffic_rx.try_recv().is_err());
+        assert!(session.pending_downlink.is_empty());
+        assert_eq!(
+            session.rlp_seq,
+            NEXT_SEQUENCE + (segment_count * HRPD_A8_FORWARD_MAX_STREAM_OCTETS) as u32
+        );
     }
 
     #[test]

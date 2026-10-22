@@ -32,6 +32,7 @@ use crate::receiver::hrpd::drc_decoder::{DRC_CHIPS_PER_SLOT, DrcDecoder, DrcSymb
 use crate::receiver::pipelined::generic_rake_receiver::{BaseFinger, RakeFinger};
 use crate::receiver::pipelined::{PipelineProcessorShared, RxSampleTimeAnchor, SampleBlock};
 
+use super::data_ordering::ReverseDataOrdering;
 use super::despread::{
     HRPD_PILOT_CLEAN_START_CHIPS, HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE, HRPD_SLOT_CHIPS,
     HRPD_TRAFFIC_FRAME_CHIPS, HRPD_TRAFFIC_SLOTS_PER_FRAME, HrpdReverseTrafficDespreadParams,
@@ -42,9 +43,9 @@ use super::despread::{
 };
 use super::drc_processor::{drc_completion_slot_for_repetition, drc_window_start_slot_at_or_after};
 use super::rri_subtype2::{
-    HRPD_SUBFRAME_CHIPS, RRI_SUBTYPE2_NULL_PAYLOAD_INDEX, RRI_SUBTYPE2_SUBFRAME_SYMBOLS,
-    RriSubtype2Detection, decode_rri_subtype2_subframe, is_rri_subtype2_null,
-    is_rri_subtype2_valid,
+    HRPD_SUBFRAME_CHIPS, HRPD_SUBFRAME_SLOTS, RRI_SUBTYPE2_NULL_PAYLOAD_INDEX,
+    RRI_SUBTYPE2_SUBFRAME_SYMBOLS, RriSubtype2Detection, decode_rri_subtype2_subframe,
+    is_rri_subtype2_null, is_rri_subtype2_valid,
 };
 use super::subframe_harq::{
     SubframeHarq, SubframeOutcome, TerminalPacketDisposition, TerminalPacketOutcome,
@@ -54,11 +55,9 @@ use super::subtype2_data::{
 };
 use crate::bts::reverse_power_predictor::{
     DeltaSigmaParams, delta_sigma_pcb_step, lsq_intercept_and_slope_at_newest,
-    predict_ahead_clamped,
 };
 
-// SampleBlock tag schema produced by the finger. Downstream RRI/ACK/DRC/Data
-// processors read these by name; do not rename without updating consumers.
+// Tag names must match downstream RRI, ACK, DRC, and data consumers.
 pub const TAG_FRAME_START_CHIP: &str = "hrpd_reverse_frame_start_chip";
 pub const TAG_FRAME_OFFSET: &str = "hrpd_reverse_frame_offset";
 pub const TAG_PILOT_COHERENCE_X1000: &str = "hrpd_reverse_pilot_coherence_x1000";
@@ -81,77 +80,43 @@ pub(super) const TAG_POWER_CONTROL_RECEIVER_REACQUIRING: &str =
 /// transmitting data right now; a sustained pilot lock is sufficient health.
 const CONSECUTIVE_HIGH_COHERENCE_FRAMES_FOR_VALIDATION: u32 = 2;
 const HRPD_CHIP_RATE_HZ: u64 = 1_228_800;
-/// Per-stage sub-frame diagnostics emitted per finger before going quiet.
 const HRPD_SUBFRAME_DIAG_REPORTS_MAX: u32 = 96;
 const HRPD_SUBFRAME_PHASE_DIAG_REPORTS_MAX: u32 = 48;
 const HRPD_SUBFRAME_RRI_MIN_MARGIN: f32 = 0.25;
 const HRPD_SUBFRAME_RRI_MIN_MARGIN_NORM: f32 = 0.06;
 const HRPD_SUBFRAME_SUMMARY_WINDOW_SLOTS: u64 = 2400;
-/// A stale finger must not pin the single-finger rake after sustained failure
-/// to reacquire. Retire it so the assignment can return to full FFT acquisition.
-const HRPD_REVERSE_TRAFFIC_REACQUIRE_TIMEOUT_CHIPS: u64 = HRPD_CHIP_RATE_HZ / 2;
+// Established terminals can leave HRPD for a 1x access exchange lasting more than half a second.
+const HRPD_REVERSE_TRAFFIC_REACQUIRE_TIMEOUT_CHIPS: u64 = 3 * HRPD_CHIP_RATE_HZ;
 const HRPD_REVERSE_TRAFFIC_PILOT_LOSS_TIMEOUT_CHIPS: u64 = 5 * HRPD_CHIP_RATE_HZ;
 const HRPD_REVERSE_TRAFFIC_PILOT_REPORT_INTERVAL_CHIPS: u64 = HRPD_CHIP_RATE_HZ;
-// Target for the full-complex, pilot-symbol SINR used by the reverse W0 loop.
-// This is the same coherent-symbol / complex-residual form used by RC3. It is
-// invariant when the whole despread signal and its proportional impairments
-// scale together, but it must rise with AT power in the receiver-noise-limited
-// region. A real-only projection reads about 3 dB high because it discards the
-// quadrature residual, so use the full-complex form. Keep raw input out of the
-// quality loop; it is only a receiver-input diagnostic and ADC safety guard.
-// Live setup traffic at 5 dB sat only 2-3 dB above the receiver's raw floor:
-// DRC publication collapsed and every reverse TrafficChannelComplete frame
-// failed FCS. Keep enough margin for reverse control and data decoding.
+// Full-complex residuals include quadrature noise that real-only projection omits.
 pub(super) const HRPD_RPC_TARGET_SNR_DB: f32 = HRPD_INITIAL_TARGET_DB;
-// A slot's pilot SINR drives the predictor only when it is strongly coherent
-// and finite. The broader traffic-pilot lock gate is intentionally lower for
-// detection continuity, but live Rev A traces showed 0.45..0.57 coherence
-// "recoveries" with floor-level raw input polluting the RPC trend.
 const HRPD_RPC_MIN_COHERENCE_FOR_DECISION: f32 = 0.90;
-// RC3 pilot-symbol SINR assumes a stationary observation. Reject a slot when
-// its despread W0 amplitude changes materially between halves; otherwise an AT
-// on/off envelope edge appears as pilot noise and biases RPC upward.
+// Envelope edges otherwise appear as noise variance and bias the power command upward.
 const HRPD_RPC_MAX_PILOT_AMPLITUDE_STEP_DB: f32 = 3.0;
-// Subtype-2 carries RPC on one slot phase out of four. A stationary W0 sample
-// on a neighboring phase may therefore be the newest usable quality estimate
-// when the control phase arrives. Reuse it only within that four-slot group;
-// never bridge a sustained DTX interval.
+// Subtype-2 RPC uses one phase per four slots. Metric reuse must not bridge a DTX interval.
 const HRPD_RPC_MAX_REUSED_METRIC_AGE_SLOTS: u32 = 3;
-// Slots the per-slot loop predicts ahead, and the absolute-slot offset it
-// schedules the RPC bit into the future. This mirrors the RC3 inner loop's
-// 12-PCG lookahead: fit a recent measured metric trend, extrapolate it to the
-// TX air time, then make the HRPD RPC decision against that predicted metric.
-const HRPD_RPC_TX_LEAD_SLOTS: u64 = 12;
-const HRPD_RPC_PREDICTION_CLAMP_DB: f32 = 1.0;
+const HRPD_RPC_TX_LEAD_SLOTS: u64 = 8;
 const DRC_MID_SLOT_OFFSET_CHIPS: u64 = (DRC_CHIPS_PER_SLOT / 2) as u64;
 const DRC_EVENT_MIN_CONFIDENCE: f32 = 4.0;
 const FAST_DRC_MIN_CONFIRMED_REPETITIONS: u8 = 2;
-// RPC controls one AT's pilot power, so its brake and hard ceiling use that
-// AT's despread coherent pilot power. Carrier-wide input power cannot identify
-// which AT should move and remains diagnostic-only.
-const HRPD_RPC_MOBILE_BRAKE_BEGIN_DBFS: f32 = -45.0;
-const HRPD_RPC_MOBILE_BRAKE_FULL_DBFS: f32 = -28.0;
-const HRPD_RPC_MOBILE_BRAKE_MAX_OFFSET_DB: f32 = 10.0;
+// Carrier-wide input power cannot identify which AT should move.
 const HRPD_RPC_MOBILE_HARD_LIMIT_DBFS: f32 = -24.0;
 const HRPD_RPC_MOBILE_HARD_RELEASE_DBFS: f32 = -30.0;
 const HRPD_RPC_MOBILE_LIMIT_COOLDOWN_SLOTS: u8 = 12;
-// General raw-power EMA is retained only for receiver diagnostics. The mobile
-// brake uses a separate fast-attack / slow-release EMA.
 const HRPD_RPC_RAW_FILTER_ALPHA: f32 = 0.05;
-const HRPD_RPC_BRAKE_ATTACK_ALPHA: f32 = 1.0 / 40.0;
-const HRPD_RPC_BRAKE_RELEASE_ALPHA: f32 = 1.0 / 16.0;
-// Diagnostic-only: count slots whose instantaneous raw input approaches ADC
-// full scale. Carrier-wide power never drives an RPC decision.
 const HRPD_RPC_RAW_HOT_DIAG_DBFS: f32 = -6.0;
-// Slot-rate SINR history depth for the least-squares level estimate. Keep this
-// short: HRPD RPC lands about 12 slots after measurement, so a long history makes
-// the controller chase stale fades and overshoots.
+// The clip guard only acts when the input sits within this AT's own data-to-pilot range above its pilot.
+const HRPD_RPC_RAW_HOT_HOLD_DBFS: f32 = -20.0;
+const HRPD_RPC_RAW_ATTRIBUTION_MAX_DB: f32 = 30.0;
+// Reverse data leaking into the per-slot pilot residual tracks the AT's own power, so the floor is learned only from null-RRI sub-frames.
+const HRPD_RPC_NOISE_FLOOR_RISE_ALPHA: f32 = 1.0 / 32.0;
+const HRPD_RPC_NOISE_FLOOR_FALL_ALPHA: f32 = 1.0 / 8.0;
+const HRPD_RPC_PENDING_NOISE_SLOTS: usize = 64;
 const HRPD_RPC_METRIC_HISTORY_LEN: usize = 12;
 const HRPD_RPC_HOLD_BAND_DB: f32 = 0.5;
 const HRPD_RPC_RESPONSE_GAIN_DB_PER_DB: f32 = 0.6;
-// Limit the maximum net drive even for a large error. A full same-direction
-// slot burst can walk the AT tens of dB in a few hundred ms; live HRPD traces
-// show that is enough to drop the reverse pilot before the loop recovers.
+// Unbounded same-direction commands can saturate AT power before delayed feedback returns.
 const HRPD_RPC_DESIRED_STEP_CLAMP_DB: f32 = 0.25;
 const HRPD_RPC_RESIDUAL_CLAMP_DB: f32 = 1.0;
 const HRPD_RPC_DIRECTION_GUARD_DB: f32 = 2.0;
@@ -268,49 +233,32 @@ impl CorrelationStats {
     }
 }
 
-/// Per-slot reverse power-control loop. The reliable path keeps the RC3-style
-/// lookahead predictor: a least-squares trend over recent slot metrics, clamped
-/// extrapolation across the RX→TX command lead, then the shared delta-sigma
-/// one-bit quantizer. A latest-slot direction guard only overrides stale
-/// prediction sign conflicts; when the latest slot and prediction agree, the
-/// quantizer still limits the net correction rate. An unmeasurable pilot holds
-/// net-neutral: live subtype-3 DTX intervals do not respond to RPC, and blind
-/// UP drive during each gap accumulates on the next active burst.
+/// Missing pilot measurements require net-neutral commands because DTX can silence the AT.
 pub(super) struct HrpdRpcController {
     target_db: f32,
-    /// Slot-rate pilot SINR history (oldest..=newest), least-squares smoothed
-    /// into the current level estimate.
     metric_history: VecDeque<f32>,
-    /// Last emitted bit (0=up, 1=down).
     last_bit: u8,
-    /// Toggles the net-neutral hold bit while the pilot metric is unavailable.
     recovery_alt: u8,
-    /// Diagnostics for the periodic summary line.
     last_level_db: f32,
     last_measured_level_db: f32,
-    last_predicted_level_db: Option<f32>,
-    last_prediction_delta_db: f32,
-    last_slope_db_per_slot: f32,
+    last_control_level_db: Option<f32>,
+    last_slope_db_per_observation: f32,
     power_residual_db: f32,
     quiet_reliable_raw_power_dbfs: f32,
-    /// Per-mobile pilot power paired with the newest reliable quality metric.
     last_reliable_mobile_power_dbfs: f32,
-    /// General EMA of raw reverse power for diagnostics only.
     filtered_raw_power_dbfs: Option<f32>,
-    /// Fast-attack / slow-release EMA of assigned-mobile pilot power.
-    brake_filtered_mobile_power_dbfs: Option<f32>,
-    /// Slots remaining in the per-mobile hard-limit cooldown.
+    last_raw_power_dbfs: f32,
+    noise_floor_db: f32,
+    pending_noise: VecDeque<(u64, f32)>,
     mobile_limit_cooldown_slots: u8,
-    /// Per-mobile hard limiter latch with power hysteresis.
     mobile_hard_limiter_active: bool,
-    /// True when the current slot exceeded the assigned-mobile hard ceiling.
     current_mobile_over_limit: bool,
-    last_brake_offset_db: f32,
     slots_since_log: u32,
     up_bits: u32,
     down_bits: u32,
     metric_holds: u32,
     raw_hot_slots: u32,
+    raw_limit_downs: u32,
     mobile_limit_downs: u32,
     unreliable: u32,
     envelope_rejects: u32,
@@ -352,22 +300,23 @@ impl HrpdRpcController {
             last_bit: 0,
             recovery_alt: 0,
             last_level_db: f32::NAN,
-            last_predicted_level_db: None,
-            last_prediction_delta_db: 0.0,
-            last_slope_db_per_slot: 0.0,
+            last_control_level_db: None,
+            last_slope_db_per_observation: 0.0,
             quiet_reliable_raw_power_dbfs: f32::NAN,
             last_reliable_mobile_power_dbfs: f32::NAN,
             filtered_raw_power_dbfs: None,
-            brake_filtered_mobile_power_dbfs: None,
+            last_raw_power_dbfs: f32::NAN,
+            noise_floor_db: f32::NAN,
+            pending_noise: VecDeque::with_capacity(HRPD_RPC_PENDING_NOISE_SLOTS),
             mobile_limit_cooldown_slots: 0,
             mobile_hard_limiter_active: false,
             current_mobile_over_limit: false,
-            last_brake_offset_db: 0.0,
             slots_since_log: 0,
             up_bits: 0,
             down_bits: 0,
             metric_holds: 0,
             raw_hot_slots: 0,
+            raw_limit_downs: 0,
             mobile_limit_downs: 0,
             unreliable: 0,
             envelope_rejects: 0,
@@ -449,6 +398,7 @@ impl HrpdRpcController {
         self.down_bits = 0;
         self.metric_holds = 0;
         self.raw_hot_slots = 0;
+        self.raw_limit_downs = 0;
         self.mobile_limit_downs = 0;
         self.unreliable = 0;
         self.envelope_rejects = 0;
@@ -476,9 +426,6 @@ impl HrpdRpcController {
         bit
     }
 
-    /// Ingest one measured slot's pilot SINR; returns the RC3-style predicted
-    /// control metric when the slot is reliable, else `None` (pilot lost or the
-    /// pilot was unavailable or changed amplitude within the observation.
     #[cfg(test)]
     pub(super) fn ingest(&mut self, snr_db: f32, coherence: f32) -> Option<f32> {
         self.ingest_with_amplitude_step(snr_db, coherence, 0.0)
@@ -506,24 +453,71 @@ impl HrpdRpcController {
             }
             self.metric_history.push_back(snr_db);
             let (intercept_at_now, slope) = lsq_intercept_and_slope_at_newest(&self.metric_history);
-            let predicted = predict_ahead_clamped(
-                intercept_at_now,
-                slope,
-                HRPD_RPC_TX_LEAD_SLOTS as f32,
-                HRPD_RPC_PREDICTION_CLAMP_DB,
-            );
             self.last_level_db = intercept_at_now;
-            self.last_predicted_level_db = Some(predicted);
-            self.last_prediction_delta_db = predicted - intercept_at_now;
-            self.last_slope_db_per_slot = slope;
+            self.last_control_level_db = Some(intercept_at_now);
+            self.last_slope_db_per_observation = slope;
             self.last_reliable_metric_age_slots = 0;
-            Some(predicted)
+            Some(intercept_at_now)
         } else {
             self.unreliable = self.unreliable.saturating_add(1);
             self.last_reliable_metric_age_slots =
                 self.last_reliable_metric_age_slots.saturating_add(1);
             None
         }
+    }
+
+    fn control_snr_db(&self, moments: PilotMoments) -> f32 {
+        if self.noise_floor_db.is_finite() {
+            mobile_pilot_power_dbfs(moments) - self.noise_floor_db
+        } else {
+            moments.rc3_sinr_db
+        }
+    }
+
+    fn queue_noise_candidate(&mut self, slot: u64, moments: PilotMoments) {
+        let noise_db = mobile_pilot_power_dbfs(moments) - moments.rc3_sinr_db;
+        if !noise_db.is_finite() {
+            return;
+        }
+        if self.pending_noise.len() == HRPD_RPC_PENDING_NOISE_SLOTS {
+            self.pending_noise.pop_front();
+        }
+        self.pending_noise.push_back((slot, noise_db));
+    }
+
+    pub(super) fn commit_subframe_noise(&mut self, start_slot: u64, data_active: bool) {
+        let end_slot = start_slot + HRPD_SUBFRAME_SLOTS as u64;
+        while let Some(&(slot, noise_db)) = self.pending_noise.front() {
+            if slot >= end_slot {
+                break;
+            }
+            self.pending_noise.pop_front();
+            if slot < start_slot || data_active {
+                continue;
+            }
+            self.noise_floor_db = if self.noise_floor_db.is_finite() {
+                let alpha = if noise_db < self.noise_floor_db {
+                    HRPD_RPC_NOISE_FLOOR_FALL_ALPHA
+                } else {
+                    HRPD_RPC_NOISE_FLOOR_RISE_ALPHA
+                };
+                self.noise_floor_db + alpha * (noise_db - self.noise_floor_db)
+            } else {
+                noise_db
+            };
+        }
+    }
+
+    fn raw_input_hot_from_mobile(&self, mobile_power_dbfs: f32) -> bool {
+        let raw = self
+            .filtered_raw_power_dbfs
+            .map_or(self.last_raw_power_dbfs, |filtered| {
+                filtered.max(self.last_raw_power_dbfs)
+            });
+        raw.is_finite()
+            && mobile_power_dbfs.is_finite()
+            && raw >= HRPD_RPC_RAW_HOT_HOLD_DBFS
+            && raw - mobile_power_dbfs <= HRPD_RPC_RAW_ATTRIBUTION_MAX_DB
     }
 
     fn control_level(&mut self, current: Option<f32>) -> Option<f32> {
@@ -535,14 +529,9 @@ impl HrpdRpcController {
         {
             return None;
         }
-        let predicted = self.last_predicted_level_db?;
+        let level = self.last_control_level_db?;
         self.reused_metric_controls = self.reused_metric_controls.saturating_add(1);
-        Some(predict_ahead_clamped(
-            predicted,
-            self.last_slope_db_per_slot,
-            self.last_reliable_metric_age_slots as f32,
-            HRPD_RPC_PREDICTION_CLAMP_DB,
-        ))
+        Some(level)
     }
 
     fn control_mobile_power(&self, current: Option<f32>, current_mobile_power_dbfs: f32) -> f32 {
@@ -563,17 +552,12 @@ impl HrpdRpcController {
         bit
     }
 
-    fn compute_metric_bit_with_offset(
-        &mut self,
-        level_db: Option<f32>,
-        level_offset_db: f32,
-    ) -> u8 {
+    fn compute_metric_bit(&mut self, level_db: Option<f32>) -> u8 {
         match level_db {
             Some(level) => {
-                let error_db = self.target_db - (level + level_offset_db);
+                let error_db = self.target_db - level;
                 if self.last_measured_level_db.is_finite() {
-                    let latest_error_db =
-                        self.target_db - (self.last_measured_level_db + level_offset_db);
+                    let latest_error_db = self.target_db - self.last_measured_level_db;
                     if latest_error_db >= HRPD_RPC_DIRECTION_GUARD_DB
                         && error_db < -HRPD_RPC_HOLD_BAND_DB
                     {
@@ -597,20 +581,17 @@ impl HrpdRpcController {
         }
     }
 
-    /// Emit one RPC bit (0=up, 1=down). A reliable level commands toward target
-    /// using the RC3-style predicted control metric. A lost pilot holds
-    /// net-neutral because raw power cannot distinguish a fade from DTX.
     #[cfg(test)]
     pub(super) fn emit(&mut self, level_db: Option<f32>) -> u8 {
-        let bit = self.compute_metric_bit_with_offset(level_db, 0.0);
+        let bit = self.compute_metric_bit(level_db);
         self.record_emit(bit)
     }
 
-    /// Record carrier-wide reverse input power for diagnostics only.
     pub(super) fn observe_raw_power(&mut self, raw_power_dbfs: f32) {
         if !raw_power_dbfs.is_finite() {
             return;
         }
+        self.last_raw_power_dbfs = raw_power_dbfs;
         self.filtered_raw_power_dbfs = Some(match self.filtered_raw_power_dbfs {
             Some(prev) => prev + HRPD_RPC_RAW_FILTER_ALPHA * (raw_power_dbfs - prev),
             None => raw_power_dbfs,
@@ -621,8 +602,6 @@ impl HrpdRpcController {
         }
     }
 
-    /// Record the assigned AT's coherent pilot power for brake and ceiling
-    /// decisions. The AT's PN and long-code mask isolate this measurement.
     pub(super) fn observe_mobile_power(&mut self, mobile_power_dbfs: f32) {
         if !mobile_power_dbfs.is_finite() {
             self.current_mobile_over_limit = false;
@@ -631,17 +610,6 @@ impl HrpdRpcController {
             }
             return;
         }
-        self.brake_filtered_mobile_power_dbfs = Some(match self.brake_filtered_mobile_power_dbfs {
-            Some(prev) => {
-                let alpha = if mobile_power_dbfs > prev {
-                    HRPD_RPC_BRAKE_ATTACK_ALPHA
-                } else {
-                    HRPD_RPC_BRAKE_RELEASE_ALPHA
-                };
-                prev + alpha * (mobile_power_dbfs - prev)
-            }
-            None => mobile_power_dbfs,
-        });
         self.current_mobile_over_limit = mobile_power_dbfs >= HRPD_RPC_MOBILE_HARD_LIMIT_DBFS;
         if self.current_mobile_over_limit {
             self.mobile_limit_cooldown_slots = HRPD_RPC_MOBILE_LIMIT_COOLDOWN_SLOTS;
@@ -674,34 +642,12 @@ impl HrpdRpcController {
         }
     }
 
-    /// Per-mobile brake offset subtracted from the RPC error, ramping 0→max as
-    /// pilot power crosses `BRAKE_BEGIN`→`BRAKE_FULL`. Keyed on
-    /// `max(brake_filtered, instant)` so one hot burst engages it immediately.
-    fn brake_offset_db(&self, instant_mobile_dbfs: f32) -> f32 {
-        let braked = match self.brake_filtered_mobile_power_dbfs {
-            Some(f) if instant_mobile_dbfs.is_finite() => f.max(instant_mobile_dbfs),
-            Some(f) => f,
-            None if instant_mobile_dbfs.is_finite() => instant_mobile_dbfs,
-            None => return 0.0,
-        };
-        if braked <= HRPD_RPC_MOBILE_BRAKE_BEGIN_DBFS {
-            return 0.0;
-        }
-        let span = HRPD_RPC_MOBILE_BRAKE_FULL_DBFS - HRPD_RPC_MOBILE_BRAKE_BEGIN_DBFS;
-        let frac = ((braked - HRPD_RPC_MOBILE_BRAKE_BEGIN_DBFS) / span).clamp(0.0, 1.0);
-        HRPD_RPC_MOBILE_BRAKE_MAX_OFFSET_DB * frac
-    }
-
-    /// Emit one RPC bit (0=up, 1=down). Pilot SINR controls toward target while
-    /// assigned-mobile pilot power applies the soft brake and hard ceiling.
+    /// RPC bit 0 requests more power, bit 1 requests less power.
     pub(super) fn emit_with_mobile_power(
         &mut self,
         level_db: Option<f32>,
         mobile_power_dbfs: f32,
     ) -> u8 {
-        let brake = self.brake_offset_db(mobile_power_dbfs);
-        self.last_brake_offset_db = brake;
-
         if self.current_mobile_over_limit
             || mobile_power_dbfs >= HRPD_RPC_MOBILE_HARD_LIMIT_DBFS
             || self.mobile_limit_cooldown_slots > 0
@@ -711,15 +657,17 @@ impl HrpdRpcController {
             self.power_residual_db = 0.0;
             return self.record_emit(1);
         }
+        if self.raw_input_hot_from_mobile(mobile_power_dbfs) {
+            self.raw_limit_downs = self.raw_limit_downs.saturating_add(1);
+            self.power_residual_db = 0.0;
+            return self.record_emit(1);
+        }
 
         if let Some(level) = level_db {
-            // Brake lowers the effective setpoint as mobile pilot power rises.
-            let bit = self.compute_metric_bit_with_offset(Some(level), brake);
+            let bit = self.compute_metric_bit(Some(level));
             return self.record_emit(bit);
         }
 
-        // Metric loss is ambiguous because subtype-3 DTX does not respond to
-        // RPC during silent intervals. Hold until a coherent metric returns.
         self.metric_holds = self.metric_holds.saturating_add(1);
         let bit = self.hold_neutral_bit();
         self.record_emit(bit)
@@ -818,11 +766,7 @@ pub struct HrpdReverseTrafficFinger {
     timing_reacquire_search_wait_slots: u32,
     timing_reacquire_search_interval_slots: u32,
     timing_last_pilot_reliable: bool,
-    /// Per-slot reverse power-control loop (predictor + HRPD RPC decision).
     rpc: HrpdRpcController,
-    /// Low-latency DRC publisher. The frame-rate DRC processor still fills
-    /// diagnostic tags, but scheduler-facing DRC cannot wait for a full
-    /// 16-slot reverse traffic frame.
     fast_drc_decoder: DrcDecoder,
     fast_drc_candidate_slot: Option<u64>,
     fast_drc_candidate_value: Option<u8>,
@@ -840,20 +784,13 @@ pub struct HrpdReverseTrafficFinger {
     /// Absolute chip of the next slot the per-slot RPC loop will measure. Runs
     /// ahead of the frame data cursor so RPC tracks at slot rate.
     next_rpc_slot_chip: u64,
-    /// Absolute chip of the next 4-slot sub-frame boundary the subtype-3
-    /// reverse data path will despread. Aligned to
-    /// (T − FrameOffset) mod 4 = 0.
+    /// Absolute chip boundary whose slot satisfies (T - FrameOffset) mod 4 = 0.
     next_subframe_chip: u64,
-    /// Per-interlace HARQ packet accumulation for subtype-3 sessions.
     subframe_harq: SubframeHarq,
-    /// Parallel HARQ state for inverted-Q data while subtype-3 data polarity
-    /// is still unknown. B4 modulation puts the code symbol on the Q branch
-    /// with the I branch all zeros (C.S0024-A §13.2.1.3.9.1), so only the two
-    /// Q polarities are probed; the acquired `q_sign` is pilot-blind, so which
-    /// one is correct is resolved from the data and CRC-24, then locked.
+    reverse_data_ordering: ReverseDataOrdering,
+    /// C.S0024-A §13.2.1.3.9.1 places B4 data on Q. Pilot acquisition does not determine Q polarity.
     subframe_harq_inverted_q: SubframeHarq,
-    /// Parallel HARQ state for non-B4 data transform probes. RRI stays on the
-    /// derotated pilot reference; only the data-channel symbols are probed.
+    /// Probe only data-channel transforms. RRI must retain pilot-referenced phase.
     subframe_harq_data_transforms: [SubframeHarq; SUBTYPE2_DATA_TRANSFORM_COUNT],
     /// Rolling decode counters for the subtype-3 subframe path.
     subframe_stats: SubframeDecodeStats,
@@ -1016,6 +953,7 @@ impl HrpdReverseTrafficFinger {
                 frame_offset_slots,
             ),
             subframe_harq: SubframeHarq::new(),
+            reverse_data_ordering: ReverseDataOrdering::default(),
             subframe_harq_inverted_q: SubframeHarq::new(),
             subframe_harq_data_transforms: std::array::from_fn(|_| SubframeHarq::new()),
             subframe_stats: SubframeDecodeStats::default(),
@@ -1516,6 +1454,8 @@ impl HrpdReverseTrafficFinger {
             );
             self.next_subframe_chip = start_chip + subframe_chips as u64;
             let start_slot = start_chip / HRPD_SLOT_CHIPS as u64;
+            self.reverse_data_ordering.expire(start_slot);
+            self.flush_reverse_data();
             let Some(mut chips) = despread else {
                 self.subframe_stats.total = self.subframe_stats.total.saturating_add(1);
                 self.subframe_stats.no_rri = self.subframe_stats.no_rri.saturating_add(1);
@@ -1595,6 +1535,8 @@ impl HrpdReverseTrafficFinger {
                 self.subframe_stats.non_null_rri =
                     self.subframe_stats.non_null_rri.saturating_add(1);
             }
+            self.rpc
+                .commit_subframe_noise(start_slot, !is_rri_subtype2_null(&detection));
             let outcome = if is_rri_subtype2_null(&detection) {
                 self.ingest_null_subframe(start_slot, &detection)
             } else if let Some(format) =
@@ -1604,6 +1546,7 @@ impl HrpdReverseTrafficFinger {
             } else {
                 self.ingest_unsupported_subframe(start_slot, &detection)
             };
+            self.reverse_data_ordering.observe(start_slot, &outcome);
             for terminal in &outcome.terminal_packets {
                 self.report_terminal_packet(*terminal);
             }
@@ -1678,14 +1621,30 @@ impl HrpdReverseTrafficFinger {
                         for event in &mut events {
                             if let HrpdTrafficEvent::Stream1Packet {
                                 air_frame_end_received_at: event_air_time,
+                                sequence,
+                                payload,
                                 ..
                             } = event
                             {
                                 *event_air_time = air_frame_end_received_at;
+                                trace!(
+                                    "rx_hrpd_traffic[m{}]: reverse_rlp_decoded uati=0x{:08x} start_slot={} subpacket={} sequence={} octets={}",
+                                    self.config.mac_index,
+                                    self.config.uati,
+                                    start_slot,
+                                    outcome.subpacket_id,
+                                    sequence,
+                                    payload.len(),
+                                );
                             }
                         }
-                        if let Some(tx) = self.config.event_tx.as_ref() {
-                            for event in events {
+                        for event in events {
+                            if matches!(event, HrpdTrafficEvent::Stream1Packet { .. }) {
+                                self.reverse_data_ordering.push(
+                                    outcome.first_subpacket_start_slot.unwrap_or(start_slot),
+                                    event,
+                                );
+                            } else if let Some(tx) = self.config.event_tx.as_ref() {
                                 let _ = tx.send(event);
                             }
                         }
@@ -1702,7 +1661,28 @@ impl HrpdReverseTrafficFinger {
                     }
                 }
             }
+            self.flush_reverse_data();
             self.maybe_report_subframe_stats(start_slot);
+        }
+    }
+
+    fn flush_reverse_data(&mut self) {
+        while let Some(event) = self.reverse_data_ordering.pop_ready() {
+            if let HrpdTrafficEvent::Stream1Packet {
+                sequence, payload, ..
+            } = &event
+            {
+                trace!(
+                    "rx_hrpd_traffic[m{}]: reverse_rlp_delivery uati=0x{:08x} sequence={} octets={}",
+                    self.config.mac_index,
+                    self.config.uati,
+                    sequence,
+                    payload.len(),
+                );
+            }
+            if let Some(tx) = self.config.event_tx.as_ref() {
+                let _ = tx.send(event);
+            }
         }
     }
 
@@ -2197,7 +2177,7 @@ impl HrpdReverseTrafficFinger {
         match &self.config.event_tx {
             Some(tx) => match tx.send(event) {
                 Ok(()) => warn!(
-                    "rx_hrpd_traffic[m{}]: reverse pilot lost uati=0x{:08x} last_good_chip={} lost_at_chip={} lost_ms={} last_coh={:.3} last_snr={:.2}dB current_coh={:.3} current_snr={:.2}dB rpc_unreliable_streak_slots={} rpc_unreliable_start_slot={:?} rpc_raw_ref={:.1}dBFS rpc_pred_delta={:+.2}dB rpc_slope={:+.3}dB/slot; sent AN event",
+                    "rx_hrpd_traffic[m{}]: reverse pilot lost uati=0x{:08x} last_good_chip={} lost_at_chip={} lost_ms={} last_coh={:.3} last_snr={:.2}dB current_coh={:.3} current_snr={:.2}dB rpc_unreliable_streak_slots={} rpc_unreliable_start_slot={:?} rpc_raw_ref={:.1}dBFS rpc_slope={:+.3}dB/observation; sent AN event",
                     self.config.mac_index,
                     self.config.uati,
                     self.last_good_pilot_chip,
@@ -2210,8 +2190,7 @@ impl HrpdReverseTrafficFinger {
                     self.rpc_unreliable_streak_slots,
                     self.rpc_unreliable_start_slot,
                     self.rpc.quiet_reliable_raw_power_dbfs,
-                    self.rpc.last_prediction_delta_db,
-                    self.rpc.last_slope_db_per_slot,
+                    self.rpc.last_slope_db_per_observation,
                 ),
                 Err(err) => warn!(
                     "rx_hrpd_traffic[m{}]: reverse pilot lost uati=0x{:08x} last_good_chip={} lost_at_chip={} but AN event send failed: {}",
@@ -2310,7 +2289,7 @@ impl HrpdReverseTrafficFinger {
             }
             if self.rpc_unreliable_streak_slots > 0 && self.rpc_unreliable_reported {
                 info!(
-                    "rx_hrpd_traffic[m{}]: rpc_recovered uati=0x{:08x} measured_slot={} previous_start_slot={:?} previous_slots={} coh={:.3} projected_snr={:.2}dB pilot_sinr={:.2}dB fitted={:.2}dB pred={:.2}dB pred_delta={:+.2}dB slope={:+.3}dB/slot residual={:+.2}dB raw={:.1}dBFS raw_ref={:.1}dBFS",
+                    "rx_hrpd_traffic[m{}]: rpc_recovered uati=0x{:08x} measured_slot={} previous_start_slot={:?} previous_slots={} coh={:.3} projected_snr={:.2}dB pilot_sinr={:.2}dB fitted={:.2}dB control={:.2}dB slope={:+.3}dB/observation residual={:+.2}dB raw={:.1}dBFS raw_ref={:.1}dBFS",
                     self.config.mac_index,
                     self.config.uati,
                     measured_slot,
@@ -2321,8 +2300,7 @@ impl HrpdReverseTrafficFinger {
                     moments.rc3_sinr_db,
                     self.rpc.last_level_db,
                     level_db.unwrap_or(f32::NAN),
-                    self.rpc.last_prediction_delta_db,
-                    self.rpc.last_slope_db_per_slot,
+                    self.rpc.last_slope_db_per_observation,
                     self.rpc.power_residual_db,
                     raw_power_dbfs,
                     self.rpc.quiet_reliable_raw_power_dbfs,
@@ -2356,7 +2334,7 @@ impl HrpdReverseTrafficFinger {
             .saturating_mul(1000)
             / HRPD_CHIP_RATE_HZ;
         warn!(
-            "rx_hrpd_traffic[m{}]: rpc_unreliable_streak uati=0x{:08x} start_slot={:?} measured_slot={} slots={} last_good_age_ms={} coh={:.3} projected_snr={:.2}dB pilot_sinr={:.2}dB amp_step={:.2}dB raw={:.1}dBFS raw_ref={:.1}dBFS latest={:.2}dB fitted={:.2}dB pred_delta={:+.2}dB slope={:+.3}dB/slot residual={:+.2}dB",
+            "rx_hrpd_traffic[m{}]: rpc_unreliable_streak uati=0x{:08x} start_slot={:?} measured_slot={} slots={} last_good_age_ms={} coh={:.3} projected_snr={:.2}dB pilot_sinr={:.2}dB amp_step={:.2}dB raw={:.1}dBFS raw_ref={:.1}dBFS latest={:.2}dB fitted={:.2}dB slope={:+.3}dB/observation residual={:+.2}dB",
             self.config.mac_index,
             self.config.uati,
             self.rpc_unreliable_start_slot,
@@ -2371,20 +2349,13 @@ impl HrpdReverseTrafficFinger {
             self.rpc.quiet_reliable_raw_power_dbfs,
             self.rpc.last_measured_level_db,
             self.rpc.last_level_db,
-            self.rpc.last_prediction_delta_db,
-            self.rpc.last_slope_db_per_slot,
+            self.rpc.last_slope_db_per_observation,
             self.rpc.power_residual_db,
         );
         self.rpc_unreliable_reported = true;
     }
 
-    /// Run the per-slot reverse power-control loop over every buffered slot that
-    /// is now fully available. Each slot's W0 pilot region is despread on its own
-    /// — independent of the frame-rate data despread — so the RPC bit reflects a
-    /// slot-fresh SINR. The controller predicts across the RX→TX slot delay and
-    /// converts the result into one bit scheduled
-    /// `HRPD_RPC_TX_LEAD_SLOTS` ahead. This runs ahead of the frame data cursor
-    /// and only reads the shared IQ buffer; the frame loop owns draining it.
+    // The frame loop owns buffer draining, so RPC can read ahead without consuming samples.
     fn process_pending_rpc_slots(&mut self) {
         let Some(bus) = self.config.harq_bus.clone() else {
             return;
@@ -2537,14 +2508,16 @@ impl HrpdReverseTrafficFinger {
             }
             let mobile_power_dbfs = mobile_pilot_power_dbfs(moments);
             self.rpc.observe_mobile_power(mobile_power_dbfs);
+            let control_snr_db = self.rpc.control_snr_db(moments);
             let level = self.rpc.ingest_with_amplitude_step(
-                moments.rc3_sinr_db,
+                control_snr_db,
                 moments.coherence,
                 moments.pilot_amplitude_step_db,
             );
             if level.is_some() {
                 self.rpc.observe_reliable_raw_power(raw_power_dbfs);
                 self.rpc.observe_reliable_mobile_power(mobile_power_dbfs);
+                self.rpc.queue_noise_candidate(measured_slot, moments);
             }
 
             let scheduled_slot = measured_slot + HRPD_RPC_TX_LEAD_SLOTS;
@@ -2581,7 +2554,7 @@ impl HrpdReverseTrafficFinger {
                 scheduled_rpc_bit.filter(|_| hrpd_rpc_control_verbose())
             {
                 debug!(
-                    "rx_hrpd_traffic[m{}]: rpc_control uati=0x{:08x} measured_slot={} scheduled_slot={} rpc_bit={} target={:.1}dB metric_coh={:.3} amp_step={:.2}dB projected_snr={:.2}dB metric_sinr={:.2}dB latest_sinr={:.2}dB fitted={:.2}dB pred={:.2}dB pred_delta={:+.2}dB slope={:+.3}dB/slot residual={:+.2}dB brake={:.2}dB limit_cd={} mobile_lim={} delay={}+{:+.2} raw={:.1}dBFS mobile={:.1}dBFS control_mobile={:.1}dBFS mobile_ref={:.1}dBFS up_bits={} down_bits={} metric_holds={} raw_hot={} mobile_limit_downs={} unreliable={}",
+                    "rx_hrpd_traffic[m{}]: rpc_control uati=0x{:08x} measured_slot={} scheduled_slot={} rpc_bit={} target={:.1}dB metric_coh={:.3} amp_step={:.2}dB projected_snr={:.2}dB metric_sinr={:.2}dB latest_sinr={:.2}dB fitted={:.2}dB control={:.2}dB slope={:+.3}dB/observation residual={:+.2}dB limit_cd={} mobile_lim={} delay={}+{:+.2} raw={:.1}dBFS mobile={:.1}dBFS control_mobile={:.1}dBFS mobile_ref={:.1}dBFS up_bits={} down_bits={} metric_holds={} raw_hot={} mobile_limit_downs={} unreliable={}",
                     self.config.mac_index,
                     self.config.uati,
                     measured_slot,
@@ -2594,13 +2567,9 @@ impl HrpdReverseTrafficFinger {
                     moments.rc3_sinr_db,
                     self.rpc.last_measured_level_db,
                     self.rpc.last_level_db,
-                    level
-                        .or(self.rpc.last_predicted_level_db)
-                        .unwrap_or(f32::NAN),
-                    self.rpc.last_prediction_delta_db,
-                    self.rpc.last_slope_db_per_slot,
+                    level.or(self.rpc.last_control_level_db).unwrap_or(f32::NAN),
+                    self.rpc.last_slope_db_per_observation,
                     self.rpc.power_residual_db,
-                    self.rpc.last_brake_offset_db,
                     self.rpc.mobile_limit_cooldown_slots,
                     self.rpc.mobile_hard_limiter_active as u8,
                     self.next_params.sample_delay,
@@ -2624,7 +2593,7 @@ impl HrpdReverseTrafficFinger {
                     .as_ref()
                     .map_or((0, 0), |bus| bus.rpc_lookup_stats(self.config.mac_index));
                 debug!(
-                    "rx_hrpd_traffic[m{}]: rpc_summary uati=0x{:08x} slots={} target_pilot_sinr={:.1}dB avg_projected_snr={:.2}dB min_projected_snr={:.2}dB max_projected_snr={:.2}dB avg_coh={:.3} min_coh={:.3} max_coh={:.3} clean_n={} clean_projected_snr={:.2}dB clean_pilot_sinr={:.2}dB clean_coh={:.3} clean_raw={:.1}dBFS clean_pilot_power={:.1}dBFS clean_corr_snr_raw={:.3} clean_corr_pilot_sinr_raw={:.3} clean_corr_pilot_sinr_power={:.3} latest_sinr={:.2}dB fitted={:.2}dB pred={:.2}dB pred_delta={:+.2}dB slope={:+.3}dB/slot residual={:+.2}dB brake={:.2}dB filt_raw={:.1}dBFS filt_mobile={:.1}dBFS delay={}+{:+.2} raw={:.1}dBFS mobile={:.1}dBFS mobile_ref={:.1}dBFS raw_ref={:.1}dBFS up_bits={} down_bits={} metric_holds={} raw_hot={} mobile_limit_downs={} unreliable={} envelope_rejects={} reused_controls={} metric_age={} tx_sched_hits={} tx_sched_misses={}",
+                    "rx_hrpd_traffic[m{}]: rpc_summary uati=0x{:08x} slots={} target_pilot_sinr={:.1}dB avg_projected_snr={:.2}dB min_projected_snr={:.2}dB max_projected_snr={:.2}dB avg_coh={:.3} min_coh={:.3} max_coh={:.3} clean_n={} clean_projected_snr={:.2}dB clean_pilot_sinr={:.2}dB clean_coh={:.3} clean_raw={:.1}dBFS clean_pilot_power={:.1}dBFS clean_corr_snr_raw={:.3} clean_corr_pilot_sinr_raw={:.3} clean_corr_pilot_sinr_power={:.3} latest_sinr={:.2}dB fitted={:.2}dB control={:.2}dB slope={:+.3}dB/observation residual={:+.2}dB filt_raw={:.1}dBFS delay={}+{:+.2} raw={:.1}dBFS mobile={:.1}dBFS mobile_ref={:.1}dBFS raw_ref={:.1}dBFS noise_floor={:.1}dBFS up_bits={} down_bits={} metric_holds={} raw_hot={} raw_limit_downs={} mobile_limit_downs={} unreliable={} envelope_rejects={} reused_controls={} metric_age={} tx_sched_hits={} tx_sched_misses={}",
                     self.config.mac_index,
                     self.config.uati,
                     self.rpc.slots_since_log,
@@ -2648,27 +2617,22 @@ impl HrpdReverseTrafficFinger {
                     self.rpc.clean_rc3_pilot_power.correlation(),
                     self.rpc.last_measured_level_db,
                     self.rpc.last_level_db,
-                    level
-                        .or(self.rpc.last_predicted_level_db)
-                        .unwrap_or(f32::NAN),
-                    self.rpc.last_prediction_delta_db,
-                    self.rpc.last_slope_db_per_slot,
+                    level.or(self.rpc.last_control_level_db).unwrap_or(f32::NAN),
+                    self.rpc.last_slope_db_per_observation,
                     self.rpc.power_residual_db,
-                    self.rpc.last_brake_offset_db,
                     self.rpc.filtered_raw_power_dbfs.unwrap_or(f32::NAN),
-                    self.rpc
-                        .brake_filtered_mobile_power_dbfs
-                        .unwrap_or(f32::NAN),
                     self.next_params.sample_delay,
                     self.next_params.sample_delay_fraction,
                     raw_power_dbfs,
                     mobile_power_dbfs,
                     self.rpc.last_reliable_mobile_power_dbfs,
                     self.rpc.quiet_reliable_raw_power_dbfs,
+                    self.rpc.noise_floor_db,
                     self.rpc.up_bits,
                     self.rpc.down_bits,
                     self.rpc.metric_holds,
                     self.rpc.raw_hot_slots,
+                    self.rpc.raw_limit_downs,
                     self.rpc.mobile_limit_downs,
                     self.rpc.unreliable,
                     self.rpc.envelope_rejects,
@@ -3382,7 +3346,28 @@ mod tests {
     }
 
     #[test]
-    fn lost_pilot_holds_despite_high_stale_prediction() {
+    fn rpc_controls_from_fitted_level_without_extrapolating_trends() {
+        for direction in [-1.0, 1.0] {
+            let mut rpc = HrpdRpcController::new();
+            let mut level = None;
+            let mut latest_db = 0.0;
+            for sample in 0..HRPD_RPC_METRIC_HISTORY_LEN {
+                latest_db = HRPD_RPC_TARGET_SNR_DB + direction * sample as f32 * 0.1;
+                level = rpc.ingest(latest_db, 1.0);
+            }
+            assert!((level.expect("reliable pilot") - latest_db).abs() < 0.001);
+            for _ in 0..HRPD_RPC_MAX_REUSED_METRIC_AGE_SLOTS {
+                assert!(rpc.ingest(0.0, 0.0).is_none());
+                let held = rpc.control_level(None).expect("recent fitted level");
+                assert!((held - latest_db).abs() < 0.001);
+            }
+            assert!(rpc.ingest(0.0, 0.0).is_none());
+            assert!(rpc.control_level(None).is_none());
+        }
+    }
+
+    #[test]
+    fn lost_pilot_holds_despite_high_stale_level() {
         let mut rpc = HrpdRpcController::new();
         assert!(rpc.ingest(HRPD_RPC_TARGET_SNR_DB + 4.0, 1.0).is_some());
 
@@ -3407,7 +3392,7 @@ mod tests {
 
         assert!(
             rpc.ingest(HRPD_RPC_TARGET_SNR_DB + 2.0, 0.50).is_none(),
-            "borderline-coherence pilot samples should not reset the RPC predictor"
+            "borderline-coherence pilot samples should not update the RPC level"
         );
         assert!(
             rpc.ingest(
@@ -3422,9 +3407,10 @@ mod tests {
     #[test]
     fn rpc_controller_uses_updated_outer_loop_target() {
         let mut rpc = HrpdRpcController::new();
-        rpc.set_target_db(crate::bts::hrpd::power_control::HRPD_AUTO_MAX_TARGET_DB);
+        let target_db = crate::bts::hrpd::power_control::HRPD_AUTO_MAX_TARGET_DB;
+        rpc.set_target_db(target_db);
 
-        let level = rpc.ingest(12.0, 1.0);
+        let level = rpc.ingest(target_db - 2.0, 1.0);
         assert_eq!(rpc.emit_with_mobile_power(level, -80.0), 0);
     }
 
@@ -3648,11 +3634,6 @@ mod tests {
         let level = rpc.ingest(HRPD_RPC_TARGET_SNR_DB + 8.0, 1.0);
 
         assert_eq!(
-            rpc.brake_offset_db(cold),
-            0.0,
-            "cold mobile power applies no brake"
-        );
-        assert_eq!(
             rpc.emit_with_mobile_power(level, cold),
             1,
             "an over-target metric at cold mobile power commands DOWN"
@@ -3677,60 +3658,128 @@ mod tests {
     }
 
     #[test]
-    fn rpc_mobile_brake_converts_up_to_down_before_the_ceiling() {
-        let hot_but_unclipped = HRPD_RPC_MOBILE_HARD_LIMIT_DBFS - 0.5;
-
-        // Control: the same under-target metric with cold mobile power goes UP.
-        let mut cold = HrpdRpcController::new();
-        for _ in 0..64 {
-            cold.observe_mobile_power(-50.0);
+    fn rpc_below_ceiling_is_invariant_to_receiver_gain() {
+        let levels = [
+            HRPD_RPC_TARGET_SNR_DB - 1.5,
+            HRPD_RPC_TARGET_SNR_DB,
+            HRPD_RPC_TARGET_SNR_DB + 1.5,
+        ];
+        for snr in levels {
+            let commands = |power| {
+                let mut rpc = HrpdRpcController::new();
+                (0..128)
+                    .map(|_| {
+                        rpc.observe_mobile_power(power);
+                        let level = rpc.ingest(snr, 1.0);
+                        rpc.emit_with_mobile_power(level, power)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let reference = commands(-60.0);
+            for power in [-44.0, -35.0, HRPD_RPC_MOBILE_HARD_LIMIT_DBFS - 0.5] {
+                assert_eq!(commands(power), reference, "SINR={snr} power={power}");
+            }
         }
-        let cold_level = cold.ingest(HRPD_RPC_TARGET_SNR_DB - 1.5, 1.0);
-        assert_eq!(
-            cold.emit_with_mobile_power(cold_level, -50.0),
-            0,
-            "under-target with cold mobile power commands UP"
-        );
+    }
 
-        let mut rpc = HrpdRpcController::new();
-        for _ in 0..64 {
-            rpc.observe_mobile_power(hot_but_unclipped);
+    fn pilot_moments_at(pilot_power_dbfs: f32, rc3_sinr_db: f32) -> PilotMoments {
+        let coherent_pilot_power = 10.0f32.powf(pilot_power_dbfs / 10.0);
+        PilotMoments {
+            pilot_phase: Complex32::new(1.0, 0.0),
+            next_frame_phase: Complex32::new(1.0, 0.0),
+            phase_at_frame_start_rad: 0.0,
+            phase_step_rad_per_slot: 0.0,
+            phase_ramp_valid: true,
+            coherence: 1.0,
+            snr_db: rc3_sinr_db,
+            rc3_sinr_db,
+            pilot_amplitude_step_db: 0.0,
+            coherent_pilot_power,
+            noise_pilot_power: coherent_pilot_power / 10.0f32.powf(rc3_sinr_db / 10.0),
         }
-        assert!(
-            !rpc.current_mobile_over_limit,
-            "the brake zone is below the hard limit"
-        );
-        assert!(
-            rpc.brake_offset_db(hot_but_unclipped) > 1.5,
-            "the per-mobile brake is engaged"
-        );
-        let level = rpc.ingest(HRPD_RPC_TARGET_SNR_DB - 1.5, 1.0);
-        assert_eq!(
-            rpc.emit_with_mobile_power(level, hot_but_unclipped),
-            1,
-            "the pre-clip brake converts an under-target UP to DOWN"
-        );
     }
 
     #[test]
-    fn rpc_mobile_brake_is_not_overridden_by_direction_guard() {
-        let hot_but_unclipped = HRPD_RPC_MOBILE_BRAKE_FULL_DBFS;
+    fn rpc_noise_floor_from_null_subframes_ignores_data_leakage() {
         let mut rpc = HrpdRpcController::new();
-        let level = rpc.ingest(HRPD_RPC_TARGET_SNR_DB - 5.0, 1.0);
+        let idle_pilot_dbfs = -60.0;
+        let idle_sinr_db = HRPD_RPC_TARGET_SNR_DB + 3.0;
+        let subframe = HRPD_SUBFRAME_SLOTS as u64;
+        for slot in 0..subframe {
+            let moments = pilot_moments_at(idle_pilot_dbfs, idle_sinr_db);
+            let control = rpc.control_snr_db(moments);
+            assert!((control - idle_sinr_db).abs() < 1.0e-3, "no floor yet");
+            assert!(rpc.ingest(control, moments.coherence).is_some());
+            rpc.queue_noise_candidate(slot, moments);
+        }
+        rpc.commit_subframe_noise(0, false);
+        let floor = rpc.noise_floor_db;
+        assert!((floor - (idle_pilot_dbfs - idle_sinr_db)).abs() < 1.0e-3);
 
-        assert_eq!(
-            rpc.emit_with_mobile_power(level, hot_but_unclipped),
-            1,
-            "the full mobile brake remains authoritative below a low SINR target"
+        let mut ups = 0u32;
+        let mut downs = 0u32;
+        for subframe_start in (subframe..9 * subframe).step_by(subframe as usize) {
+            for slot in subframe_start..subframe_start + subframe {
+                let moments =
+                    pilot_moments_at(idle_pilot_dbfs + 20.0, HRPD_RPC_TARGET_SNR_DB - 1.0);
+                let control = rpc.control_snr_db(moments);
+                assert!((control - (idle_sinr_db + 20.0)).abs() < 1.0e-3);
+                let level = rpc.ingest(control, moments.coherence);
+                rpc.queue_noise_candidate(slot, moments);
+                match rpc.emit_with_mobile_power(level, idle_pilot_dbfs + 20.0) {
+                    0 => ups += 1,
+                    _ => downs += 1,
+                }
+            }
+            rpc.commit_subframe_noise(subframe_start, true);
+        }
+        assert!(
+            downs > ups,
+            "a hot pilot over the floor nets DOWN: up={ups} down={downs}"
         );
+        assert_eq!(
+            rpc.noise_floor_db, floor,
+            "data sub-frames must not move the floor"
+        );
+        assert!(rpc.pending_noise.is_empty());
+    }
+
+    #[test]
+    fn rpc_stale_pending_noise_is_dropped_with_the_next_subframe() {
+        let mut rpc = HrpdRpcController::new();
+        let subframe = HRPD_SUBFRAME_SLOTS as u64;
+        rpc.queue_noise_candidate(1, pilot_moments_at(-30.0, 0.0));
+        rpc.queue_noise_candidate(subframe, pilot_moments_at(-60.0, 8.0));
+        rpc.commit_subframe_noise(subframe, false);
+        assert!((rpc.noise_floor_db - (-68.0)).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn rpc_raw_input_near_full_scale_forces_down_only_for_the_attributed_mobile() {
+        let hot_raw = HRPD_RPC_RAW_HOT_HOLD_DBFS + 1.0;
+        let own_pilot = hot_raw - HRPD_RPC_RAW_ATTRIBUTION_MAX_DB + 5.0;
+        let mut rpc = HrpdRpcController::new();
+        rpc.observe_raw_power(hot_raw);
+        let level = rpc.ingest(HRPD_RPC_TARGET_SNR_DB - 5.0, 1.0);
+        assert_eq!(rpc.emit_with_mobile_power(level, own_pilot), 1);
+        assert_eq!(rpc.raw_limit_downs, 1);
+
+        let neighbor_pilot = hot_raw - HRPD_RPC_RAW_ATTRIBUTION_MAX_DB - 5.0;
+        let mut other = HrpdRpcController::new();
+        other.observe_raw_power(hot_raw);
+        let level = other.ingest(HRPD_RPC_TARGET_SNR_DB - 5.0, 1.0);
+        assert_eq!(other.emit_with_mobile_power(level, neighbor_pilot), 0);
+        assert_eq!(other.raw_limit_downs, 0);
+
+        let mut cool = HrpdRpcController::new();
+        cool.observe_raw_power(HRPD_RPC_RAW_HOT_HOLD_DBFS - 10.0);
+        let level = cool.ingest(HRPD_RPC_TARGET_SNR_DB - 5.0, 1.0);
+        assert_eq!(cool.emit_with_mobile_power(level, own_pilot), 0);
+        assert_eq!(cool.raw_limit_downs, 0);
     }
 
     #[test]
     fn rpc_lost_metric_holds_instead_of_ramping() {
-        // Live regression: during a reverse data transfer the W0 metric is
-        // unreliable on nearly every slot. Blindly commanding UP there ramps
-        // the AT into clipping, so a lost metric with cold raw and no fade
-        // holds neutral.
         let mut rpc = HrpdRpcController::new();
         for _ in 0..24 {
             rpc.observe_raw_power(-45.0);
@@ -3750,7 +3799,7 @@ mod tests {
         }
         assert!(
             up.abs_diff(down) <= 1,
-            "a lost metric with a healthy last prediction holds neutral: up={up} down={down}"
+            "a lost metric with a healthy last measurement holds neutral: up={up} down={down}"
         );
         assert!(rpc.metric_holds >= 20);
     }

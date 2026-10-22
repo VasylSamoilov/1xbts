@@ -596,6 +596,10 @@ pub async fn spawn_hrpd_pcf_a9_service(
     let an_a8_bearer = inverted_udp_gre_bearer(pcf_config.a8_bearer, "an.a8_bearer")
         .map_err(|err| Error::from(format!("HRPD AN A8 config: {err}")))?;
     let an_a8_endpoint = cdma_a8::BearerEndpoint::new(a8_peer_ipv4, a8_local_ipv4);
+    let an_a8_port = an_a8_bearer
+        .udp_bind_addr
+        .ok_or_else(|| Error::from("an.a8_bearer requires udp_bind_addr"))?
+        .port();
     let (a10_local_ipv4, a10_peer_ipv4) =
         configured_a10_ipv4_pair(&pcf_config.a10_bearer, "pcf.a10_bearer")
             .map_err(|err| Error::from(format!("HRPD PCF A10 config: {err}")))?;
@@ -957,6 +961,7 @@ pub async fn spawn_hrpd_pcf_a9_service(
                     bearer_relay.register(
                         bearer,
                         cdma_a10::BearerSession::new(a10_session_id, a10_endpoint),
+                        SocketAddr::new(peer.ip(), an_a8_port),
                     );
                     let connect = cdma_a9::ConnectA8Message {
                         call_connection_reference: setup.call_connection_reference,
@@ -1069,6 +1074,7 @@ pub async fn spawn_hrpd_pcf_a9_service(
                 bearer_relay.register(
                     bearer,
                     cdma_a10::BearerSession::new(a10_session_id, a10_endpoint),
+                    SocketAddr::new(peer.ip(), an_a8_port),
                 );
                 match register_hrpd_a11_session(
                     &mut state.manager,

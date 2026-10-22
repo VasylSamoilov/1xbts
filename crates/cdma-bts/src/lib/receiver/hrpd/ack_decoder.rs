@@ -64,18 +64,8 @@ pub const ACK_SUBTYPE2_WALSH_SYMBOLS_PER_BIT: usize = ACK_CHIPS_PER_BIT / ACK_SU
 /// (§9.2.1.3.3.4 and Figures 9.2.1.3.1-5 / 9.2.1.3.1-6).
 pub const ACK_FORWARD_TO_REVERSE_SLOT_OFFSET: u32 = 3;
 
-/// Default gating threshold as a fraction of the reference amplitude (the
-/// frame's despread pilot amplitude). The finger's despread chips keep the
-/// raw capture amplitude — the PN/LC reference and pilot phase correction
-/// are both unit magnitude — so an absolute gate is meaningless across RF
-/// gain settings. Live AT NAKs measure ~0.16-0.25 of the despread pilot
-/// (well under the -3 dB the TCA grants, between phase error and the AT's
-/// own ACK gain choice), so the gate sits at 0.10: still ~2 sigma above
-/// integrated noise at the pilot SNRs we acquire at while keeping every
-/// observed response decodable.
 pub const ACK_DEFAULT_THRESHOLD: f32 = 0.10;
 
-/// Decoded ACK Channel symbol for one reverse slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AckSymbol {
     /// Binary '0' (ACK) -> chip `+1` -> positive real after despread.
@@ -99,6 +89,14 @@ pub struct AckDecoder {
     threshold: f32,
     walsh_index: usize,
     walsh_len: usize,
+}
+
+const ACK_MIN_STANDARD_ERRORS: f32 = 4.0;
+const PILOT_MIN_STANDARD_ERRORS: f32 = 4.0;
+
+pub(crate) struct AckObservation {
+    pub mean: Complex32,
+    standard_error: f32,
 }
 
 impl Default for AckDecoder {
@@ -162,59 +160,101 @@ impl AckDecoder {
         ACK_CHIPS_PER_BIT / self.walsh_len
     }
 
-    /// Despread the ACK Channel arm of one reverse slot and return the mean
-    /// post-despread value over the first 1024 chips. Returns `None` when
-    /// fewer than `ACK_CHIPS_PER_BIT` chips are available. The result keeps
-    /// the caller's amplitude scale: a clean ACK/NAK bit lands at ±(ACK
-    /// channel amplitude) on the real axis.
+    /// Returns the mean over the first 1024 chips in the caller's amplitude scale.
     pub fn despread_slot(&self, samples: &[Complex32]) -> Option<Complex32> {
-        if samples.len() < ACK_CHIPS_PER_BIT {
-            return None;
-        }
-        let ack_samples = &samples[..ACK_CHIPS_PER_BIT];
-
-        let decoder = build_walsh_decoder(self.walsh_len, self.walsh_index);
-
-        // `process_symbol` normalizes by Walsh length, so summing and
-        // dividing by the repetition count yields the mean post-despread
-        // value per repetition.
-        let mut acc = Complex32::new(0.0, 0.0);
-        for chunk in ack_samples.chunks_exact(self.walsh_len) {
-            acc += decoder.process_symbol(chunk);
-        }
-        Some(acc / (self.walsh_symbols_per_bit() as f32))
+        self.observe_slot(samples)
+            .map(|observation| observation.mean)
     }
 
-    /// Decode the ACK symbol for one reverse slot, gating against
-    /// `reference_amplitude` (the frame's despread pilot amplitude in the
-    /// same units as `samples`). The despread chips keep the raw capture
-    /// amplitude, so the gate must be relative to a same-frame reference —
-    /// an absolute gate silently reads everything as `Gated` at low capture
-    /// levels and as noise-driven ACK/NAK at high ones.
-    ///
-    /// `samples` must contain at least `ACK_CHIPS_PER_BIT` (1024) complex
-    /// chips starting at the slot boundary; the decoder only reads the first
-    /// 1024. The caller is responsible for selecting the correct reverse
-    /// slot (forward slot `n` -> reverse slot `n + 3`, see
-    /// [`ACK_FORWARD_TO_REVERSE_SLOT_OFFSET`]).
-    ///
-    /// Returns:
-    /// - `AckSymbol::Ack` for a transmitted binary '0' (positive I-arm).
-    /// - `AckSymbol::Nak` for a transmitted binary '1' (negative I-arm).
-    /// - `AckSymbol::Gated` if `|despread.re|` is below
-    ///   `threshold * reference_amplitude` (the AT did not transmit in this
-    ///   slot).
+    pub(crate) fn observe_slot(&self, samples: &[Complex32]) -> Option<AckObservation> {
+        self.observe_rotated_slot(samples, Complex32::new(1.0, 0.0))
+    }
+
+    pub(crate) fn observe_pilot_referenced_slot(
+        &self,
+        samples: &[Complex32],
+    ) -> Option<(AckObservation, f32)> {
+        let ack_samples = samples.get(..ACK_CHIPS_PER_BIT)?;
+        let count = self.walsh_symbols_per_bit() as f64;
+        let mut sum = Complex32::new(0.0, 0.0);
+        let mut power_sum = 0.0_f64;
+        // C.S0024-200-C §2.3.1.3.1: subtype-2 W0 pilot is continuous and orthogonal to ACK.
+        for chunk in ack_samples.chunks_exact(self.walsh_len) {
+            let pilot = chunk.iter().copied().sum::<Complex32>() / self.walsh_len as f32;
+            sum += pilot;
+            power_sum += f64::from(pilot.norm_sqr());
+        }
+        let pilot = sum / count as f32;
+        let amplitude = pilot.norm();
+        let variance =
+            (power_sum - f64::from(sum.norm_sqr()) / count).max(0.0) / (count * (count - 1.0));
+        if !amplitude.is_finite()
+            || !variance.is_finite()
+            || amplitude <= PILOT_MIN_STANDARD_ERRORS * variance.sqrt() as f32
+        {
+            return Some((
+                AckObservation {
+                    mean: Complex32::new(0.0, 0.0),
+                    standard_error: 0.0,
+                },
+                0.0,
+            ));
+        }
+        self.observe_rotated_slot(samples, pilot.conj() / amplitude)
+            .map(|observation| (observation, amplitude))
+    }
+
+    fn observe_rotated_slot(
+        &self,
+        samples: &[Complex32],
+        correction: Complex32,
+    ) -> Option<AckObservation> {
+        let ack_samples = samples.get(..ACK_CHIPS_PER_BIT)?;
+        let decoder = build_walsh_decoder(self.walsh_len, self.walsh_index);
+        let mut sum = Complex32::new(0.0, 0.0);
+        let mut real_sum = 0.0_f64;
+        let mut real_square_sum = 0.0_f64;
+        for chunk in ack_samples.chunks_exact(self.walsh_len) {
+            let symbol = decoder.process_symbol(chunk) * correction;
+            sum += symbol;
+            let real = f64::from(symbol.re);
+            real_sum += real;
+            real_square_sum += real * real;
+        }
+        let count = self.walsh_symbols_per_bit() as f64;
+        let variance_of_mean =
+            (real_square_sum - real_sum * real_sum / count).max(0.0) / (count * (count - 1.0));
+        Some(AckObservation {
+            mean: sum / count as f32,
+            standard_error: variance_of_mean.sqrt() as f32,
+        })
+    }
+
+    pub(crate) fn classify_observation(
+        &self,
+        observation: &AckObservation,
+        reference_amplitude: f32,
+    ) -> AckSymbol {
+        let noise_gate = ACK_MIN_STANDARD_ERRORS * observation.standard_error;
+        if !observation.mean.re.is_finite()
+            || !noise_gate.is_finite()
+            || observation.mean.re.abs() <= noise_gate
+        {
+            AckSymbol::Gated
+        } else {
+            self.classify(observation.mean, reference_amplitude)
+        }
+    }
+
+    /// Samples begin at the reverse-slot boundary and must include its first 1024 chips.
     pub fn decode_slot(&self, samples: &[Complex32], reference_amplitude: f32) -> AckSymbol {
-        let Some(avg) = self.despread_slot(samples) else {
+        let Some(observation) = self.observe_slot(samples) else {
             return AckSymbol::Gated;
         };
-        self.classify(avg, reference_amplitude)
+        self.classify_observation(&observation, reference_amplitude)
     }
 
-    /// Classify a mean despread value from [`Self::despread_slot`] against
-    /// `threshold * reference_amplitude`. ACK Channel is BPSK on the I arm;
-    /// `|re|` gates, the sign decides the bit (chip `+1` -> ACK, chip `-1`
-    /// -> NAK per §9.2.1.3 mapping with §9.2.1.3.3.4 binary 0=ACK / 1=NAK).
+    /// C.S0024 §9.2.1.3.3.4 maps positive I to ACK and negative I to NAK.
     pub fn classify(&self, avg: Complex32, reference_amplitude: f32) -> AckSymbol {
         // `<=` so a zero despread stays Gated even when the reference (and
         // therefore the gate) degenerates to zero.
@@ -264,6 +304,62 @@ fn build_walsh_decoder(walsh_len: usize, walsh_row: usize) -> WalshDecoder {
 mod tests {
     use super::*;
     use crate::phy::walsh::WalshGenerator;
+
+    #[test]
+    fn pilot_reference_preserves_ack_and_nak_across_phase_and_gain() {
+        let decoder = AckDecoder::for_physical_layer_subtype(2);
+        for phase in [-2.8, -1.6, 0.0, 1.7, 2.1, 3.0] {
+            for gain in [0.0001, 0.01, 1.0] {
+                for (bit, expected) in [(1.4, AckSymbol::Ack), (-1.4, AckSymbol::Nak)] {
+                    let cover = spread_ack_bit_with_cover(
+                        bit,
+                        ACK_SUBTYPE2_WALSH_LEN,
+                        usize::from(ACK_SUBTYPE2_WALSH_INDEX),
+                    );
+                    let noise = noise_seq(123, ACK_CHIPS_PER_BIT, 0.5);
+                    let rotor = Complex32::from_polar(gain, phase);
+                    let samples: Vec<_> = cover
+                        .iter()
+                        .zip(noise)
+                        .map(|(ack, noise)| (*ack + Complex32::new(1.0, 0.0) + noise) * rotor)
+                        .collect();
+                    let (observation, amplitude) =
+                        decoder.observe_pilot_referenced_slot(&samples).unwrap();
+                    assert_eq!(
+                        decoder.classify_observation(&observation, amplitude),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pilot_reference_rejects_ack_without_pilot_and_pilot_without_ack() {
+        let decoder = AckDecoder::for_physical_layer_subtype(2);
+        let cover = spread_ack_bit_with_cover(
+            1.4,
+            ACK_SUBTYPE2_WALSH_LEN,
+            usize::from(ACK_SUBTYPE2_WALSH_INDEX),
+        );
+        for seed in 1..=256 {
+            let noise = noise_seq(seed, ACK_CHIPS_PER_BIT, 1.0);
+            for (pilot_gain, ack_gain) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0)] {
+                let samples: Vec<_> = cover
+                    .iter()
+                    .zip(&noise)
+                    .map(|(ack, noise)| *ack * ack_gain + Complex32::new(pilot_gain, 0.0) + *noise)
+                    .collect();
+                let (observation, amplitude) =
+                    decoder.observe_pilot_referenced_slot(&samples).unwrap();
+                assert_eq!(
+                    decoder.classify_observation(&observation, amplitude),
+                    AckSymbol::Gated,
+                    "seed={seed} pilot={pilot_gain} ack={ack_gain}"
+                );
+            }
+        }
+    }
 
     fn spread_ack_bit(bit_chip: f32) -> Vec<Complex32> {
         spread_ack_bit_with_cover(bit_chip, ACK_WALSH_LEN, usize::from(ACK_WALSH_INDEX))
@@ -376,28 +472,28 @@ mod tests {
         assert!(!slot_expected_in_mask(0x0000, 0));
     }
 
+    fn noise_seq(seed: u32, n: usize, sigma: f32) -> Vec<Complex32> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / ((1u32 << 24) as f32)
+        };
+        for _ in 0..n {
+            let mut u1 = next();
+            if u1 < 1e-7 {
+                u1 = 1e-7;
+            }
+            let u2 = next();
+            let r = (-2.0_f32 * u1.ln()).sqrt();
+            let th = 2.0 * std::f32::consts::PI * u2;
+            out.push(Complex32::new(sigma * r * th.cos(), sigma * r * th.sin()));
+        }
+        out
+    }
+
     #[test]
     fn decodes_under_10db_noise() {
-        fn noise_seq(seed: u32, n: usize, sigma: f32) -> Vec<Complex32> {
-            let mut s = seed;
-            let mut out = Vec::with_capacity(n);
-            let mut next = || {
-                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-                (s >> 8) as f32 / ((1u32 << 24) as f32)
-            };
-            for _ in 0..n {
-                let mut u1 = next();
-                if u1 < 1e-7 {
-                    u1 = 1e-7;
-                }
-                let u2 = next();
-                let r = (-2.0_f32 * u1.ln()).sqrt();
-                let th = 2.0 * std::f32::consts::PI * u2;
-                out.push(Complex32::new(sigma * r * th.cos(), sigma * r * th.sin()));
-            }
-            out
-        }
-
         let sigma = (0.1_f32 / 2.0).sqrt(); // 10 dB SNR.
         for (bit, expected) in [(1.0_f32, AckSymbol::Ack), (-1.0_f32, AckSymbol::Nak)] {
             let clean = spread_ack_bit(bit);
@@ -409,6 +505,46 @@ mod tests {
                 dec.decode_slot(&noisy, 1.0),
                 expected,
                 "10 dB SNR ACK decode mismatch for bit {bit}"
+            );
+        }
+    }
+    #[test]
+    fn noisy_silent_slots_do_not_acknowledge_packets() {
+        const TRIALS: u32 = 1024;
+        const MAX_ERRORS: u32 = 4;
+        const CHIP_NOISE_SIGMA: f32 = 2.0;
+        for subtype in [0, 2] {
+            let decoder = AckDecoder::for_physical_layer_subtype(subtype);
+            let cover = spread_ack_bit_with_cover(0.5, decoder.walsh_len, decoder.walsh_index);
+            let mut false_feedback = 0;
+            let mut missed_ack = 0;
+            let mut missed_nak = 0;
+            for trial in 0..TRIALS {
+                let noise = noise_seq(trial + 1, ACK_CHIPS_PER_BIT, CHIP_NOISE_SIGMA);
+                false_feedback += u32::from(decoder.decode_slot(&noise, 1.0) != AckSymbol::Gated);
+                for (sign, expected, missed) in [
+                    (1.0, AckSymbol::Ack, &mut missed_ack),
+                    (-1.0, AckSymbol::Nak, &mut missed_nak),
+                ] {
+                    let noisy: Vec<_> = noise
+                        .iter()
+                        .zip(&cover)
+                        .map(|(n, s)| n + s * sign)
+                        .collect();
+                    *missed += u32::from(decoder.decode_slot(&noisy, 1.0) != expected);
+                }
+            }
+            assert!(
+                false_feedback <= MAX_ERRORS,
+                "subtype={subtype} false_feedback={false_feedback}"
+            );
+            assert!(
+                missed_ack <= MAX_ERRORS,
+                "subtype={subtype} missed_ack={missed_ack}"
+            );
+            assert!(
+                missed_nak <= MAX_ERRORS,
+                "subtype={subtype} missed_nak={missed_nak}"
             );
         }
     }

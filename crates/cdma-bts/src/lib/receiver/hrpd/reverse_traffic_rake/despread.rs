@@ -216,11 +216,6 @@ pub fn despread_frame_with_reference(
     )
 }
 
-/// Despread exactly `ref_conj.len()` chips beginning at absolute `start_chip`,
-/// applying `phase_correction` to every despread chip. Generalizes
-/// [`despread_frame_with_reference`] so the per-slot reverse power-control loop
-/// can despread a single slot's pilot region as soon as its samples arrive,
-/// without waiting for the whole 16-slot frame.
 #[allow(clippy::too_many_arguments)]
 pub fn despread_chips_with_reference(
     samples: &[Complex32],
@@ -237,8 +232,6 @@ pub fn despread_chips_with_reference(
         return None;
     }
     let base_start = (start_sample - absolute_sample_start) as usize;
-    let mut chips = Vec::with_capacity(ref_conj.len());
-
     if let Some(walk) = ChipWalk::resolve(
         samples.len(),
         base_start,
@@ -247,26 +240,49 @@ pub fn despread_chips_with_reference(
         sample_delay,
         sample_delay_fraction,
     ) {
-        let step = walk.step;
         let frac = walk.fraction;
-        let mut lo = walk.first_index;
-        if frac == 0.0 {
-            for &reference in ref_conj {
-                chips.push(samples[lo] * reference * phase_correction);
-                lo += step;
+        let first = samples[walk.first_index..].iter().step_by(walk.step);
+        if phase_correction == Complex32::new(1.0, 0.0) {
+            if frac == 0.0 {
+                return Some(
+                    first
+                        .zip(ref_conj)
+                        .map(|(&sample, &reference)| sample * reference)
+                        .collect(),
+                );
             }
-        } else {
-            for &reference in ref_conj {
-                let a = samples[lo];
-                let b = samples[lo + 1];
-                let sample = a * (1.0 - frac) + b * frac;
-                chips.push(sample * reference * phase_correction);
-                lo += step;
-            }
+            let second = samples[walk.first_index + 1..].iter().step_by(walk.step);
+            return Some(
+                first
+                    .zip(second)
+                    .zip(ref_conj)
+                    .map(|((&a, &b), &reference)| (a * (1.0 - frac) + b * frac) * reference)
+                    .collect(),
+            );
         }
-        return Some(chips);
+        if frac == 0.0 {
+            return Some(
+                first
+                    .zip(ref_conj)
+                    .map(|(&sample, &reference)| sample * reference * phase_correction)
+                    .collect(),
+            );
+        } else {
+            let second = samples[walk.first_index + 1..].iter().step_by(walk.step);
+            return Some(
+                first
+                    .zip(second)
+                    .zip(ref_conj)
+                    .map(|((&a, &b), &reference)| {
+                        let sample = a * (1.0 - frac) + b * frac;
+                        sample * reference * phase_correction
+                    })
+                    .collect(),
+            );
+        }
     }
 
+    let mut chips = Vec::with_capacity(ref_conj.len());
     for (chip, &reference) in ref_conj.iter().enumerate() {
         let sample = sample_chip_at_delay(
             samples,
@@ -569,7 +585,12 @@ fn pilot_moments_from_slot_regions(
     let fallback_phase = phase_of(coherent);
     let mut fit = PilotPhaseRampFit::default();
     for (slot, value) in slot_coherent.iter().enumerate() {
-        fit.push(slot as f32 + PILOT_REGION_SLOT_CENTER, *value);
+        let start = slot * HRPD_SLOT_CHIPS + pilot_start_chips;
+        let end = ((slot + 1) * HRPD_SLOT_CHIPS).min(max_chips);
+        if start < end {
+            let center = (start + end - 1) as f32 / (2 * HRPD_SLOT_CHIPS) as f32;
+            fit.push(center, *value);
+        }
     }
     let (phase_at_frame_start_rad, phase_step_rad_per_slot, phase_ramp_valid) =
         clamp_pilot_phase_ramp(fit.finish(fallback_phase), fallback_phase);
@@ -592,24 +613,25 @@ fn pilot_moments_from_slot_regions(
     let mut first_half_symbols = 0usize;
     let mut second_half_symbols = 0usize;
     let ramp_step_per_chip = -(phase_step_rad_per_slot as f64) / HRPD_SLOT_CHIPS as f64;
+    let mut rotated_slot = [Complex32::new(0.0, 0.0); HRPD_SLOT_CHIPS];
     for slot in 0..slots {
         let slot_start = slot * HRPD_SLOT_CHIPS + pilot_start_chips;
         if slot_start >= max_chips {
             continue;
         }
         let slot_end = ((slot + 1) * HRPD_SLOT_CHIPS).min(max_chips);
-        // The region's chips are contiguous, so the conjugate ramp can
-        // advance by phasor recurrence instead of per-chip sine/cosine.
         let mut ramp = crate::sdr::PhasorNco::with_start_phase(
             -(phase_at_frame_start_rad as f64
                 + phase_step_rad_per_slot as f64 * slot_start as f64 / HRPD_SLOT_CHIPS as f64),
             ramp_step_per_chip,
         );
-        let mut chip_idx = slot_start;
-        while chip_idx + HRPD_PILOT_WALSH_CHIPS <= slot_end {
+        let rotated = &mut rotated_slot[..slot_end - slot_start];
+        rotated.copy_from_slice(&chips[slot_start..slot_end]);
+        ramp.rotate_in_place(rotated);
+        for symbol_chips in rotated.chunks_exact(HRPD_PILOT_WALSH_CHIPS) {
             let mut complex_symbol = Complex32::new(0.0, 0.0);
-            for offset in 0..HRPD_PILOT_WALSH_CHIPS {
-                complex_symbol += ramp.mix(chips[chip_idx + offset]);
+            for sample in symbol_chips {
+                complex_symbol += *sample;
             }
             let complex_symbol = complex_symbol / HRPD_PILOT_WALSH_CHIPS as f32;
             let symbol = complex_symbol.re;
@@ -626,7 +648,6 @@ fn pilot_moments_from_slot_regions(
                 second_half_symbols += 1;
             }
             symbol_count += 1;
-            chip_idx += HRPD_PILOT_WALSH_CHIPS;
         }
     }
     let noncoherent: f32 = slot_projected.iter().map(|s| s.abs()).sum();
@@ -787,5 +808,66 @@ pub(crate) fn pilot_moments_from_slot(chips: &[Complex32]) -> PilotMoments {
         pilot_amplitude_step_db,
         coherent_pilot_power: coherent_power,
         noise_pilot_power: noise_power,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn despreading_matches_scalar_interpolation_at_buffer_edges() {
+        for phase in [Complex32::new(1.0, 0.0), Complex32::new(0.6, -0.8)] {
+            assert_despreading_matches_scalar_interpolation(phase);
+        }
+    }
+
+    fn assert_despreading_matches_scalar_interpolation(phase: Complex32) {
+        let samples = (0..32768)
+            .map(|i| Complex32::new((i % 127) as f32 / 127.0, (i % 97) as f32 / 97.0))
+            .collect::<Vec<_>>();
+        let reference = (0..2048)
+            .map(|i| Complex32::new(if i % 2 == 0 { 1.0 } else { -1.0 }, 1.0))
+            .collect::<Vec<_>>();
+        for oversample in [1, 2, 4, 8] {
+            for base in [0, 7, 128] {
+                for delay in [-5, 0, 12] {
+                    for fraction in [-0.75, 0.0, 0.25, 0.75] {
+                        for len in [0, 1, 31, 2048] {
+                            for available in [512, samples.len()] {
+                                let input = &samples[..available];
+                                let reference = &reference[..len];
+                                let expected = reference
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(chip, &r)| {
+                                        sample_chip_at_delay(
+                                            input, base, oversample, chip, delay, fraction,
+                                        )
+                                        .map(|sample| sample * r * phase)
+                                    })
+                                    .collect::<Option<Vec<_>>>();
+                                let start_chip = base as u64;
+                                let buffer_start = start_chip * oversample as u64 - base as u64;
+                                assert_eq!(
+                                    despread_chips_with_reference(
+                                        input,
+                                        buffer_start,
+                                        oversample,
+                                        start_chip,
+                                        delay,
+                                        fraction,
+                                        phase,
+                                        reference,
+                                    ),
+                                    expected,
+                                    "oversample={oversample} base={base} delay={delay} fraction={fraction} len={len} available={available}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

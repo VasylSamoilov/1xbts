@@ -218,25 +218,12 @@ impl HrpdTurboDecoder {
             }
         }
 
-        // The physical packet TAIL field is discarded before turbo encoding;
-        // fill those trailing positions so the returned representation matches
-        // the full physical packet length the spec defines.
+        // The physical packet tail is omitted from turbo encoding and restored as zero padding.
         (soft, None)
     }
 }
 
-/// Single Max-Log-MAP sweep over one constituent encoder's trellis.
-/// `x` is the systematic LLR per bit (Nturbo data bits + 3 constituent tail
-/// bits).
-/// `y0`/`y1` are parity LLRs with the same length.
-/// `la` is the a-priori LLR from the other CE with the same length; it is zero
-/// on tail positions.
-/// `n_data` is the number of data bits (the first `n_data` of `payload_bits`).
-/// Returns the posterior LLR per bit.
-/// Caller-provided scratch reused across every BCJR sweep within one
-/// `decode_soft` call so the decoder allocates these buffers once per frame
-/// instead of 16 times. The buffers are fully reset at the top of each sweep,
-/// so their incoming contents do not matter.
+/// Alpha and beta require one more row than the input trellis length. Tail steps terminate at state zero.
 fn bcjr_log_map(
     x: &[f32],
     y0: &[f32],
@@ -250,10 +237,10 @@ fn bcjr_log_map(
     let n = x.len();
     let trans = &*TRELLIS;
 
-    // Forward metrics α[k][s] over (n+1) time steps.
     alpha.fill([NEG_INF; NUM_STATES]);
     alpha[0][0] = 0.0;
     for k in 0..n {
+        let metrics = branch_metrics(x[k], y0[k], y1[k], la[k], k < n_data);
         for s in 0..NUM_STATES {
             if alpha[k][s] <= NEG_INF / 2.0 {
                 continue;
@@ -263,18 +250,17 @@ fn bcjr_log_map(
                     continue;
                 }
                 let t = &trans[s][u];
-                let g = branch_metric(u as u8, t.y0, t.y1, x[k], y0[k], y1[k], la[k], k < n_data);
+                let g = metrics[u][usize::from(t.y0)][usize::from(t.y1)];
                 let cand = alpha[k][s] + g;
                 alpha[k + 1][t.next_state] = log_sum(alpha[k + 1][t.next_state], cand);
             }
         }
     }
 
-    // Backward metrics β[k][s]. We terminate the trellis at state 0 after
-    // the tail (the encoder forces zero state via tail bits).
     beta.fill([NEG_INF; NUM_STATES]);
     beta[n][0] = 0.0;
     for k in (0..n).rev() {
+        let metrics = branch_metrics(x[k], y0[k], y1[k], la[k], k < n_data);
         for s in 0..NUM_STATES {
             let mut sum = NEG_INF;
             for u in 0..2 {
@@ -285,7 +271,7 @@ fn bcjr_log_map(
                 if beta[k + 1][t.next_state] <= NEG_INF / 2.0 {
                     continue;
                 }
-                let g = branch_metric(u as u8, t.y0, t.y1, x[k], y0[k], y1[k], la[k], k < n_data);
+                let g = metrics[u][usize::from(t.y0)][usize::from(t.y1)];
                 let cand = beta[k + 1][t.next_state] + g;
                 sum = log_sum(sum, cand);
             }
@@ -293,9 +279,9 @@ fn bcjr_log_map(
         }
     }
 
-    // Posterior LLR: max over (s -> s', u=0) − max over (s -> s', u=1).
-    // Positive ⇒ u=0 ⇒ bit 0.
+    // Positive LLRs represent bit 0.
     for k in 0..n {
+        let metrics = branch_metrics(x[k], y0[k], y1[k], la[k], k < n_data);
         let mut sum0 = NEG_INF;
         let mut sum1 = NEG_INF;
         for s in 0..NUM_STATES {
@@ -310,7 +296,7 @@ fn bcjr_log_map(
                 if beta[k + 1][t.next_state] <= NEG_INF / 2.0 {
                     continue;
                 }
-                let g = branch_metric(u as u8, t.y0, t.y1, x[k], y0[k], y1[k], la[k], k < n_data);
+                let g = metrics[u][usize::from(t.y0)][usize::from(t.y1)];
                 let cand = alpha[k][s] + g + beta[k + 1][t.next_state];
                 if u == 0 {
                     sum0 = log_sum(sum0, cand);
@@ -346,15 +332,24 @@ fn branch_metric(
     la: f32,
     use_la: bool,
 ) -> f32 {
-    // Convention: LLR positive => bit 0. Branch metric uses
-    // 0.5 * (1 - 2*bit) * LLR which is +LLR/2 for bit 0 and −LLR/2 for bit 1.
-    // We drop the constant 0.5 factor since it is uniform.
+    // The half factor keeps posterior LLRs in the input scale for extrinsic subtraction.
     let sgn = |b: u8| -> f32 { if b == 0 { 1.0 } else { -1.0 } };
     let mut m = sgn(u) * lx + sgn(y0_bit) * ly0 + sgn(y1_bit) * ly1;
     if use_la {
         m += sgn(u) * la;
     }
-    m
+    0.5 * m
+}
+
+#[inline]
+fn branch_metrics(lx: f32, ly0: f32, ly1: f32, la: f32, use_la: bool) -> [[[f32; 2]; 2]; 2] {
+    std::array::from_fn(|u| {
+        std::array::from_fn(|y0| {
+            std::array::from_fn(|y1| {
+                branch_metric(u as u8, y0 as u8, y1 as u8, lx, ly0, ly1, la, use_la)
+            })
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -410,14 +405,42 @@ pub fn hard_symbols_to_llrs(symbols: &[u8], amplitude: f32) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parity_free_trellis_preserves_input_llr_scale() {
+        const DATA_BITS: usize = 64;
+        const TAIL_BITS: usize = 3;
+        let len = DATA_BITS + TAIL_BITS;
+        let mut systematic = vec![0.0; len];
+        let mut prior = vec![0.0; len];
+        for k in 0..DATA_BITS {
+            systematic[k] = (k % 7) as f32 * 0.125 - 0.375;
+            prior[k] = (k % 5) as f32 * 0.0625 - 0.125;
+        }
+        let parity = vec![0.0; len];
+        let mut alpha = vec![[NEG_INF; NUM_STATES]; len + 1];
+        let mut beta = alpha.clone();
+        let mut posterior = vec![0.0; len];
+        bcjr_log_map(
+            &systematic,
+            &parity,
+            &parity,
+            &prior,
+            DATA_BITS,
+            &mut alpha,
+            &mut beta,
+            &mut posterior,
+        );
+        for k in 0..DATA_BITS {
+            let extrinsic = posterior[k] - systematic[k] - prior[k];
+            assert!(extrinsic.abs() < 1.0e-5, "bit {k}: extrinsic={extrinsic}");
+        }
+    }
+
     fn lcg_payload(payload_bits: u32) -> Vec<u8> {
-        // Deterministic Park-Miller LCG bit stream.
         let mut s: u32 = 0xC0FFEEED;
         let mut out = Vec::with_capacity(payload_bits as usize);
         for i in 0..payload_bits {
             s = s.wrapping_mul(48271).wrapping_add(1);
-            // Force the trailing 6 tail bits to 0 (the encoder discards them
-            // as tail anyway, but pinning makes the test deterministic).
             let is_tail = i >= payload_bits - 6;
             let bit = if is_tail { 0 } else { ((s >> 16) & 1) as u8 };
             out.push(bit);

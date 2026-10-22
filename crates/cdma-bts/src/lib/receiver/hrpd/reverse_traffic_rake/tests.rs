@@ -18,7 +18,8 @@ use crate::bts::hrpd::scheduler::HarqResponse;
 use crate::bts::hrpd::{HarqBus, HarqEmissionEvent};
 use crate::phy::walsh::WalshGenerator;
 use crate::receiver::hrpd::ack_decoder::{
-    ACK_CHIPS_PER_BIT, ACK_WALSH_INDEX, ACK_WALSH_LEN, ACK_WALSH_SYMBOLS_PER_BIT,
+    ACK_CHIPS_PER_BIT, ACK_SUBTYPE2_WALSH_INDEX, ACK_SUBTYPE2_WALSH_LEN, ACK_WALSH_INDEX,
+    ACK_WALSH_LEN, ACK_WALSH_SYMBOLS_PER_BIT,
 };
 use crate::receiver::hrpd::reverse_spread::{
     HrpdReversePilotReferenceConfig, hrpd_reverse_pilot_reference_chips,
@@ -111,9 +112,37 @@ fn subtype2_subframe_pilot_moments_use_full_slot() {
 }
 
 #[test]
+fn pilot_phase_fit_uses_the_measured_region_midpoint() {
+    let slots = 4;
+    let initial_phase = 0.3;
+    for step in [-2.4, -0.8, 0.8, 2.4] {
+        let chips = (0..slots * HRPD_SLOT_CHIPS)
+            .map(|chip| unit_phase(initial_phase + step * chip as f32 / HRPD_SLOT_CHIPS as f32))
+            .collect::<Vec<_>>();
+        for moments in [
+            pilot_moments_from_clean_slot_regions(&chips, slots),
+            pilot_moments_from_subtype2_slot_regions(&chips, slots),
+        ] {
+            assert!(moments.phase_ramp_valid);
+            assert!((moments.phase_step_rad_per_slot - step).abs() < 1.0e-4);
+            assert!(
+                phase_delta_abs(
+                    unit_phase(moments.phase_at_frame_start_rad),
+                    unit_phase(initial_phase)
+                ) < 1.0e-4,
+                "step={step} recovered phase={}",
+                moments.phase_at_frame_start_rad,
+            );
+            let mut corrected = chips.clone();
+            derotate_frame_by_pilot_ramp(&mut corrected, moments);
+            let mean = corrected.iter().copied().sum::<Complex32>() / corrected.len() as f32;
+            assert!(phase_delta_abs(mean, Complex32::new(1.0, 0.0)) < 1.0e-4);
+        }
+    }
+}
+
+#[test]
 fn derotate_by_pilot_ramp_matches_per_chip_sin_cos() {
-    // A steep ramp near the per-slot clamp maximizes rotor drift between
-    // phasor resyncs.
     let moments = PilotMoments {
         pilot_phase: Complex32::new(1.0, 0.0),
         next_frame_phase: Complex32::new(1.0, 0.0),
@@ -291,11 +320,92 @@ fn synthesize_pilot_only_frame_samples(
         q_sign: -1.0,
         q_pair_phase: 0,
     });
-    // Pad trailing samples so the chip interpolator and the steady-state
-    // timing tracker can safely score positive delay candidates.
+    // Positive delay searches require trailing sample padding.
     let mut samples = chips;
     samples.extend([Complex32::new(0.0, 0.0); 64]);
     (samples, i_mask, q_mask)
+}
+
+#[test]
+fn pilot_sinr_tracks_relative_power_of_two_terminals() {
+    const TERMINALS: [u32; 2] = [0x1a40_072a, 0x1a78_2ed4];
+    const POWER_STEPS_DB: [f32; 3] = [-10.0, 0.0, 10.0];
+    const SINR_TOLERANCE_DB: f32 = 1.0;
+    const EXPECTED_PROCESSING_GAIN_DB: f32 = 12.0;
+    let references = TERMINALS.map(|uati| synthesize_pilot_only_frame_samples(uati, 0).0);
+    for desired in 0..references.len() {
+        let interfering = 1 - desired;
+        let mut sinrs = Vec::new();
+        for power_db in POWER_STEPS_DB {
+            let amplitude = 10.0_f32.powf(power_db / 20.0);
+            let despread: Vec<_> = references[desired][..HRPD_TRAFFIC_FRAME_CHIPS]
+                .iter()
+                .zip(&references[interfering])
+                .map(|(&reference, &other)| (reference * amplitude + other) * reference.conj())
+                .collect();
+            let moments =
+                pilot_moments_from_clean_slot_regions(&despread, HRPD_TRAFFIC_SLOTS_PER_FRAME);
+            sinrs.push(moments.rc3_sinr_db);
+        }
+        eprintln!(
+            "terminal={desired} relative_power_db={POWER_STEPS_DB:?} pilot_sinr_db={sinrs:?}"
+        );
+        assert!((sinrs[1] - EXPECTED_PROCESSING_GAIN_DB).abs() < SINR_TOLERANCE_DB);
+        for (index, power_db) in POWER_STEPS_DB.into_iter().enumerate() {
+            assert!(
+                (sinrs[index] - sinrs[1] - power_db).abs() < SINR_TOLERANCE_DB,
+                "terminal={desired} power_db={power_db} sinrs={sinrs:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pilot_sinr_separates_own_channel_energy_from_other_terminal_interference() {
+    const TERMINALS: [u32; 2] = [0x1a40_072a, 0x1a78_2ed4];
+    const WALSH_CHIPS: usize = 16;
+    const WALSH_ROW: usize = 4;
+    const SINR_TOLERANCE_DB: f32 = 1.0;
+    const GAIN_TOLERANCE_DB: f32 = 0.05;
+    let references = TERMINALS.map(|uati| synthesize_pilot_only_frame_samples(uati, 0).0);
+    let channel =
+        WalshGenerator::new::<WALSH_CHIPS>(WALSH_ROW, HRPD_TRAFFIC_FRAME_CHIPS / WALSH_CHIPS)
+            .feed(Complex32::new(0.0, 1.0));
+    for desired in 0..references.len() {
+        let measure = |own_power: f32, other_power: f32, gain: f32| {
+            let chips: Vec<_> = channel
+                .iter()
+                .enumerate()
+                .map(|(chip, &symbol)| {
+                    let own = references[desired][chip]
+                        * (Complex32::new(1.0, 0.0) + symbol * own_power.sqrt());
+                    let other = references[1 - desired][chip]
+                        * (Complex32::new(1.0, 0.0) + symbol * other_power.sqrt());
+                    (own + other) * gain * references[desired][chip].conj()
+                })
+                .collect();
+            pilot_moments_from_clean_slot_regions(&chips, HRPD_TRAFFIC_SLOTS_PER_FRAME)
+        };
+        let pilot_only_sinr = measure(0.0, 0.0, 1.0).rc3_sinr_db;
+        for other_power in [0.0_f32, 4.0, 16.0] {
+            let baseline = measure(0.0, other_power, 1.0);
+            let expected_sinr = pilot_only_sinr - 10.0 * (1.0 + other_power).log10();
+            eprintln!(
+                "terminal={desired} other_channel_power={other_power} sinr={} coherence={}",
+                baseline.rc3_sinr_db, baseline.coherence,
+            );
+            assert!((baseline.rc3_sinr_db - expected_sinr).abs() < SINR_TOLERANCE_DB);
+            for gain in [0.01, 1.0, 100.0] {
+                for own_power in [0.0, 16.0] {
+                    let moments = measure(own_power, other_power, gain);
+                    assert!(
+                        (moments.rc3_sinr_db - baseline.rc3_sinr_db).abs() < GAIN_TOLERANCE_DB,
+                        "terminal={desired} own={own_power} other={other_power} gain={gain}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn synthesize_noise_samples(len: usize) -> Vec<Complex32> {
@@ -577,6 +687,81 @@ fn rpc_slot_timing_does_not_chase_unlocked_noise() {
 }
 
 #[test]
+fn finger_retains_acquisition_through_two_second_tune_away() {
+    let uati = 0x0123_4567;
+    let mac_index = 5;
+    let frame_start_chip = 0u64;
+    let (samples, i_mask, q_mask) = synthesize_pilot_only_frame_samples(uati, frame_start_chip);
+    let (tx, _rx) = tokio_mpsc::unbounded_channel();
+    let acquired = Arc::new(AtomicBool::new(false));
+    let config = HrpdReverseTrafficFingerConfig {
+        uati,
+        mac_index,
+        physical_layer_subtype: 0,
+        reverse_traffic_mac_subtype: 0,
+        frame_offset: 0,
+        i_mask,
+        q_mask,
+        drc_cover: 3,
+        drc_length: 1,
+        oversample: 1,
+        event_tx: Some(tx),
+        harq_bus: None,
+        power_control: None,
+        reverse_pilot_acquired: Some(acquired.clone()),
+        worker_spawned_at: std::time::Instant::now(),
+    };
+    let lock = HrpdReverseTrafficFingerLock {
+        frame_start_chip,
+        chip_offset: 0,
+        sample_delay: 0,
+        sample_delay_fraction: 0.0,
+        q_sign: -1.0,
+        q_pair_phase: 0,
+        initial_pilot_phase: Complex32::new(1.0, 0.0),
+    };
+    let mut finger = HrpdReverseTrafficFinger::new(1, config, lock);
+    let mut chain = Vec::new();
+    const SIGNAL_FRAMES: usize = 3;
+    const SILENT_FRAMES: usize = 75;
+    let pilot = &samples[..HRPD_TRAFFIC_FRAME_CHIPS];
+    let mut stream = pilot.repeat(SIGNAL_FRAMES);
+    stream.resize(
+        stream.len() + SILENT_FRAMES * HRPD_TRAFFIC_FRAME_CHIPS,
+        Complex32::new(0.0, 0.0),
+    );
+    stream.extend(pilot.repeat(SIGNAL_FRAMES));
+    let mut last_coherence = 0;
+    for (slot, chunk) in stream.chunks(HRPD_SLOT_CHIPS).enumerate() {
+        let block = SampleBlock {
+            samples: chunk.to_vec(),
+            chip_start: slot * HRPD_SLOT_CHIPS,
+            sample_rate_hz: 1_228_800.0,
+            rx_sample_time: None,
+            tags: Default::default(),
+            pcg_signal_snr_db: None,
+            active_pcg_mask: None,
+            pcg_pilot_metrics: None,
+        };
+        for output in finger.process(&block, &mut chain) {
+            last_coherence = output
+                .tags
+                .get(TAG_PILOT_COHERENCE_X1000)
+                .copied()
+                .unwrap_or(0);
+        }
+        assert!(
+            !finger.should_retire(),
+            "receiver retired during tune-away at slot {slot}"
+        );
+    }
+    assert!(acquired.load(Ordering::Acquire));
+    assert!(finger.is_soft_validated());
+    assert_eq!(finger.signal_lost_chips(), 0);
+    assert!(last_coherence >= (HRPD_REVERSE_TRAFFIC_PILOT_MIN_COHERENCE * 1000.0) as i64);
+}
+
+#[test]
 fn finger_reports_reverse_pilot_lost_after_timeout() {
     let uati = 0x0123_4567;
     let mac_index = 5;
@@ -629,7 +814,7 @@ fn finger_reports_reverse_pilot_lost_after_timeout() {
     );
     assert!(acquired.load(Ordering::Acquire));
 
-    let reacquire_timeout_chips = 1_228_800u64 / 2;
+    let reacquire_timeout_chips = 3 * 1_228_800u64;
     let pilot_loss_timeout_chips = 5 * 1_228_800u64;
     let low_frames = pilot_loss_timeout_chips.div_ceil(HRPD_TRAFFIC_FRAME_CHIPS as u64);
     let mut lost = None;
@@ -957,8 +1142,68 @@ fn synthesize_ack_slot_chips(bit: f32) -> Vec<Complex32> {
 }
 
 #[test]
+fn ack_processor_subtype2_uses_slot_pilot_despite_low_frame_coherence() {
+    let mut frame = vec![Complex32::new(0.0, 0.0); HRPD_TRAFFIC_FRAME_CHIPS];
+    let ack_slot_idx = 7usize;
+    let ack_chips = WalshGenerator::new::<ACK_SUBTYPE2_WALSH_LEN>(
+        usize::from(ACK_SUBTYPE2_WALSH_INDEX),
+        ACK_CHIPS_PER_BIT / ACK_SUBTYPE2_WALSH_LEN,
+    )
+    .feed(Complex32::new(1.4, 0.0));
+    let phase = Complex32::from_polar(1.0, 2.1);
+    let slot_base = ack_slot_idx * HRPD_SLOT_CHIPS;
+    for (k, sample) in ack_chips.iter().enumerate().take(ACK_CHIPS_PER_BIT) {
+        frame[slot_base + k] = (*sample + Complex32::new(1.0, 0.0)) * phase;
+    }
+    let mut block = SampleBlock {
+        samples: frame,
+        chip_start: 0,
+        sample_rate_hz: 1_228_800.0,
+        rx_sample_time: None,
+        tags: Default::default(),
+        pcg_signal_snr_db: None,
+        active_pcg_mask: None,
+        pcg_pilot_metrics: None,
+    };
+    let frame_start_chip = 0i64;
+    let frame_start_slot = 0u64;
+    let mac_index = 11u8;
+    block.tags.insert(TAG_FRAME_START_CHIP, frame_start_chip);
+    block.tags.insert(TAG_MAC_INDEX, mac_index as i64);
+    block
+        .tags
+        .insert(super::finger::TAG_PHYSICAL_LAYER_SUBTYPE, 2);
+    block.tags.insert(TAG_PILOT_COHERENCE_X1000, 0);
+
+    let bus = Arc::new(HarqBus::new());
+    bus.publish_emission(
+        mac_index,
+        HarqEmissionEvent {
+            packet_id: 2,
+            subpacket: 2,
+            packet_start_slot: frame_start_slot + ack_slot_idx as u64 - 3,
+            forward_slot: frame_start_slot + ack_slot_idx as u64 - 3,
+            expected_ack_reverse_slot: frame_start_slot + ack_slot_idx as u64,
+            terminal: true,
+        },
+    );
+
+    let mut proc = HrpdReverseTrafficAckProcessor::new(Some(bus.clone()), None);
+    let out = proc.process_block(block);
+    assert_eq!(out.len(), 1);
+    let packed = out[0].tags.get(TAG_ACK_PATTERN_PACKED).copied().unwrap() as u32;
+    let slot_bits = (packed >> (ack_slot_idx * 2)) & 0b11;
+    assert_eq!(slot_bits, 0b10, "expected ACK state for slot 7");
+
+    let feedback = bus.drain_feedback(mac_index);
+    assert_eq!(feedback.len(), 1);
+    assert_eq!(feedback[0].packet_id, 2);
+    assert_eq!(feedback[0].subpacket, 2);
+    assert_eq!(feedback[0].response, HarqResponse::Ack);
+}
+
+#[test]
 fn ack_processor_publishes_feedback_for_expected_slot() {
-    // Build a frame whose slot 7 carries an ACK bit; all other chips zero.
     let mut frame = vec![Complex32::new(0.0, 0.0); HRPD_TRAFFIC_FRAME_CHIPS];
     let ack_slot_idx = 7usize;
     let ack_chips = synthesize_ack_slot_chips(1.0); // ACK
@@ -1007,6 +1252,62 @@ fn ack_processor_publishes_feedback_for_expected_slot() {
     assert_eq!(feedback[0].packet_id, 2);
     assert_eq!(feedback[0].subpacket, 2);
     assert_eq!(feedback[0].response, HarqResponse::Ack);
+}
+
+#[test]
+fn ack_processor_does_not_publish_low_confidence_early_ack() {
+    use crate::receiver::hrpd::ack_decoder::{
+        ACK_FORWARD_TO_REVERSE_SLOT_OFFSET, AckDecoder, AckSymbol,
+    };
+
+    const MAC_INDEX: u8 = 14;
+    const ACK_SLOT: usize = 6;
+    const RESIDUAL_MEAN: f32 = 0.11;
+    let mut frame = vec![Complex32::new(1.0, 0.0); HRPD_TRAFFIC_FRAME_CHIPS];
+    let cover = synthesize_ack_slot_chips(1.0);
+    for (index, chip) in cover.iter().enumerate() {
+        let residual = if (index / ACK_WALSH_LEN) % 2 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        frame[ACK_SLOT * HRPD_SLOT_CHIPS + index] += chip * (RESIDUAL_MEAN + residual);
+    }
+    let decoder = AckDecoder::new();
+    let mean = decoder
+        .despread_slot(&frame[ACK_SLOT * HRPD_SLOT_CHIPS..])
+        .unwrap();
+    assert_eq!(decoder.classify(mean, 1.0), AckSymbol::Ack);
+    let mut block = SampleBlock {
+        samples: frame,
+        chip_start: 0,
+        sample_rate_hz: 1_228_800.0,
+        rx_sample_time: None,
+        tags: Default::default(),
+        pcg_signal_snr_db: None,
+        active_pcg_mask: None,
+        pcg_pilot_metrics: None,
+    };
+    block.tags.insert(TAG_FRAME_START_CHIP, 0);
+    block.tags.insert(TAG_MAC_INDEX, i64::from(MAC_INDEX));
+    let bus = Arc::new(HarqBus::new());
+    bus.publish_emission(
+        MAC_INDEX,
+        HarqEmissionEvent {
+            packet_id: 1,
+            subpacket: 0,
+            packet_start_slot: ACK_SLOT as u64 - u64::from(ACK_FORWARD_TO_REVERSE_SLOT_OFFSET),
+            forward_slot: ACK_SLOT as u64 - u64::from(ACK_FORWARD_TO_REVERSE_SLOT_OFFSET),
+            expected_ack_reverse_slot: ACK_SLOT as u64,
+            terminal: false,
+        },
+    );
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+    let mut processor = HrpdReverseTrafficAckProcessor::new(Some(bus.clone()), Some(tx));
+    let out = processor.process_block(block);
+    assert_eq!(out.len(), 1);
+    assert!(bus.drain_feedback(MAC_INDEX).is_empty());
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
@@ -1488,8 +1789,13 @@ fn reverse_rev0_per_drives_outer_loop_once_per_packet() {
     let mut proc =
         HrpdReverseTrafficDataProcessor::new_with_power_control(None, Some(handle.clone()));
 
+    let initial_target = handle.target_db();
     proc.test_record_reverse_per(false, false);
-    assert_eq!(handle.target_db(), 10.0, "pilot-only frame is excluded");
+    assert_eq!(
+        handle.target_db(),
+        initial_target,
+        "pilot-only frame is excluded"
+    );
 
     for _ in 0..10 {
         proc.test_record_reverse_per(true, true);
@@ -1502,16 +1808,8 @@ fn reverse_rev0_per_drives_outer_loop_once_per_packet() {
     assert_eq!(snapshot.packets_erased, 1);
 }
 
-// -- Reverse power-control loop tests ----------------------------------------
-//
-// These exercise the per-slot HRPD RPC controller directly: it ingests one
-// pilot SINR per slot, predicts across HRPD_RPC_TX_LEAD_SLOTS with the same
-// clamped LSQ predictor form as RC3, and emits one RPC bit (0=up, 1=down) via
-// the shared delta-sigma quantizer plus a large-error direction guard.
 const RPC_TEST_TARGET_DB: f32 = HRPD_RPC_TARGET_SNR_DB;
 
-/// Drive the controller for `slots` reliable measurements held at `snr_db` and
-/// return `(up_bits, down_bits)`.
 fn run_rpc_controller(snr_db: f32, slots: usize) -> (usize, usize) {
     let mut rpc = HrpdRpcController::new();
     let mut up: usize = 0;
@@ -1524,23 +1822,6 @@ fn run_rpc_controller(snr_db: f32, slots: usize) -> (usize, usize) {
         }
     }
     (up, down)
-}
-
-#[test]
-fn rpc_predictor_clamps_forward_trend_like_rc3() {
-    let mut rpc = HrpdRpcController::new();
-    for sample in [6.0_f32, 6.5, 7.0, 7.5, 8.0, 8.5] {
-        let _ = rpc.ingest(sample, 1.0);
-    }
-    let predicted = rpc.ingest(9.0, 1.0).unwrap();
-    assert!(
-        predicted > 9.0,
-        "upward trend should predict above newest measured level: predicted={predicted}"
-    );
-    assert!(
-        predicted <= 10.0 + 1e-6,
-        "prediction must be clamped to newest+1 dB: predicted={predicted}"
-    );
 }
 
 #[test]

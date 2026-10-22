@@ -1,7 +1,4 @@
-//! Fast-DRC decode and publication methods for `HrpdReverseTrafficFinger`.
-//!
-//! Split out of the primary finger impl to keep it focused; these methods
-//! run on the same struct and access its state directly.
+use std::borrow::Cow;
 
 use super::*;
 
@@ -147,17 +144,21 @@ impl HrpdReverseTrafficFinger {
         }
     }
 
-    fn reference_for_region(&self, start_chip: u64, len: usize) -> Vec<Complex32> {
-        let mut out = Vec::with_capacity(len);
-        let period = HRPD_TRAFFIC_FRAME_CHIPS as u64;
-        for offset in 0..len {
-            let idx = ((start_chip
-                .saturating_sub(self.spawn_chip)
-                .saturating_add(offset as u64))
-                % period) as usize;
-            out.push(self.ref_conj[idx]);
+    fn reference_for_region(&self, start_chip: u64, len: usize) -> Cow<'_, [Complex32]> {
+        let start =
+            (start_chip.saturating_sub(self.spawn_chip) % HRPD_TRAFFIC_FRAME_CHIPS as u64) as usize;
+        if len <= HRPD_TRAFFIC_FRAME_CHIPS - start {
+            return Cow::Borrowed(&self.ref_conj[start..start + len]);
         }
-        out
+        Cow::Owned(
+            self.ref_conj
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(len)
+                .copied()
+                .collect(),
+        )
     }
 
     pub(super) fn publish_repeated_drc(&mut self, completion_slot: u64, symbol: DrcSymbol) {

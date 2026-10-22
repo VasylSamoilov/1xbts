@@ -33,6 +33,7 @@ use cdma_common::hrpd::traffic::{
     FORWARD_TRAFFIC_MAC_PACKET_BITS, FORWARD_TRAFFIC_MAC_PAD_BITS,
     FORWARD_TRAFFIC_MAC_TRAILER_BITS, PHYSICAL_FCS_BITS, PHYSICAL_TAIL_BITS,
     REVERSE_TRAFFIC_CHANNEL_MAC_GRANT_MESSAGE_ID, REVERSE_TRAFFIC_CHANNEL_MAC_RTC_ACK_MESSAGE_ID,
+    default_packet_stream_protocol_type,
     default_reverse_traffic_mac_rtc_ack_ftc_payload_bits_for_mac_subtype,
     default_signaling_ftc_payload_bits_with_ack_for_mac_subtype,
     enhanced_forward_traffic_mac_packet_bits, format_b_ftc_payload_bits_for_mac_subtype,
@@ -123,7 +124,7 @@ pub struct PreparedForwardTrafficPacket {
     session_packets: Option<Arc<[Vec<u8>]>>,
     default_signaling: Option<DefaultSignalingPacket>,
     rtc_ack_sequence_number: Option<u8>,
-    priority_ranges: Option<String>,
+    rlp_ranges: Option<String>,
     turbo_codewords: Option<PreparedTurboCodewords>,
     prepared_chips: Option<PreparedPacketChips>,
 }
@@ -229,12 +230,13 @@ impl PreparedForwardTrafficPacket {
         let rtc_ack_sequence_number = session_packets
             .as_deref()
             .and_then(rtc_ack_sequence_number_from_session_packets);
-        let priority_ranges = packet.high_priority.then(|| {
-            session_packets
-                .as_deref()
-                .map(format_default_packet_rlp_ranges_from_session_packets)
-                .unwrap_or_else(|| "unparsed".to_string())
-        });
+        let rlp_ranges =
+            (packet.high_priority || log::log_enabled!(log::Level::Trace)).then(|| {
+                session_packets
+                    .as_deref()
+                    .map(format_default_packet_rlp_ranges_from_session_packets)
+                    .unwrap_or_else(|| "unparsed".to_string())
+            });
         let turbo_codewords = prepare_turbo
             .then(|| prepare_turbo_codewords(&packet))
             .flatten();
@@ -243,7 +245,7 @@ impl PreparedForwardTrafficPacket {
             session_packets: session_packets.map(Arc::from),
             default_signaling,
             rtc_ack_sequence_number,
-            priority_ranges,
+            rlp_ranges,
             turbo_codewords,
             prepared_chips: None,
         }
@@ -490,7 +492,7 @@ impl HrpdForwardScheduler {
             log::debug!(
                 "rx_hrpd_traffic[m{}]: enqueueing priority DefaultPacket RLP repair ranges=[{}] insert_at={} queued_before={}",
                 pkt.mac_index,
-                pkt.priority_ranges.as_deref().unwrap_or("unparsed"),
+                pkt.rlp_ranges.as_deref().unwrap_or("unparsed"),
                 insert_at,
                 self.queue.len(),
             );
@@ -755,9 +757,33 @@ impl HrpdForwardScheduler {
     }
 
     fn promote_queue(&mut self, slot_index: u64) {
+        let bus = self.harq_bus.clone();
+        self.promote_queue_with_drc(slot_index, |mac| {
+            bus.as_ref().and_then(|bus| {
+                bus.governing_drc(
+                    mac,
+                    slot_index,
+                    FORWARD_FRAME_OFFSET_SLOTS,
+                    FORWARD_DRC_LENGTH_SLOTS,
+                )
+            })
+        });
+    }
+
+    fn promote_queue_with_drc(
+        &mut self,
+        slot_index: u64,
+        mut governing_drc_for_mac: impl FnMut(u8) -> Option<u8>,
+    ) {
+        let mut deferred_macs = [false; u8::MAX as usize + 1];
         let mut i = 0;
         while i < self.queue.len() {
             let mac = self.queue[i].mac_index;
+            // DRC arriving mid-scan must not let a later packet overtake this MAC's head.
+            if deferred_macs[mac as usize] {
+                i += 1;
+                continue;
+            }
             if self
                 .active
                 .iter()
@@ -765,36 +791,24 @@ impl HrpdForwardScheduler {
                 .count()
                 >= MAX_OUTSTANDING_PACKETS_PER_MAC
             {
+                deferred_macs[mac as usize] = true;
                 i += 1;
                 continue;
             }
             let mut pkt = self.queue.remove(i);
-            // Transmit at the rate the AT requested for this packet's start
-            // slot, per C.S0024-0 v4.0 §8.4.6.1.4.1.2. Higher layers do not
-            // provide a DRC. If the governing DRC uses a different payload
-            // size, rebuild recognized HRPD payloads before HARQ encoding.
+            // C.S0024-0 v4.0 §8.4.6.1.4.1.2 binds the transmit rate to the AT's DRC at packet start.
             let latest_drc_record = self
                 .harq_bus
                 .as_ref()
                 .and_then(|bus| bus.current_drc_record(mac));
             let latest_drc = latest_drc_record.map(|(_, drc)| drc);
-            let exact_governing_drc = self.harq_bus.as_ref().and_then(|bus| {
-                bus.governing_drc(
-                    mac,
-                    slot_index,
-                    FORWARD_FRAME_OFFSET_SLOTS,
-                    FORWARD_DRC_LENGTH_SLOTS,
-                )
-            });
+            let exact_governing_drc = governing_drc_for_mac(mac);
             let governing_slot = governing_drc_slot(
                 slot_index,
                 FORWARD_FRAME_OFFSET_SLOTS,
                 FORWARD_DRC_LENGTH_SLOTS,
             );
-            // C.S0024-A §1.6.6.1.4.1.2 binds a packet start to the DRC
-            // completed in one exact window. Reusing an older DRC during an
-            // AT tune-away removes packets from the queue while the AT is not
-            // listening and turns a short pause into a large RLP repair burst.
+            // C.S0024-A §1.6.6.1.4.1.2 requires the exact governing DRC window, even after a tune-away.
             let governing_drc = exact_governing_drc;
             let Some(at_drc) = governing_drc else {
                 if slot_index.saturating_sub(self.last_no_governing_drc_log_slot) >= 128 {
@@ -816,6 +830,7 @@ impl HrpdForwardScheduler {
                     self.last_no_governing_drc_log_slot = slot_index;
                 }
                 self.queue.insert(i, pkt);
+                deferred_macs[mac as usize] = true;
                 i += 1;
                 continue;
             };
@@ -833,6 +848,7 @@ impl HrpdForwardScheduler {
             };
             if slot_index % INTERLACE == 0 && at_rate.slots > 1 {
                 self.queue.insert(i, pkt);
+                deferred_macs[mac as usize] = true;
                 i += 1;
                 continue;
             }
@@ -943,9 +959,25 @@ impl HrpdForwardScheduler {
             self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
             let scheduled_rtc_ack_seq = pkt.rtc_ack_sequence_number;
             let scheduled_signaling = pkt.default_signaling.clone();
-            let scheduled_priority_ranges = pkt.priority_ranges.clone();
+            let scheduled_rlp_ranges = pkt.rlp_ranges.clone();
             if let Some(state) = build_harq_state(pkt, at_rate, packet_id) {
-                if let Some(ranges) = scheduled_priority_ranges {
+                if let Some(ranges) = scheduled_rlp_ranges.as_ref() {
+                    log::trace!(
+                        "rx_hrpd_traffic[m{}]: scheduling RLP packet_id={} ranges=[{}] repair={} start_slot={} drc=0x{:x} payload_bits={} slots={} queue_remaining={}",
+                        state.packet.mac_index,
+                        packet_id,
+                        ranges,
+                        state.packet.high_priority,
+                        slot_index,
+                        at_rate.drc_index,
+                        at_rate.payload_bits,
+                        at_rate.slots,
+                        self.queue.len(),
+                    );
+                }
+                if state.packet.high_priority
+                    && let Some(ranges) = scheduled_rlp_ranges
+                {
                     log::debug!(
                         "rx_hrpd_traffic[m{}]: scheduling priority DefaultPacket RLP repair packet_id={} ranges=[{}] start_slot={} drc=0x{:x} payload_bits={} slots={} queue_remaining={}",
                         state.packet.mac_index,
@@ -1241,6 +1273,7 @@ fn format_default_packet_rlp_ranges_from_session_packets(session_packets: &[Vec<
     let ranges = session_packets
         .iter()
         .filter_map(|packet| parse_stream_layer_packet_bytes(packet).ok())
+        .filter(|stream| default_packet_stream_protocol_type(stream.stream_id).is_some())
         .filter_map(|stream| {
             parse_default_packet_rlp_packet_bits(&stream.application_packet_bits).ok()
         })
@@ -2477,17 +2510,42 @@ mod tests {
         for s in 5..=20 {
             let _ = sched.next_slot(s, false);
         }
-        // DRC 0x1's 16-slot run would still be emitting interlace slots
-        // here; with the override to 0x6 the queue is fully drained.
         let after = sched.next_slot(65, false);
         assert!(matches!(after.channel, SlotKind::Idle));
     }
 
     #[test]
+    fn drc_arriving_during_queue_scan_preserves_packet_order() {
+        let mut sched = HrpdForwardScheduler::new();
+        for mac in [5, 5, 7] {
+            sched.enqueue(ForwardTrafficPacket {
+                mac_index: mac,
+                physical_layer_subtype: 0,
+                forward_traffic_mac_subtype: 0,
+                high_priority: false,
+                payload: dummy_payload(1024),
+            });
+        }
+        let mut reads = 0;
+        sched.promote_queue_with_drc(1201, |mac| {
+            if mac == 7 {
+                return Some(0x6);
+            }
+            reads += 1;
+            (reads > 1).then_some(0x6)
+        });
+        assert_eq!(reads, 1);
+        assert_eq!(sched.active.len(), 1);
+        assert_eq!(sched.active[0].packet.mac_index, 7);
+        assert_eq!(sched.queue.len(), 2);
+        assert!(sched.queue.iter().all(|packet| packet.mac_index == 5));
+        sched.promote_queue_with_drc(1202, |_| Some(0x6));
+        assert_eq!(sched.active.last().unwrap().packet.mac_index, 5);
+        assert_eq!(sched.queue.len(), 1);
+    }
+
+    #[test]
     fn stale_governing_drc_defers_non_signaling_queued_packet() {
-        // A DRC recorded long before the packet's start slot is past the
-        // governing-DRC age window (§8.4.6.1.4.1.2), so the scheduler must
-        // not transmit opaque packet data at the stale queued rate.
         let bus = Arc::new(HarqBus::new());
         bus.set_current_drc_at_slot(5, 0, 0x6);
         let mut sched = HrpdForwardScheduler::new();

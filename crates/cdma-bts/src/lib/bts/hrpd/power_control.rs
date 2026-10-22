@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-pub const HRPD_INITIAL_TARGET_DB: f32 = 10.0;
-pub const HRPD_AUTO_MIN_TARGET_DB: f32 = 8.0;
-pub const HRPD_AUTO_MAX_TARGET_DB: f32 = 14.0;
+pub const HRPD_INITIAL_TARGET_DB: f32 = 5.0;
+pub const HRPD_AUTO_MIN_TARGET_DB: f32 = 3.0;
+pub const HRPD_AUTO_MAX_TARGET_DB: f32 = 10.0;
 pub const HRPD_TARGET_PER: f32 = 0.01;
 const HRPD_ERASURE_STEP_UP_DB: f32 = 0.25;
 const HRPD_OUTER_LOOP_MIN_SUCCESSES: u64 = 10;
@@ -242,6 +242,7 @@ impl HrpdPowerControlRegistry {
         registry
             .assignments
             .insert(key, AssignmentState::new(generation));
+        drop(registry);
         log::info!(
             "hrpd_power[m{}]: installed uati=0x{:08x} generation={} target={:.2}dB range={:.1}..{:.1}dB target_per={:.2}%",
             mac_index,
@@ -261,7 +262,8 @@ impl HrpdPowerControlRegistry {
 
     pub fn release(&self, uati: u32, mac_index: u8) {
         let key = AssignmentKey { uati, mac_index };
-        if let Some(state) = self.inner.lock().assignments.remove(&key) {
+        let state = self.inner.lock().assignments.remove(&key);
+        if let Some(state) = state {
             let snapshot = state.snapshot(key);
             log::info!(
                 "hrpd_power[m{}]: released uati=0x{:08x} generation={} target={:.2}dB per={:.2}% packets={} erased={} excluded={} tuneaway_excluded={} late={} tuneaway_active={} return_warmup={}",
@@ -340,6 +342,7 @@ impl HrpdPowerControlHandle {
         let previous_target = state.target_db;
         state.observe(observation);
         let snapshot = state.snapshot(self.key);
+        drop(registry);
         let target_changed = (snapshot.target_db - previous_target).abs() > f32::EPSILON;
         let report_summary =
             snapshot.packets_total != 0 && snapshot.packets_total % HRPD_OUTER_SUMMARY_PACKETS == 0;
@@ -423,11 +426,13 @@ impl HrpdPowerControlHandle {
         }
         state.tune_away_active = true;
         state.return_successes_remaining = 0;
+        let target_db = state.target_db;
+        drop(registry);
         log::info!(
             "hrpd_power[m{}]: suspended for tune-away uati=0x{:08x} target={:.3}dB",
             self.key.mac_index,
             self.key.uati,
-            state.target_db,
+            target_db,
         );
         true
     }
@@ -442,12 +447,14 @@ impl HrpdPowerControlHandle {
         }
         state.tune_away_active = false;
         state.return_successes_remaining = HRPD_TUNE_AWAY_RETURN_SUCCESSES;
+        let target_db = state.target_db;
+        drop(registry);
         log::info!(
             "hrpd_power[m{}]: resumed after tune-away uati=0x{:08x} target={:.3}dB downward_warmup_successes={}",
             self.key.mac_index,
             self.key.uati,
-            state.target_db,
-            state.return_successes_remaining,
+            target_db,
+            HRPD_TUNE_AWAY_RETURN_SUCCESSES,
         );
         true
     }

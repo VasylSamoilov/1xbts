@@ -67,13 +67,10 @@ pub const DRC_NUM_VALUES: u8 = 16;
 /// Maximum DRCCover value (3-bit field selecting one of W_0^8..W_7^8).
 pub const DRC_MAX_COVER: u8 = 7;
 
-/// Default detection threshold on `peak_energy / mean_codeword_energy`. A
-/// pure-noise window distributes energy roughly evenly across the 16
-/// hypotheses, so demanding the peak exceed `threshold * mean` rejects
-/// noise-only inputs while leaving wide margin for AWGN at >=10 dB SNR.
+const DRC_NULL_COVER: u8 = 0;
+
 pub const DRC_DEFAULT_THRESHOLD: f32 = 1.5;
 
-/// Decoded DRC symbol.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DrcSymbol {
     /// 4-bit DRC value (0..15), per Table 9.2.1.3.3.3-1.
@@ -209,37 +206,46 @@ impl DrcDecoder {
         // accumulate all repetitions (2 codewords/slot * drc_length slots) of
         // each bit position coherently into a single 8-element soft codeword.
         let outer = WalshDecoder::new::<DRC_OUTER_WALSH_LEN>(DRC_OUTER_WALSH_LEN / 2);
-        // W_8^16 means Walsh row 8 of the size-16 Hadamard matrix. The
-        // identifier in §9.2.1.3.3.3 / Table 9.2.1.3.3.3-2 uses the same
-        // Hadamard ordering as our generator, so row index = 8.
+        // C.S0024 §9.2.1.3.3.3, Table 9.2.1.3.3.3-2 maps W_8^16 to Hadamard row 8.
 
         let inner = WalshDecoder::new::<DRC_INNER_WALSH_LEN>(self.drc_cover as usize);
 
-        // Soft per-bit accumulator over all repetitions.
+        let mut null_soft_bits = [0.0_f32; DRC_CODEWORD_BITS];
         let mut soft_bits = [0.0_f32; DRC_CODEWORD_BITS];
 
         let total_codewords = (drc_length as usize) * DRC_CODEWORDS_PER_SLOT;
+        let mut usable_codewords = 0;
         for cw_idx in 0..total_codewords {
             let cw_start = cw_idx * DRC_CHIPS_PER_CODEWORD;
             let codeword_derotation = if pilot_derotate {
-                // The DRC Walsh channels sum to zero over a codeword, leaving
-                // W0 as the local phase reference.
-                let pilot = chips[cw_start..cw_start + DRC_CHIPS_PER_CODEWORD]
-                    .iter()
-                    .copied()
-                    .sum::<Complex32>();
-                let norm = pilot.norm();
-                if norm > f32::EPSILON {
-                    pilot.conj() / norm
-                } else {
-                    Complex32::new(1.0, 0.0)
+                let codeword = &chips[cw_start..cw_start + DRC_CHIPS_PER_CODEWORD];
+                let mut sum = Complex32::new(0.0, 0.0);
+                let mut power_sum = 0.0_f64;
+                let count = (DRC_CHIPS_PER_CODEWORD / DRC_OUTER_WALSH_LEN) as f64;
+                // W0 and the DRC outer Walsh cover are orthogonal over each 16-chip group.
+                for group in codeword.chunks_exact(DRC_OUTER_WALSH_LEN) {
+                    let pilot =
+                        group.iter().copied().sum::<Complex32>() / DRC_OUTER_WALSH_LEN as f32;
+                    sum += pilot;
+                    power_sum += f64::from(pilot.norm_sqr());
                 }
+                let pilot = sum / count as f32;
+                let norm = pilot.norm();
+                let variance = (power_sum - f64::from(sum.norm_sqr()) / count).max(0.0)
+                    / (count * (count - 1.0));
+                const PILOT_MIN_STANDARD_ERRORS: f32 = 4.0;
+                if !norm.is_finite()
+                    || !variance.is_finite()
+                    || norm <= PILOT_MIN_STANDARD_ERRORS * variance.sqrt() as f32
+                {
+                    continue;
+                }
+                pilot.conj() / norm
             } else {
                 Complex32::new(1.0, 0.0)
             };
+            usable_codewords += 1;
             for bit_idx in 0..DRC_CODEWORD_BITS {
-                // Outer despread: produce DRC_INNER_WALSH_LEN soft Walsh chips
-                // for this bit position.
                 let mut walsh_chips = [Complex32::new(0.0, 0.0); DRC_INNER_WALSH_LEN];
                 for k in 0..DRC_INNER_WALSH_LEN {
                     let group_start =
@@ -247,18 +253,23 @@ impl DrcDecoder {
                     let group = &chips[group_start..group_start + DRC_OUTER_WALSH_LEN];
                     walsh_chips[k] = outer.process_symbol(group);
                 }
-                // Inner despread: correlate against W_DRCCover^8. Take the Q
-                // component (DRC is on the Q arm per §9.2.1.3.1).
+                // C.S0024 §9.2.1.3.1 maps DRC to the Q arm.
                 let inner_out = inner.process_symbol(&walsh_chips) * codeword_derotation;
                 soft_bits[bit_idx] += inner_out.im;
+                if self.drc_cover != DRC_NULL_COVER {
+                    let null_out = walsh_chips.iter().copied().sum::<Complex32>()
+                        * codeword_derotation
+                        / DRC_INNER_WALSH_LEN as f32;
+                    null_soft_bits[bit_idx] += null_out.im;
+                }
             }
         }
 
-        // Step 2: pick the codeword with maximum |inner-product| against the
-        // soft 8-bit vector. Each codeword's BPSK-mapped soft template is
-        // `(1-2c)` per bit, so the inner product is signed. The bi-orthogonal
-        // pair (c, 1-c) gives opposite signs; the max over all 16 codewords
-        // therefore picks both row (= value >> 1) and polarity (= value & 1).
+        if usable_codewords == 0 {
+            return None;
+        }
+
+        // Biorthogonal pairs encode the row in value >> 1 and polarity in value & 1.
         let mut scores = [0.0_f32; 16];
         for (value, codeword) in DRC_CODEWORDS.iter().enumerate() {
             let mut s = 0.0_f32;
@@ -274,12 +285,27 @@ impl DrcDecoder {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .unwrap();
 
-        // Detection: require best score to exceed `threshold * mean(|score|)`.
-        // Using mean of |score| (rather than mean of raw score, which is ~0
-        // for any orthogonal code basis) gives a stable noise floor estimate.
+        // Signed scores cancel across the codebook, so the noise floor uses absolute scores.
         let mean_abs: f32 = scores.iter().map(|s| s.abs()).sum::<f32>() / (scores.len() as f32);
         if mean_abs <= 0.0 || best_score < self.threshold * mean_abs {
             return None;
+        }
+
+        // C.S0024-A §10.7.6.1.5 defines cover 0 as the null cover, not a sector request.
+        if self.drc_cover != DRC_NULL_COVER {
+            let null_score = DRC_CODEWORDS
+                .iter()
+                .map(|codeword| {
+                    codeword
+                        .iter()
+                        .zip(null_soft_bits)
+                        .map(|(&bit, soft)| bpsk(bit) * soft)
+                        .sum::<f32>()
+                })
+                .fold(0.0_f32, f32::max);
+            if null_score >= best_score {
+                return None;
+            }
         }
 
         let confidence = best_score / mean_abs.max(f32::EPSILON);
@@ -441,6 +467,97 @@ mod tests {
 
         assert!(dec.decode(&chips, 1).is_none());
         assert_eq!(dec.decode_pilot_derotated(&chips, 1).unwrap().value, value);
+    }
+
+    #[test]
+    fn pilot_derotation_rejects_noise_and_drc_without_pilot() {
+        let decoder = DrcDecoder::new(1);
+        for length in [1, 2, 4, 8] {
+            let encoded = encode_drc(0xe, 1, length);
+            for seed in 1..=256 {
+                let noise = noise_seq(seed, encoded.len(), 1.0);
+                assert!(decoder.decode_pilot_derotated(&noise, length).is_none());
+                let no_pilot: Vec<_> = encoded
+                    .iter()
+                    .zip(noise)
+                    .map(|(signal, noise)| *signal + noise)
+                    .collect();
+                assert!(decoder.decode_pilot_derotated(&no_pilot, length).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn sector_cover_rejects_null_cover_with_small_amplitude_imbalance() {
+        const LEAKAGE_AMPLITUDE: f32 = 0.005;
+        for cover in 1..=DRC_MAX_COVER {
+            let decoder = DrcDecoder::with_threshold(cover, 4.0);
+            let cover_code = WalshGenerator::new::<DRC_INNER_WALSH_LEN>(cover as usize, 1);
+            for length in [1, 2, 4, 8] {
+                for value in 0..DRC_NUM_VALUES {
+                    let mut chips = encode_drc(value, DRC_NULL_COVER, length);
+                    for (index, chip) in chips.iter_mut().enumerate() {
+                        let group = (index / DRC_OUTER_WALSH_LEN) % DRC_INNER_WALSH_LEN;
+                        *chip *= 1.0 + LEAKAGE_AMPLITUDE * cover_code.code()[group] as f32;
+                        *chip += Complex32::new(0.5, 0.0);
+                    }
+                    assert!(
+                        decoder.decode_pilot_derotated(&chips, length).is_none(),
+                        "cover={cover} length={length} null_value={value}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pilot_derotation_recovers_one_codeword_in_partial_window() {
+        let decoder = DrcDecoder::with_threshold(1, 4.0);
+        for length in [1, 2, 4, 8] {
+            for value in 0..DRC_NUM_VALUES {
+                for active_codeword in [0, length as usize * DRC_CODEWORDS_PER_SLOT - 1] {
+                    let mut chips = encode_drc(value, 1, length);
+                    for (index, chip) in chips.iter_mut().enumerate() {
+                        if index / DRC_CHIPS_PER_CODEWORD != active_codeword {
+                            *chip = Complex32::new(0.0, 0.0);
+                        }
+                        let phase = (index / DRC_CHIPS_PER_CODEWORD) as f32 * 1.7;
+                        *chip = (*chip + Complex32::new(1.0, 0.0))
+                            * Complex32::from_polar(0.001, phase);
+                    }
+                    assert_eq!(
+                        decoder
+                            .decode_pilot_derotated(&chips, length)
+                            .map(|symbol| symbol.value),
+                        Some(value),
+                        "length={length} value={value} active_codeword={active_codeword}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pilot_derotation_preserves_weak_pilot_with_phase_changes() {
+        let decoder = DrcDecoder::new(1);
+        for length in [1, 2, 4, 8] {
+            for value in 0..DRC_NUM_VALUES {
+                let mut chips = encode_drc(value, 1, length);
+                let noise = noise_seq(123 + u32::from(value), chips.len(), 1.0);
+                for (index, (chip, noise)) in chips.iter_mut().zip(noise).enumerate() {
+                    let phase = (index / DRC_CHIPS_PER_CODEWORD) as f32 * 1.7;
+                    *chip = (*chip + Complex32::new(0.25, 0.0) + noise)
+                        * Complex32::from_polar(0.001, phase);
+                }
+                assert_eq!(
+                    decoder
+                        .decode_pilot_derotated(&chips, length)
+                        .unwrap()
+                        .value,
+                    value
+                );
+            }
+        }
     }
 
     #[test]

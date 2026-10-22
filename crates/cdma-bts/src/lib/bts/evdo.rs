@@ -43,18 +43,12 @@ pub const SR1_MIN_CARRIER_SEPARATION_HZ: usize = SR1_PASSBAND_HALF_BW_HZ as usiz
 /// to derive the total RF bandwidth and validate complex-Nyquist containment.
 pub const SR1_OCCUPIED_HALF_BW_HZ: i64 = 740_000;
 pub const SR1_OCCUPIED_BANDWIDTH_HZ: usize = SR1_OCCUPIED_HALF_BW_HZ as usize * 2;
-/// Maximum span, in slots, for an in-flight Control packet at the selected
-/// Forward Control Channel rate.
 fn hrpd_control_packet_slot_span() -> u64 {
     if ctrl_ch_kbps() == 38_400 { 64 } else { 32 }
 }
-/// Avoid letting directed signaling consume the asynchronous Control capsule;
-/// overhead remains the priority in that path.
-const MAX_DEFAULT_SIGNALING_PER_CONTROL_CAPSULE: usize = 1;
-/// Directed-message slots allowed in one synchronous capsule before capacity
-/// accounting rejects additional signaling.
-const MAX_DEFAULT_SIGNALING_PER_SYNC_CAPSULE: usize = 4;
-/// Sync-copy queue bound for directed Control Channel signaling.
+const MAX_DEFAULT_SIGNALING_PER_CONTROL_CAPSULE: usize = 4;
+const HRPD_PROBE_INITIAL_ADJUST_MIN_DB: i8 = -16;
+const HRPD_PROBE_INITIAL_ADJUST_MAX_DB: i8 = 15;
 const MAX_PENDING_SYNC_SIGNALING: usize = 32;
 const TRAFFIC_ASSIGNMENT_REPEAT_OFFSETS_SLOTS: [u64; 2] = [48, 96];
 /// Control Channel MAC capsule header: SynchronousCapsule + FirstPacket +
@@ -195,18 +189,15 @@ fn format_overhead_body(body: &[u8], active_macs: &[u8]) -> String {
     }
 }
 
-/// Move queued directed messages into `directed` while they fit the capsule
-/// bit budget. Stops at the first message identical to one already included:
-/// repeat copies of the same message stay queued for later cycles instead of
-/// burning multiple slots of one capsule on duplicates.
-fn drain_signaling_into_sync_capsule(
+// Repeat copies must remain in separate capsules to provide another reception opportunity.
+fn drain_signaling_into_capsule(
     queue: &mut VecDeque<ControlChannelDefaultSignalingMessage>,
     directed: &mut Vec<ControlChannelDefaultSignalingMessage>,
     capsule_bits: &mut usize,
     cycle_index: u64,
 ) {
     use crate::bts::hrpd::control_modulator::DEFAULT_CONTROL_MAC_BITS;
-    while directed.len() < MAX_DEFAULT_SIGNALING_PER_SYNC_CAPSULE {
+    while directed.len() < MAX_DEFAULT_SIGNALING_PER_CONTROL_CAPSULE {
         let Some(front) = queue.front() else {
             break;
         };
@@ -242,7 +233,7 @@ fn drain_due_scheduled_sync_signaling(
     cycle_index: u64,
 ) {
     use crate::bts::hrpd::control_modulator::DEFAULT_CONTROL_MAC_BITS;
-    while directed.len() < MAX_DEFAULT_SIGNALING_PER_SYNC_CAPSULE {
+    while directed.len() < MAX_DEFAULT_SIGNALING_PER_CONTROL_CAPSULE {
         let Some(pos) = queue.iter().position(|message| {
             message.synchronous_control_cycle.is_some()
                 && synchronous_control_cycle_matches(message, cycle_index)
@@ -365,12 +356,12 @@ pub struct HrpdOverheadConfig {
     pub subnet_mask: Option<u8>,
     /// Explicit HRPD color code advertised in QuickConfig and used for access.
     pub color_code: Option<u8>,
-    /// Signature advertised in QuickConfig and SectorParameters. Change this
-    /// when SectorParameters contents change so ATs refresh cached overhead.
+    /// Change this when SectorParameters changes so terminals refresh cached overhead.
     pub sector_signature: u16,
-    /// Signature advertised in QuickConfig and AccessParameters. Change this
-    /// when AccessParameters contents change so ATs refresh access config.
+    /// Change this when AccessParameters changes so terminals refresh cached overhead.
     pub access_signature: u16,
+    /// C.S0024-A §10.5.6.2.6 ProbeInitialAdjust, in 1 dB units.
+    pub probe_initial_adjust_db: i8,
 }
 
 impl Default for HrpdOverheadConfig {
@@ -381,6 +372,7 @@ impl Default for HrpdOverheadConfig {
             color_code: None,
             sector_signature: 0x0001,
             access_signature: 0x0001,
+            probe_initial_adjust_db: 0,
         }
     }
 }
@@ -403,12 +395,21 @@ impl HrpdOverheadConfig {
         let color_code = self.color_code.ok_or_else(|| {
             Error::from("evdo.overhead.color_code is required when EVDO is enabled")
         })?;
+        if !(HRPD_PROBE_INITIAL_ADJUST_MIN_DB..=HRPD_PROBE_INITIAL_ADJUST_MAX_DB)
+            .contains(&self.probe_initial_adjust_db)
+        {
+            return Err(format!(
+                "evdo.overhead.probe_initial_adjust_db must be in {HRPD_PROBE_INITIAL_ADJUST_MIN_DB}..={HRPD_PROBE_INITIAL_ADJUST_MAX_DB} (current: {})",
+                self.probe_initial_adjust_db,
+            ).into());
+        }
         Ok(ResolvedHrpdOverheadConfig {
             sector_id,
             subnet_mask,
             color_code,
             sector_signature: self.sector_signature,
             access_signature: self.access_signature,
+            probe_initial_adjust_db: self.probe_initial_adjust_db,
         })
     }
 }
@@ -420,6 +421,7 @@ pub struct ResolvedHrpdOverheadConfig {
     pub color_code: u8,
     pub sector_signature: u16,
     pub access_signature: u16,
+    pub probe_initial_adjust_db: i8,
 }
 
 impl ResolvedHrpdOverheadConfig {
@@ -768,25 +770,14 @@ pub struct HrpdForwardSlotModulator {
     /// into `pending_signaling` once the live slot index reaches the stored
     /// slot, spacing the copies across the AT's response window.
     deferred_signaling: Vec<(u64, ControlChannelDefaultSignalingMessage)>,
-    /// Synchronous-capsule copies of directed signaling. A slotted AT only
-    /// monitors the synchronous Sleep State capsule at the start of each
-    /// Control Channel cycle (C.S0024-0 v4.0 §8.2.6) and never sees the
-    /// mid-cycle asynchronous capsules, so every directed message also gets
-    /// queued here and rides the next cycle-boundary capsule.
+    /// C.S0024-0 v4.0 §8.2.6 restricts slotted terminals to synchronous Sleep State capsules.
     pending_sync_signaling: VecDeque<ControlChannelDefaultSignalingMessage>,
-    /// Active ReverseLinkMACIndex public data has changed and should be
-    /// observed in the next synchronous Sleep State QuickConfig capsule.
     active_mac_overhead_pending: bool,
+    active_mac_overhead_in_flight: bool,
     active_mac_overhead_hold_logged: bool,
 }
 
 impl HrpdForwardSlotModulator {
-    /// Construct the forward-link modulator. The scheduler is fed a slot
-    /// index derived from the live chip cursor; the overhead schedule flags
-    /// Control slots at the start of each Control Channel cycle and the
-    /// modulator auto-builds a capsule from the overhead-message sources
-    /// (pre-populated with defaults; replace via the
-    /// `set_overhead_*` setters once real sector parameters are available).
     pub fn new(pilot_offset: usize, short_code_length_chips: usize) -> Self {
         Self {
             spreader: Spreader::new(HrpdForwardPnSequence::new(
@@ -819,14 +810,12 @@ impl HrpdForwardSlotModulator {
             deferred_signaling: Vec::new(),
             pending_sync_signaling: VecDeque::new(),
             active_mac_overhead_pending: false,
+            active_mac_overhead_in_flight: false,
             active_mac_overhead_hold_logged: false,
         }
     }
 
-    /// Load a Forward Control Channel capsule for transmission on the next
-    /// Control slot(s). Returns true if the capsule fit a supported turbo
-    /// block. Auto-cycle wiring builds capsules itself; this entry point
-    /// remains useful for tests and externally-built capsules.
+    /// Returns false if the capsule does not fit a supported turbo block.
     pub fn load_control_capsule(
         &mut self,
         capsule: &crate::bts::hrpd::control_channel::ControlChannelCapsule,
@@ -933,17 +922,13 @@ impl HrpdForwardSlotModulator {
         }
         self.sector_params = Some(sp);
 
-        // AccessParameters: keep the spec defaults (preamble length, probe
-        // sequence, persistence vectors). These are tunable per deployment
-        // but the defaults are acquirable.
         let mut ap = AccessParameters::defaults();
         ap.access_signature = overhead.access_signature;
+        ap.probe_initial_adjust = overhead.probe_initial_adjust_db;
         self.access_params = Some(ap);
 
         self.reverse_rate = Some(BroadcastReverseRateLimit {
-            // C.S0024-300 §1.10.6.3.3 requires RPCCount >= 64 - the smallest
-            // assigned subtype-0 MAC index. Cover MAC 1..64 with a uniform
-            // 153.6 kbps cap; assigned live MACs are in the low Rev 0 range.
+            // C.S0024-300 §1.10.6.3.3 requires RPCCount >= 64 - the smallest assigned MAC index.
             rpc_count: 63,
             rate_limit: vec![5; 63],
         });
@@ -980,14 +965,34 @@ impl HrpdForwardSlotModulator {
                 || fires.reverse_rate
                 || !self.pending_sync_signaling.is_empty());
         if !has_scheduled_overhead {
-            let messages = self.pop_pending_signaling_for_capsule();
-            if messages.is_empty() {
+            let bodies = if self.active_mac_overhead_pending && !self.active_mac_overhead_in_flight
+            {
+                self.quick_config
+                    .as_ref()
+                    .map(|qc| vec![qc.encode()])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut capsule_bits = CONTROL_CAPSULE_HEADER_BITS
+                + bodies
+                    .iter()
+                    .map(|body| capsule_overhead_body_bits(body))
+                    .sum::<usize>();
+            let mut messages = Vec::new();
+            drain_signaling_into_capsule(
+                &mut self.pending_signaling,
+                &mut messages,
+                &mut capsule_bits,
+                cycle_index,
+            );
+            if messages.is_empty() && bodies.is_empty() {
                 return None;
             }
-            return Some(ControlChannelCapsule::new_asynchronous_default_signaling(
-                messages,
-                ctrl_ch_kbps(),
-            ));
+            let mut capsule =
+                ControlChannelCapsule::new_with_default_signaling(bodies, messages, ctrl_ch_kbps());
+            capsule.synchronous = false;
+            return Some(capsule);
         }
 
         let mut bodies: Vec<Vec<u8>> = Vec::new();
@@ -1041,26 +1046,13 @@ impl HrpdForwardSlotModulator {
                 cycle_index,
             );
         } else {
-            drain_signaling_into_sync_capsule(
+            drain_signaling_into_capsule(
                 &mut self.pending_sync_signaling,
                 &mut directed,
                 &mut capsule_bits,
                 cycle_index,
             );
-            // Async-queue stragglers enqueued in the last few slots may as
-            // well ride this capsule too instead of waiting for the next async
-            // slot, as long as this is not an explicitly scheduled sleep-state
-            // capsule.
-            drain_signaling_into_sync_capsule(
-                &mut self.pending_signaling,
-                &mut directed,
-                &mut capsule_bits,
-                cycle_index,
-            );
         }
-        // A message carried by this capsule doesn't need its asynchronous
-        // copy anymore — every AT that decodes async capsules decodes the
-        // synchronous capsule too.
         for message in &directed {
             if let Some(pos) = self
                 .pending_signaling
@@ -1069,6 +1061,14 @@ impl HrpdForwardSlotModulator {
             {
                 self.pending_signaling.remove(pos);
             }
+        }
+        if !scheduled_sync_due {
+            drain_signaling_into_capsule(
+                &mut self.pending_signaling,
+                &mut directed,
+                &mut capsule_bits,
+                cycle_index,
+            );
         }
         if bodies.is_empty() && directed.is_empty() {
             return None;
@@ -1124,6 +1124,7 @@ impl HrpdForwardSlotModulator {
     }
 
     fn refresh_active_mac_overhead(&mut self) {
+        self.active_mac_overhead_in_flight = false;
         let actives = self.mac_encoder.actives();
         let active_mac_indices = active_mac_indices_from_encoder(&self.mac_encoder);
         let Some(min_mac) = actives
@@ -1324,6 +1325,11 @@ impl HrpdForwardSlotModulator {
         if self.current_slot == Some(slot_index) {
             return;
         }
+        if self.active_mac_overhead_in_flight && self.control.remaining() == 0 {
+            self.active_mac_overhead_pending = false;
+            self.active_mac_overhead_in_flight = false;
+            self.active_mac_overhead_hold_logged = false;
+        }
         self.promote_due_deferred_signaling(slot_index);
         let cycle = u64::from(CTRL_CH_CYCLE_SLOTS);
         let at_cycle_boundary = cycle > 0 && slot_index % cycle == 0;
@@ -1336,39 +1342,23 @@ impl HrpdForwardSlotModulator {
                 || s.access_params
                 || s.sync
                 || s.reverse_rate
-                // Directed sync-capsule copies also warrant a synchronous
-                // capsule this cycle, even if no overhead slot fires.
                 || !self.pending_sync_signaling.is_empty()
         };
         let async_control_can_start = (cycle == 0
             || cycle_slot <= cycle.saturating_sub(hrpd_control_packet_slot_span()))
             && slot_index % 4 == 0;
-        let starts_control_capsule = scheduled_overhead_fires
-            || (!self.pending_signaling.is_empty() && async_control_can_start);
+        let needs_async_control = !self.pending_signaling.is_empty()
+            || (self.active_mac_overhead_pending && !self.active_mac_overhead_in_flight);
+        let starts_control_capsule =
+            scheduled_overhead_fires || (needs_async_control && async_control_can_start);
 
-        // Auto-build a capsule from the configured overhead bodies whenever
-        // this is a new cycle boundary that fires at least one source. We
-        // condition on `last_cycle_loaded` so changing a setter mid-cycle doesn't
-        // tear the in-flight capsule.
+        // An overhead update must not replace an in-flight capsule.
         if starts_control_capsule
             && self.control.remaining() == 0
-            && (scheduled_overhead_fires || !self.pending_signaling.is_empty())
+            && (scheduled_overhead_fires || needs_async_control)
             && (!scheduled_overhead_fires || self.last_cycle_loaded != Some(cycle_index))
         {
-            // C.S0024-0 v4.0 §6.3.6.2.1: SystemTime is "the System Time 160 ms
-            // after the start of the Control Channel Cycle in which the Sync
-            // message is being sent" in units of 26.66… ms.
-            //
-            // Our `chip` cursor is absolute chips-since-CDMA-epoch (initialized
-            // by `timing::compute_initial_tx_anchor` from
-            // `chips_since_epoch(start_system_time)` and incremented chip-for-
-            // chip from there). At a cycle boundary `chip == cycle_start_chip`,
-            // so:
-            //   SystemTime [ticks] = (chip + 160 ms × 1.2288 Mcps) / 32768
-            //                      = (chip + 196_608) / 32_768
-            //
-            // 196_608 / 32_768 = 6 exactly, so the +160 ms offset is precisely
-            // 6 ticks ahead of cycle start — no rounding error.
+            // C.S0024-0 v4.0 §6.3.6.2.1 places SystemTime six 26.6667 ms ticks after cycle start.
             const SYSTEM_TIME_CHIPS_PER_TICK: u64 = 32_768;
             const SYNC_OFFSET_CHIPS: u64 = 196_608;
             const SYSTEM_TIME_MASK: u64 = (1u64 << 37) - 1;
@@ -1423,11 +1413,10 @@ impl HrpdForwardSlotModulator {
                         .join(",")
                 };
                 if loaded {
-                    if active_mac_overhead_was_pending && capsule.synchronous && has_quick_config {
-                        self.active_mac_overhead_pending = false;
-                        self.active_mac_overhead_hold_logged = false;
+                    if active_mac_overhead_was_pending && has_quick_config {
+                        self.active_mac_overhead_in_flight = true;
                         info!(
-                            "HRPD active MAC public data loaded in synchronous QuickConfig slot={} cycle={} messages=[{}]",
+                            "HRPD active MAC public data queued in QuickConfig slot={} cycle={} messages=[{}]",
                             slot_index,
                             cycle_index,
                             message_summaries(&self.mac_encoder)
@@ -1528,13 +1517,19 @@ impl HrpdForwardSlotModulator {
         }
     }
 
-    fn pop_pending_signaling_for_capsule(&mut self) -> Vec<ControlChannelDefaultSignalingMessage> {
+    #[cfg(test)]
+    fn pop_pending_signaling_for_capsule(
+        &mut self,
+        cycle_index: u64,
+    ) -> Vec<ControlChannelDefaultSignalingMessage> {
         let mut out = Vec::new();
-        while out.len() < MAX_DEFAULT_SIGNALING_PER_CONTROL_CAPSULE
-            && let Some(message) = self.pending_signaling.pop_front()
-        {
-            out.push(message);
-        }
+        let mut capsule_bits = CONTROL_CAPSULE_HEADER_BITS;
+        drain_signaling_into_capsule(
+            &mut self.pending_signaling,
+            &mut out,
+            &mut capsule_bits,
+            cycle_index,
+        );
         out
     }
 }
@@ -1698,6 +1693,37 @@ mod modulator_tests {
             err.to_string().contains("subnet_mask must be in 0..=128"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn access_probe_power_adjustment_is_validated_and_broadcast() {
+        for adjustment_db in [-17, -16, -6, 0, 15, 16] {
+            let config = HrpdOverheadConfig {
+                sector_id: Some(HrpdSectorId::new([0; 16])),
+                subnet_mask: Some(26),
+                color_code: Some(26),
+                access_signature: 2,
+                probe_initial_adjust_db: adjustment_db,
+                ..Default::default()
+            };
+            let resolved = config.resolve();
+            if !(-16..=15).contains(&adjustment_db) {
+                assert!(
+                    resolved
+                        .unwrap_err()
+                        .to_string()
+                        .contains("probe_initial_adjust_db")
+                );
+                continue;
+            }
+            let mut modulator = HrpdForwardSlotModulator::new(0, 32_768);
+            modulator.install_sector_overheads(0, None, 0, 37, resolved.unwrap());
+            let access = modulator.access_params.as_ref().unwrap();
+            assert_eq!(access.probe_initial_adjust, adjustment_db);
+            assert_eq!(access.access_signature, 2);
+            assert_eq!(modulator.quick_config.as_ref().unwrap().access_signature, 2);
+        }
+        assert_eq!(HrpdOverheadConfig::default().probe_initial_adjust_db, 0);
     }
 
     #[test]
@@ -2101,7 +2127,7 @@ mod modulator_tests {
     }
 
     #[test]
-    fn queued_forward_signaling_keeps_one_message_per_capsule() {
+    fn queued_forward_signaling_packs_ack_and_assignment() {
         let mut m = HrpdForwardSlotModulator::new(0, 32_768);
         m.set_overhead_quick_config(None);
         m.set_overhead_sector_params(None);
@@ -2134,14 +2160,105 @@ mod modulator_tests {
             .build_capsule_for_cycle(1, false)
             .expect("queued signaling capsule");
 
-        assert_eq!(capsule.messages.len(), 1);
+        assert_eq!(capsule.messages.len(), 2);
+        assert!(m.load_control_capsule(&capsule));
         assert_eq!(capsule.messages[0], vec![0x00]);
-        assert_eq!(m.pending_signaling.len(), 1);
+        assert_eq!(m.pending_signaling.len(), 0);
         assert_eq!(
             m.deferred_signaling.len(),
             TRAFFIC_ASSIGNMENT_REPEAT_OFFSETS_SLOTS.len(),
             "TrafficChannelAssignment should keep bounded best-effort repeat copies"
         );
+    }
+
+    #[test]
+    fn synchronous_capsule_skips_ack_copy_without_dropping_assignment_repeat() {
+        let mut m = HrpdForwardSlotModulator::new(0, 32_768);
+        m.set_overhead_quick_config(None);
+        m.set_overhead_sector_params(None);
+        m.set_overhead_access_params(None);
+        m.set_overhead_reverse_rate(None);
+        m.set_overhead_sync(None);
+        let ati = cdma_common::hrpd::air::AccessTerminalIdentifier {
+            ati_type: cdma_common::hrpd::air::AccessTerminalIdentifierType::Uati,
+            value: 0x1a05_8001,
+        };
+        m.enqueue_forward_signaling(HrpdForwardSignalingRequest::access_channel_ack(ati));
+        m.enqueue_forward_signaling(HrpdForwardSignalingRequest {
+            uati: Some(0x8005_8001),
+            target_ati: ati,
+            protocol_type: cdma_common::hrpd::air::DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE,
+            payload: vec![
+                0x01, 0x00, 0x80, 0x01, 0x3b, 0x03, 0xd7, 0x42, 0x00, 0x0a, 0x00,
+            ],
+            channel: cdma_common::hrpd::air::HrpdForwardChannel::AsynchronousControl,
+            reliable_sequence: None,
+            synchronous_control_cycle: None,
+        });
+        assert_eq!(
+            m.pending_sync_signaling.len(),
+            1,
+            "only ACAck should keep a synchronous fallback copy"
+        );
+
+        m.pending_signaling
+            .push_back(m.pending_signaling.back().unwrap().clone());
+
+        let capsule = m
+            .build_capsule_for_cycle(1, true)
+            .expect("queued signaling capsule");
+
+        assert_eq!(capsule.messages.len(), 2);
+        assert!(m.load_control_capsule(&capsule));
+        assert_eq!(capsule.messages[0], vec![0x00]);
+        assert_eq!(m.pending_signaling.len(), 1);
+        assert_eq!(
+            m.pending_signaling.front().unwrap().payload,
+            capsule.messages[1]
+        );
+        assert!(m.pending_sync_signaling.is_empty());
+        assert_eq!(
+            m.deferred_signaling.len(),
+            TRAFFIC_ASSIGNMENT_REPEAT_OFFSETS_SLOTS.len(),
+            "TrafficChannelAssignment should keep bounded best-effort repeat copies"
+        );
+    }
+
+    #[test]
+    fn async_capsules_preserve_overflow_and_repeat_messages() {
+        use crate::bts::hrpd::control_modulator::DEFAULT_CONTROL_MAC_BITS;
+
+        let ati = cdma_common::hrpd::air::AccessTerminalIdentifier {
+            ati_type: cdma_common::hrpd::air::AccessTerminalIdentifierType::Uati,
+            value: 0x1a05_8001,
+        };
+        for duplicate in [false, true] {
+            let mut m = HrpdForwardSlotModulator::new(0, 32_768);
+            m.enqueue_forward_signaling(HrpdForwardSignalingRequest::access_channel_ack(ati));
+            let first = m.pending_signaling.front_mut().unwrap();
+            let empty_payload_bits = capsule_directed_message_bits(first) - first.payload.len() * 8;
+            first.payload.resize(
+                (DEFAULT_CONTROL_MAC_BITS - CONTROL_CAPSULE_HEADER_BITS - empty_payload_bits) / 8,
+                0,
+            );
+            if duplicate {
+                first.payload.truncate(1);
+            }
+            let mut second = first.clone();
+            if !duplicate {
+                second.payload = vec![0x01];
+            }
+            m.pending_signaling.push_back(second.clone());
+
+            let messages = m.pop_pending_signaling_for_capsule(1);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(m.pending_signaling.front(), Some(&second));
+            let capsule =
+                ControlChannelCapsule::new_asynchronous_default_signaling(messages, ctrl_ch_kbps());
+            assert!(m.load_control_capsule(&capsule));
+            assert_eq!(m.pop_pending_signaling_for_capsule(1), vec![second]);
+            assert!(m.pending_signaling.is_empty());
+        }
     }
 
     #[test]
@@ -2249,10 +2366,47 @@ mod modulator_tests {
             control_data_nonzero > 0,
             "active-MAC overhead should load a synchronous control capsule even without queued signaling"
         );
-        assert!(
-            !m.active_mac_overhead_pending,
-            "active-MAC overhead should be consumed by synchronous QuickConfig"
+        assert!(m.active_mac_overhead_pending);
+        assert!(m.active_mac_overhead_in_flight);
+        let remaining_slots = hrpd_control_packet_slot_span();
+        let _ = block(
+            &mut m,
+            cycle_start + SLOT_CHIPS,
+            (remaining_slots * SLOT_CHIPS) as usize,
         );
+        assert!(!m.active_mac_overhead_pending);
+        assert!(!m.active_mac_overhead_in_flight);
+    }
+
+    #[test]
+    fn active_mac_update_during_quick_config_keeps_traffic_held() {
+        let mut m = HrpdForwardSlotModulator::new(0, 32_768);
+        let active = |mac_index| crate::bts::hrpd::mac_encoder::ActiveMac {
+            mac_index,
+            rpc: true,
+            rpc_alternating: false,
+            drclock: true,
+            frame_offset: 0,
+            physical_layer_subtype: 0,
+        };
+        m.set_active_macs(vec![active(5)]);
+        let _ = block(&mut m, 0, SLOT_CHIPS as usize);
+        assert!(m.active_mac_overhead_in_flight);
+        m.set_active_macs(vec![active(5), active(6)]);
+        assert!(!m.active_mac_overhead_in_flight);
+        let span = hrpd_control_packet_slot_span();
+        let _ = block(&mut m, SLOT_CHIPS, ((span - 1) * SLOT_CHIPS) as usize);
+        assert!(m.active_mac_overhead_pending);
+        assert!(!m.active_mac_overhead_in_flight);
+        let _ = block(&mut m, span * SLOT_CHIPS, SLOT_CHIPS as usize);
+        assert!(m.active_mac_overhead_pending);
+        assert!(m.active_mac_overhead_in_flight);
+        let _ = block(
+            &mut m,
+            (span + 1) * SLOT_CHIPS,
+            (span * SLOT_CHIPS) as usize,
+        );
+        assert!(!m.active_mac_overhead_pending);
     }
 
     #[test]
@@ -2303,7 +2457,6 @@ mod modulator_tests {
         bus.set_current_drc_at_slot(MAC_INDEX, 0, 0x1);
         m.set_harq_bus(bus.clone());
 
-        // Model a mid-cycle assignment before the next synchronous QuickConfig.
         m.current_slot = Some(0);
         m.last_cycle_loaded = Some(0);
         m.set_active_macs(vec![crate::bts::hrpd::mac_encoder::ActiveMac {
@@ -2337,17 +2490,22 @@ mod modulator_tests {
             "queued traffic must not start before active-MAC QuickConfig is public"
         );
 
-        let cycle_start_slot = u64::from(CTRL_CH_CYCLE_SLOTS);
-        let cycle_start_chip = cycle_start_slot * SLOT_CHIPS;
-        bus.set_current_drc_at_slot(MAC_INDEX, cycle_start_slot - 1, 0x1);
-        let _ = block(&mut m, cycle_start_chip, SLOT_CHIPS as usize);
-        assert!(
-            !m.active_mac_overhead_pending,
-            "active-MAC public data should load at the next synchronous QuickConfig"
-        );
-
-        let traffic_start_chip = cycle_start_chip + SLOT_CHIPS;
+        let first_async_slot = 4;
+        let last_control_slot = first_async_slot + hrpd_control_packet_slot_span() - 4;
+        for slot in 2..=last_control_slot {
+            bus.set_current_drc_at_slot(MAC_INDEX, slot - 1, 0x1);
+            let _ = block(&mut m, slot * SLOT_CHIPS, SLOT_CHIPS as usize);
+            assert!(m.active_mac_overhead_pending);
+            if slot >= first_async_slot {
+                assert!(m.active_mac_overhead_in_flight);
+            }
+        }
+        let traffic_start_slot = last_control_slot + 1;
+        let traffic_start_chip = traffic_start_slot * SLOT_CHIPS;
+        bus.set_current_drc_at_slot(MAC_INDEX, traffic_start_slot - 1, 0x1);
         let traffic = block(&mut m, traffic_start_chip, SLOT_CHIPS as usize);
+        assert!(!m.active_mac_overhead_pending);
+        assert!(!m.active_mac_overhead_in_flight);
         let traffic_data_nonzero = traffic
             .iter()
             .enumerate()

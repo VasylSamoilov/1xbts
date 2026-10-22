@@ -748,6 +748,10 @@ impl HrpdAirController {
             .messages
             .iter()
             .any(|message| matches!(message, HrpdAccessMessage::UatiComplete(_)));
+        let access_contains_session_close = indication
+            .messages
+            .iter()
+            .any(|message| matches!(message, HrpdAccessMessage::SessionClose(_)));
         if !indication.messages.is_empty() {
             log::info!(
                 "HRPD AN: queueing ACAck for access ati={:?} messages={}",
@@ -772,13 +776,15 @@ impl HrpdAirController {
             let at = &mut at;
             match message {
                 HrpdAccessMessage::RouteUpdate(route) => {
-                    self.maybe_session_close_orphaned_cached_uati_access(
-                        at,
-                        indication.ati,
-                        allocator,
-                        &mut outcome,
-                        "RouteUpdate",
-                    );
+                    if !access_contains_session_close {
+                        self.maybe_session_close_orphaned_cached_uati_access(
+                            at,
+                            indication.ati,
+                            allocator,
+                            &mut outcome,
+                            "RouteUpdate",
+                        );
+                    }
                     outcome.route_updates.push(route.clone());
                 }
                 HrpdAccessMessage::UatiRequest(request) => {
@@ -856,6 +862,35 @@ impl HrpdAirController {
                     }
                 }
                 HrpdAccessMessage::ConnectionRequest(connection) => {
+                    let unconfirmed_configuration = at
+                        .pending_traffic_assignment
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.active
+                                && pending.connection_request_transaction_id
+                                    != connection.transaction_id
+                                && pending.session_config_complete_sent
+                                && !pending.an_session_config_complete_acked
+                                && Self::pending_configuration_changes_in_use(at, pending)
+                        });
+                    if unconfirmed_configuration {
+                        self.cancel_access_traffic_outputs_for_session_close(&mut outcome);
+                        outcome
+                            .forward_signaling
+                            .push(HrpdForwardSignalingRequest::session_close(
+                                indication.ati,
+                                SESSION_CLOSE_REASON_SESSION_LOST,
+                                &[],
+                            ));
+                        self.close_session_from_access(
+                            at,
+                            indication.ati,
+                            allocator,
+                            &mut outcome,
+                            "idle reconnect before configuration delivery was confirmed",
+                        )?;
+                        break;
+                    }
                     let access_slot =
                         Some(indication.absolute_chip / HRPD_REVERSE_TRAFFIC_SLOT_CHIPS);
                     if self.connection_request_waiting_for_assigned_uati(at, indication.ati)
@@ -2164,14 +2199,7 @@ impl HrpdAirController {
             );
             return;
         }
-        // A ConnectionRequest is an Idle State message: an AT with a live
-        // traffic connection never sends one. A *new* transaction arriving
-        // while an assignment is still marked active means the AT already
-        // abandoned that channel, so waiting out DRC-silence/pilot-loss
-        // supervision only delays the retry — release the stale assignment
-        // and hand the AT a fresh one now. A repeat of the transaction that
-        // opened the active assignment is just a late access-probe
-        // retransmission and keeps the current connection.
+        // A new Idle State ConnectionRequest means the previous traffic connection ended.
         match at
             .pending_traffic_assignment
             .as_ref()
@@ -2189,6 +2217,21 @@ impl HrpdAirController {
                 return;
             }
             Some(_) => {
+                let commit_confirmed_configuration = at
+                    .pending_traffic_assignment
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.an_session_config_complete_acked
+                            && pending.session_config_commit_connection_close_sent
+                    });
+                if commit_confirmed_configuration
+                    && Self::commit_pending_session_configuration(at, traffic_uati).is_some()
+                {
+                    at.session_configuration_complete = true;
+                    log::info!(
+                        "HRPD AN: new idle ConnectionRequest confirms connection closure after acknowledged SessionConfiguration UATI=0x{traffic_uati:08x}; retaining negotiated configuration"
+                    );
+                }
                 log::info!(
                     "HRPD AN: new ConnectionRequest transaction=0x{:02x} reason={} while traffic assignment is active session_uati=0x{:08x}; releasing stale assignment and reassigning",
                     request.transaction_id,
@@ -5941,6 +5984,27 @@ mod tests {
 
     #[test]
     fn live_session_configuration_reopens_rev_a_traffic_with_default_tca() {
+        check_session_configuration_reopen(ConfigurationCloseDelivery::Reply);
+    }
+
+    #[test]
+    fn session_configuration_reopens_rev_a_after_lost_close_reply() {
+        check_session_configuration_reopen(ConfigurationCloseDelivery::LostReply);
+    }
+
+    #[test]
+    fn session_configuration_reconnect_resets_unacknowledged_settings() {
+        check_session_configuration_reopen(ConfigurationCloseDelivery::Unacknowledged);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ConfigurationCloseDelivery {
+        Reply,
+        LostReply,
+        Unacknowledged,
+    }
+
+    fn check_session_configuration_reopen(delivery: ConfigurationCloseDelivery) {
         let mut controller = HrpdAirController::with_sector(26, 0, None);
         let mut allocator = allocator();
         let _ = controller
@@ -6075,40 +6139,56 @@ mod tests {
             .expect("SessionConfigurationComplete should await ACK before commit close")
             .sequence_number;
 
-        let commit_close = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
-            uati: first_traffic.uati,
-            payload: encode_default_signaling_slp_d_ack_packet(complete_seq),
-        });
-        assert_eq!(commit_close.forward_traffic.len(), 1);
-        assert!(commit_close.session_configuration_complete_uatis.is_empty());
+        if delivery != ConfigurationCloseDelivery::Unacknowledged {
+            let commit_close =
+                controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+                    uati: first_traffic.uati,
+                    payload: encode_default_signaling_slp_d_ack_packet(complete_seq),
+                });
+            assert_eq!(commit_close.forward_traffic.len(), 1);
+            assert!(commit_close.session_configuration_complete_uatis.is_empty());
+        }
 
-        let close_reply = encode_reliable_default_signaling_packet(
-            DEFAULT_CONNECTED_STATE_PROTOCOL_TYPE,
-            &[0x00, 0x40],
-            3,
-        );
-        let close_reply = controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
-            uati: first_traffic.uati,
-            payload: close_reply,
-        });
-        assert_eq!(
-            close_reply.session_configuration_complete_uatis,
-            vec![first_traffic.uati]
-        );
-        assert_eq!(
-            close_reply.traffic_releases,
-            vec![HrpdTrafficReleaseRequest {
-                uati: first_traffic.uati,
-                mac_index: first_traffic.mac_index,
-            }]
-        );
-        let event = close_reply
-            .session_configuration_complete_events
-            .first()
-            .expect("SessionConfigurationComplete event should carry committed subtypes");
-        assert_eq!(event.physical_layer_subtype, SESSION_SUBTYPE_PHYS_SUBTYPE2);
-        assert_eq!(event.forward_traffic_mac_subtype, SESSION_SUBTYPE_ENHANCED);
-        assert!(controller.pending_traffic_assignment().is_none());
+        if delivery == ConfigurationCloseDelivery::Reply {
+            const CLOSE_REPLY_REASON: u8 = 0x01;
+            const CLOSE_REPLY_SEQUENCE: u8 = 3;
+            let close_reply = HrpdForwardSignalingRequest::connection_close(
+                first_traffic.uati,
+                AccessTerminalIdentifier {
+                    ati_type: AccessTerminalIdentifierType::Uati,
+                    value: first_traffic.uati,
+                },
+                CLOSE_REPLY_REASON,
+            );
+            let close_reply = encode_reliable_default_signaling_packet(
+                close_reply.protocol_type,
+                &close_reply.payload,
+                CLOSE_REPLY_SEQUENCE,
+            );
+            let close_reply =
+                controller.handle_traffic_event(&HrpdTrafficEvent::Stream0Signaling {
+                    uati: first_traffic.uati,
+                    payload: close_reply,
+                });
+            assert_eq!(
+                close_reply.session_configuration_complete_uatis,
+                vec![first_traffic.uati]
+            );
+            assert_eq!(
+                close_reply.traffic_releases,
+                vec![HrpdTrafficReleaseRequest {
+                    uati: first_traffic.uati,
+                    mac_index: first_traffic.mac_index,
+                }]
+            );
+            let event = close_reply
+                .session_configuration_complete_events
+                .first()
+                .expect("SessionConfigurationComplete event should carry committed subtypes");
+            assert_eq!(event.physical_layer_subtype, SESSION_SUBTYPE_PHYS_SUBTYPE2);
+            assert_eq!(event.forward_traffic_mac_subtype, SESSION_SUBTYPE_ENHANCED);
+            assert!(controller.pending_traffic_assignment().is_none());
+        }
 
         let mut reopen = indication(vec![HrpdAccessMessage::ConnectionRequest(
             HrpdConnectionRequest {
@@ -6125,6 +6205,17 @@ mod tests {
             .handle_access_indication(&reopen, &mut allocator)
             .unwrap();
 
+        if delivery == ConfigurationCloseDelivery::Unacknowledged {
+            assert!(reopen.traffic_assignments.is_empty());
+            assert!(reopen.forward_traffic.is_empty());
+            assert_eq!(reopen.session_closed_uatis, vec![first_traffic.uati]);
+            assert!(reopen.forward_signaling.iter().any(|request| {
+                request.protocol_type == DEFAULT_SESSION_MANAGEMENT_PROTOCOL_TYPE
+                    && request.payload == vec![0x01, SESSION_CLOSE_REASON_SESSION_LOST, 0]
+            }));
+            assert!(controller.pending_traffic_assignment().is_none());
+            return;
+        }
         assert_eq!(reopen.traffic_assignments.len(), 1);
         assert_eq!(
             reopen.traffic_assignments[0].physical_layer_subtype,
@@ -6637,6 +6728,51 @@ mod tests {
             vec![0x01, SESSION_CLOSE_REASON_SESSION_LOST, 0x00]
         );
         assert_eq!(out.forward_traffic.len(), 0);
+    }
+
+    #[test]
+    fn orphaned_uati_close_reply_with_route_update_does_not_restart_close() {
+        const CLOSE_REPLY_REASON: u8 = 1;
+        for close_first in [false, true] {
+            let mut controller = HrpdAirController::new(26);
+            let mut allocator = allocator();
+            let route = AirRouteUpdate {
+                message_sequence: 8,
+                reference_pilot_pn: 0,
+                reference_pilot_strength: 0,
+                reference_keep: true,
+                num_pilots: 0,
+                at_total_pilot_transmission: None,
+                reference_pilot_channel: None,
+                reserved_zero: true,
+            };
+            let mut messages = vec![
+                HrpdAccessMessage::RouteUpdate(route.clone()),
+                HrpdAccessMessage::SessionClose(HrpdSessionClose {
+                    close_reason: CLOSE_REPLY_REASON,
+                    more_info: Vec::new(),
+                }),
+            ];
+            if close_first {
+                messages.reverse();
+            }
+            let mut request = indication(messages);
+            request.ati = AccessTerminalIdentifier {
+                ati_type: AccessTerminalIdentifierType::Uati,
+                value: 0x1a05_8001,
+            };
+            let out = controller
+                .handle_access_indication(&request, &mut allocator)
+                .unwrap();
+            assert_eq!(out.route_updates, vec![route]);
+            assert_eq!(out.session_closes.len(), 1);
+            assert_eq!(
+                out.forward_signaling,
+                vec![HrpdForwardSignalingRequest::access_channel_ack(request.ati)]
+            );
+            assert!(out.traffic_assignments.is_empty());
+            assert_eq!(controller.session().state(), SessionState::Closed);
+        }
     }
 
     #[test]

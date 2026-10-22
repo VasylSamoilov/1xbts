@@ -787,6 +787,7 @@ impl Bts {
             m
         });
         let mut hrpd_active_macs: Vec<crate::bts::hrpd::ActiveMac> = Vec::new();
+        let mut hrpd_pending_signaling = Vec::new();
         let evdo_hrpd_only = self.evdo.as_ref().is_some_and(|cfg| cfg.uses_hrpd_only());
         let mut evdo_composer = if let Some(cfg) = self
             .evdo
@@ -1185,6 +1186,10 @@ impl Bts {
                 if let (Some(evdo_idle), Some(evdo_tx_batch)) =
                     (evdo_idle.as_mut(), evdo_tx_batch.as_mut())
                 {
+                    // Snapshot signaling before assignments so every setup message sees its earlier assignment.
+                    while let Ok(request) = self.hrpd_forward_signaling_rx.try_recv() {
+                        hrpd_pending_signaling.push(request);
+                    }
                     while let Ok(release) = self.hrpd_traffic_release_rx.try_recv() {
                         info!(
                             "HRPD traffic release: uati=0x{:08x} mac_index={}",
@@ -1265,7 +1270,7 @@ impl Bts {
                             );
                         }
                     }
-                    while let Ok(request) = self.hrpd_forward_signaling_rx.try_recv() {
+                    for request in hrpd_pending_signaling.drain(..) {
                         info!(
                             "HRPD forward signaling enqueue: channel={:?} protocol=0x{:02x} target={:?} payload_octets={}",
                             request.channel,

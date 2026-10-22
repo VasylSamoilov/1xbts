@@ -153,12 +153,14 @@ impl PipelineProcessor for HrpdReverseTrafficDrcProcessor {
             && window_slot < HRPD_TRAFFIC_SLOTS_PER_FRAME
         {
             let window = &block.samples[window_start..window_start + window_chips];
-            if let Some(DrcSymbol { value, confidence }) = self.decoder.decode(window, drc_length) {
+            let decoded = if physical_layer_subtype == 2 {
+                self.decoder.decode_pilot_derotated(window, drc_length)
+            } else {
+                self.decoder.decode(window, drc_length)
+            };
+            if let Some(DrcSymbol { value, confidence }) = decoded {
                 let value = normalize_drc_polarity(value, q_sign);
-                // The decoded DRC value is valid for the *entire*
-                // `drc_length`-slot window. Replicate the value across every
-                // slot the window covers so downstream consumers can read
-                // any individual slot nibble.
+                // DRC governs every slot in its DRCLength window.
                 for slot_offset in 0..drc_length as usize {
                     let slot = window_slot + slot_offset;
                     if slot >= HRPD_TRAFFIC_SLOTS_PER_FRAME {

@@ -240,16 +240,25 @@ impl HarqBus {
         }
     }
 
-    /// Schedule the forward ARQ channel content for one absolute TX slot.
-    /// Callers write each of the three response slots (m, m+1, m+2)
-    /// individually; a later write to the same slot merges by overriding
-    /// only the channel(s) not set to `Off`.
+    /// Write each response slot m..m+2 separately. Off preserves a channel set by an earlier write.
     pub fn schedule_arq_at_slot(&self, mac: u8, slot: u64, h_or_l: ArqLevel, p: ArqLevel) {
+        if h_or_l == ArqLevel::Off && p == ArqLevel::Off {
+            return;
+        }
         let Some(ring) = self.scheduled_arq.get(mac as usize) else {
             return;
         };
         let latest_tx_slot = self.latest_arq_tx_slot[mac as usize].load(Ordering::Relaxed);
         let timing_counter = if latest_tx_slot != 0 && slot <= latest_tx_slot {
+            log::debug!(
+                "hrpd_arq_late: mac={} response_slot={} latest_tx_slot={} late_slots={} h_or_l={:?} p={:?}",
+                mac,
+                slot,
+                latest_tx_slot,
+                latest_tx_slot - slot,
+                h_or_l,
+                p,
+            );
             &self.arq_schedule_late[mac as usize]
         } else {
             &self.arq_schedule_on_time[mac as usize]
@@ -671,6 +680,23 @@ mod tests {
         assert!(bus.arq_at_slot(6, 108).is_some());
         bus.schedule_arq_at_slot(6, 107, ArqLevel::Minus, ArqLevel::Off);
         assert_eq!(bus.arq_schedule_stats(6), (1, 1, 1, 108));
+    }
+
+    #[test]
+    fn silent_arq_writes_do_not_count_as_responses_or_replace_existing_levels() {
+        let bus = HarqBus::new();
+        bus.schedule_arq_at_slot(6, 108, ArqLevel::Plus, ArqLevel::Minus);
+        let scheduled = bus.arq_at_slot(6, 108).unwrap();
+        let before = bus.arq_schedule_stats(6);
+        for slot in [107, 108, 109] {
+            bus.schedule_arq_at_slot(6, slot, ArqLevel::Off, ArqLevel::Off);
+        }
+        assert_eq!(bus.arq_schedule_stats(6), before);
+        assert!(bus.arq_at_slot(6, 107).is_none());
+        let preserved = bus.arq_at_slot(6, 108).unwrap();
+        assert_eq!(preserved.h_or_l, scheduled.h_or_l);
+        assert_eq!(preserved.p, scheduled.p);
+        assert!(bus.arq_at_slot(6, 109).is_none());
     }
 
     #[test]

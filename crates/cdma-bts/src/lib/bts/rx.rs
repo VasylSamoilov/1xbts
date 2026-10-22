@@ -66,6 +66,8 @@ mod rx_events;
 static ACCESS_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static REVERSE_BEARER_SEQ: AtomicU64 = AtomicU64::new(1);
 const RX_QUEUE_WARN_THRESHOLD_US: u64 = 20_000;
+const HRPD_WORKER_TIMING_REPORT_THRESHOLD_US: u64 = 2_000;
+const HRPD_WORKER_TIMING_REPORT_INTERVAL_BLOCKS: u64 = 400;
 const RELEASE_ORDER_CODE: u8 = 0b010101;
 fn next_access_event_id() -> String {
     format!(
@@ -815,22 +817,31 @@ fn spawn_hrpd_traffic_rx_thread(
                 timing_samples = timing_samples.saturating_add(1);
                 rake_total_us = rake_total_us.saturating_add(rake_us);
                 rake_max_us = rake_max_us.max(rake_us);
-                let slow_rake = rake_us > represented_us.saturating_mul(2).max(10_000);
-                if queue_us > 250_000 || slow_rake || timing_samples % 400 == 0 {
-                    log::trace!(
-                        "rx_hrpd_traffic[m{}]: worker_timing queue_age_us={} queue_avg={} queue_max={} coalesced={} samples={} iq_us={} rake_us={} rake_avg={} rake_max={} blocks={}",
-                        mac_index,
-                        queue_us,
-                        queue_age_total_us / queue_age_samples.max(1),
-                        queue_age_max_us,
-                        1,
-                        block_samples,
-                        represented_us,
-                        rake_us,
-                        rake_total_us / timing_samples.max(1),
-                        rake_max_us,
-                        timing_samples,
-                    );
+                if log::log_enabled!(target: "cdma_bts::hrpd_rx_timing", log::Level::Trace) {
+                    let rx_read_age_us = blk.rx_read_completed_at.elapsed().as_micros();
+                    if rx_read_age_us > u128::from(HRPD_WORKER_TIMING_REPORT_THRESHOLD_US)
+                        || queue_us > HRPD_WORKER_TIMING_REPORT_THRESHOLD_US
+                        || rake_us > HRPD_WORKER_TIMING_REPORT_THRESHOLD_US
+                        || timing_samples % HRPD_WORKER_TIMING_REPORT_INTERVAL_BLOCKS == 0
+                    {
+                        log::trace!(
+                            target: "cdma_bts::hrpd_rx_timing",
+                            "rx_hrpd_traffic[m{}]: worker_timing queue_age_us={} queue_avg={} queue_max={} coalesced={} samples={} iq_us={} rake_us={} rake_avg={} rake_max={} blocks={} rx_read_age_us={} start_chip={}",
+                            mac_index,
+                            queue_us,
+                            queue_age_total_us / queue_age_samples.max(1),
+                            queue_age_max_us,
+                            1,
+                            block_samples,
+                            represented_us,
+                            rake_us,
+                            rake_total_us / timing_samples.max(1),
+                            rake_max_us,
+                            timing_samples,
+                            rx_read_age_us,
+                            absolute_chip_start,
+                        );
+                    }
                 }
             }
             info!(
@@ -6790,18 +6801,16 @@ mod tests {
         expected_uati: u32,
         mac_index: u8,
         min_drc_events: usize,
-        min_unique_drc_windows: usize,
+        expected_unique_drc_windows: Option<usize>,
+        null_cover_slots: &'static [u64],
         drc_cover: Option<u8>,
         drc_length: Option<u8>,
         physical_layer_subtype: u16,
         reverse_traffic_mac_subtype: u16,
-        /// Exact decoded reverse Stream 0 / Stream 1 event counts, when the
-        /// capture has a locked baseline (None skips the assertion).
         expected_stream0_events: Option<usize>,
         expected_stream1_events: Option<usize>,
-        /// Payloads that must appear among the decoded Stream 0 events
-        /// (exact match) and Stream 1 events (prefix match).
         expected_stream0_payloads: &'static [&'static [u8]],
+        expected_stream0_sequence: &'static [&'static [u8]],
         expected_stream1_payload_prefixes: &'static [&'static [u8]],
     }
 
@@ -7195,13 +7204,28 @@ mod tests {
             fixture.label,
             fixture.min_drc_events,
         );
-        assert!(
-            drc_slots.len() >= fixture.min_unique_drc_windows,
-            "{}: decoded unique DRC windows fell below {} (decoded={})",
-            fixture.label,
-            fixture.min_unique_drc_windows,
-            drc_slots.len(),
-        );
+        if let Some(expected) = fixture.expected_unique_drc_windows {
+            assert_eq!(
+                drc_slots.len(),
+                expected,
+                "{}: unique DRC windows changed",
+                fixture.label
+            );
+        }
+        for slot in fixture.null_cover_slots {
+            assert!(
+                !drc_slots.contains(slot),
+                "{}: null cover published a sector rate at slot {slot}",
+                fixture.label
+            );
+        }
+        if !fixture.expected_stream0_sequence.is_empty() {
+            assert_eq!(
+                stream0_payloads, fixture.expected_stream0_sequence,
+                "{}: ordered Stream 0 payloads changed",
+                fixture.label
+            );
+        }
         for expected in fixture.expected_stream0_payloads {
             assert!(
                 stream0_payloads.iter().any(|p| p == expected),
@@ -7394,17 +7418,68 @@ mod tests {
             expected_uati: 0x1a1e_58d5,
             mac_index: 6,
             min_drc_events: 200,
-            min_unique_drc_windows: 0,
+            expected_unique_drc_windows: None,
+            null_cover_slots: &[],
             drc_cover: None,
             drc_length: None,
             physical_layer_subtype: 2,
             reverse_traffic_mac_subtype: 3,
-            // Locked baseline for the fixed subtype-2 RRI: 50 signaling and
-            // 38 data-stream packets decode from this session, including the
-            // AT's TrafficChannelComplete, a RouteUpdate, and the PPP LCP
-            // Configure-Request train.
-            expected_stream0_events: Some(50),
+            expected_stream0_events: Some(52),
             expected_stream1_events: Some(38),
+            expected_stream0_sequence: &[
+                &[0x01, 0x88, 0x0e, 0x02, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x01, 0x88, 0x0e, 0x02, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x01, 0x88, 0x0e, 0x02, 0x00],
+                &[0x01, 0x09, 0x0e, 0x00, 0x01, 0x00, 0x01, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x01, 0x09, 0x0e, 0x00, 0x01, 0x00, 0x01, 0x00],
+                &[0x01, 0x09, 0x0e, 0x00, 0x01, 0x00, 0x01, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x0c, 0x00],
+                &[0x00, 0x16, 0x07],
+                &[0x00, 0x16, 0x0c, 0x00],
+            ],
             expected_stream0_payloads: &[
                 // SLP-D reliable, Route Update (0x0e), TrafficChannelComplete.
                 &[0x01, 0x88, 0x0e, 0x02, 0x00],
@@ -7415,6 +7490,49 @@ mod tests {
                 // HDLC flag + PPP LCP (0xc021) Configure-Request.
                 &[0x7e, 0xff, 0x7d, 0x23, 0xc0, 0x21],
             ],
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a local capture and traffic assignment"]
+    fn capture_hrpd_reverse_traffic_local_diagnostic() {
+        let metadata_path = std::env::var("HRPD_DIAGNOSTIC_CAPTURE")
+            .expect("HRPD_DIAGNOSTIC_CAPTURE must name the capture JSON metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read capture metadata"))
+                .expect("parse capture metadata");
+        let assignment: cdma_common::hrpd::air::HrpdTrafficAssignmentRequest =
+            serde_json::from_str(
+                &std::env::var("HRPD_DIAGNOSTIC_ASSIGNMENT")
+                    .expect("HRPD_DIAGNOSTIC_ASSIGNMENT must contain the traffic assignment JSON"),
+            )
+            .expect("parse traffic assignment");
+        assert_eq!(assignment.frame_offset, 0);
+        assert_eq!(
+            (
+                assignment.reverse_long_code_mask_i,
+                assignment.reverse_long_code_mask_q
+            ),
+            default_reverse_traffic_long_code_masks(assignment.uati)
+        );
+        drive_hrpd_reverse_traffic_worker_capture(HrpdTrafficCaptureFixture {
+            label: "local-diagnostic",
+            wav_path: PathBuf::from(metadata["wav_path"].as_str().expect("wav_path")),
+            sample_rate_hz: metadata["sample_rate_hz"].as_u64().expect("sample_rate_hz") as usize,
+            chip_rate_hz: metadata["chip_rate_hz"].as_u64().expect("chip_rate_hz") as usize,
+            first_absolute_sample_start: metadata["first_absolute_sample_start"]
+                .as_u64()
+                .expect("first_absolute_sample_start"),
+            hrpd_rx_shift_hz: metadata["hrpd_rx_shift_hz"]
+                .as_i64()
+                .expect("hrpd_rx_shift_hz"),
+            expected_uati: assignment.uati,
+            mac_index: assignment.mac_index,
+            drc_cover: Some(assignment.drc_cover),
+            drc_length: Some(assignment.drc_length),
+            physical_layer_subtype: assignment.physical_layer_subtype,
+            reverse_traffic_mac_subtype: assignment.reverse_traffic_mac_subtype,
+            ..Default::default()
         });
     }
 
@@ -7432,13 +7550,24 @@ mod tests {
             expected_uati: 0x1a0a_e0ec,
             mac_index: 6,
             min_drc_events: 590,
-            min_unique_drc_windows: 248,
+            expected_unique_drc_windows: Some(240),
+            null_cover_slots: &[
+                881908379335,
+                881908379727,
+                881908381319,
+                881908381687,
+                881908382303,
+                881908382623,
+                881908382639,
+                881908382719,
+            ],
             drc_cover: Some(1),
             drc_length: Some(8),
             physical_layer_subtype: 2,
             reverse_traffic_mac_subtype: 3,
             expected_stream0_events: Some(11),
             expected_stream1_events: Some(371),
+            expected_stream0_sequence: &[],
             expected_stream0_payloads: &[
                 &[0x01, 0x88, 0x0e, 0x02, 0x00],
                 &[0x01, 0x09, 0x0e, 0x00, 0x06, 0x00, 0x01, 0x00],

@@ -1463,29 +1463,6 @@ async fn hrpd_an_access_task(
                 runtime.retarget_stale_downlink_to_active_uati(uati);
             }
         }
-        let count = outcome.forward_signaling.len();
-        for request in outcome.forward_signaling {
-            if forward_tx.send(request).is_err() {
-                warn!("HRPD AN: BTS forward-signaling queue closed");
-                return;
-            }
-        }
-        if count > 0 {
-            info!("HRPD AN: queued {count} forward signaling message(s)");
-        }
-        let count = outcome.forward_traffic.len();
-        for packet in outcome.forward_traffic {
-            if forward_traffic_tx
-                .send(forward_traffic_from_air_packet(packet))
-                .is_err()
-            {
-                warn!("HRPD AN: BTS forward-traffic queue closed");
-                return;
-            }
-        }
-        if count > 0 {
-            log::debug!("HRPD AN: queued {count} forward traffic packet(s)");
-        }
         let count = outcome.traffic_releases.len();
         for release in outcome.traffic_releases {
             if let Some(runtime) = an_a8_runtime.as_ref() {
@@ -1558,6 +1535,29 @@ async fn hrpd_an_access_task(
         }
         if count > 0 {
             info!("HRPD AN: queued {count} traffic assignment(s)");
+        }
+        let count = outcome.forward_signaling.len();
+        for request in outcome.forward_signaling {
+            if forward_tx.send(request).is_err() {
+                warn!("HRPD AN: BTS forward-signaling queue closed");
+                return;
+            }
+        }
+        if count > 0 {
+            info!("HRPD AN: queued {count} forward signaling message(s)");
+        }
+        let count = outcome.forward_traffic.len();
+        for packet in outcome.forward_traffic {
+            if forward_traffic_tx
+                .send(forward_traffic_from_air_packet(packet))
+                .is_err()
+            {
+                warn!("HRPD AN: BTS forward-traffic queue closed");
+                return;
+            }
+        }
+        if count > 0 {
+            log::debug!("HRPD AN: queued {count} forward traffic packet(s)");
         }
     }
     info!("HRPD AN stopped: BTS access event channel closed");

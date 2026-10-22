@@ -155,17 +155,11 @@ impl PdsnA10Runtime {
 struct PdsnA10Session {
     key: cdma_a11::SessionKey,
     registration_id: u64,
-    /// Where this session's downlink is sent.
     peer: SocketAddr,
     uplink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    downlink_ready: bool,
-    logged_downlink_hold: bool,
 }
 
-/// Return address for a session that is being registered again.
-///
-/// A refresh from the same PCF must not undo what its uplink packets taught
-/// us, so the learned address survives when the seed names the same host.
+/// Preserve the learned return address on same-host registration refreshes.
 fn peer_for_registration(
     existing: Option<&PdsnA10Session>,
     key: cdma_a11::SessionKey,
@@ -197,9 +191,6 @@ fn apply_pdsn_a10_command(
                 *next_registration_id = next_registration_id.wrapping_add(1);
                 let existing = sessions.get(&key.pcf_session_id);
                 let peer = peer_for_registration(existing, key, peer);
-                let downlink_ready = existing
-                    .filter(|session| session.key == key)
-                    .is_some_and(|session| session.downlink_ready);
                 sessions.insert(
                     key.pcf_session_id,
                     PdsnA10Session {
@@ -207,8 +198,6 @@ fn apply_pdsn_a10_command(
                         registration_id,
                         peer,
                         uplink_tx,
-                        downlink_ready,
-                        logged_downlink_hold: false,
                     },
                 );
                 let task_event_tx = downlink_event_tx.clone();
@@ -268,16 +257,6 @@ async fn handle_pdsn_a10_downlink_event(
                 return;
             };
             if session.registration_id != registration_id {
-                return;
-            }
-            if !session.downlink_ready {
-                if !session.logged_downlink_hold {
-                    info!(
-                        "PDSN A10: holding downlink until first uplink key={:?}",
-                        session.key
-                    );
-                    session.logged_downlink_hold = true;
-                }
                 return;
             }
             let key = session.key;
@@ -370,22 +349,13 @@ async fn deliver_uplink(
         );
         session.peer = from;
     }
-    if !session.downlink_ready {
-        session.downlink_ready = true;
-        info!(
-            "PDSN A10: first uplink from {from}, enabling downlink key={:?}",
-            session.key
-        );
-    }
     let key = session.key;
     if session.uplink_tx.send(inbound.payload).await.is_err() {
         warn!("PDSN A10: packet session uplink closed key={key:?}");
     }
 }
 
-/// Starts the A10 bearer on `config`, which may omit `udp_peer_addr` because
-/// every session carries its own PCF address. `local_ipv4` is the bearer's own
-/// address as sessions are bound to it.
+/// The endpoint may omit udp_peer_addr because each session stores its PCF address.
 pub fn spawn_pdsn_a10_runtime(
     config: cdma_a10::BearerTransportConfig,
     local_ipv4: [u8; 4],
@@ -629,15 +599,15 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         downlink_tx.send(vec![0xaa]).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), async {
-                let mut buf = [0_u8; 128];
-                peer.recv_gre_packet(&mut buf).await
-            })
-            .await
-            .is_err(),
-            "downlink GRE must wait for the first uplink"
-        );
+        let (initial, _) = tokio::time::timeout(RECV_TIMEOUT, async {
+            let mut buf = [0_u8; 128];
+            peer.recv_gre_packet(&mut buf).await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(initial.key, Some(key.pcf_session_id));
+        assert_eq!(initial.payload, [0xaa]);
 
         peer.send_gre_packet(&cdma_a8::GrePacket::octet_stream(
             key.pcf_session_id,

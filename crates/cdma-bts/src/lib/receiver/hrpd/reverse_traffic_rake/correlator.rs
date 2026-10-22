@@ -57,22 +57,12 @@ const HRPD_TRAFFIC_PILOT_SNR_THRESHOLD_LINEAR: f32 = 31.622776;
 /// Search window must be larger than the reference template for the FFT
 /// primitive to actually slide — `valid_delay_samples = window - frame`.
 const HRPD_TRAFFIC_SEARCH_WINDOW_FRAMES: usize = 2;
-// A traffic pilot is continuous while the AT is transmitting. A two-frame
-// window searches every possible one-frame delay, so overlapping adjacent
-// windows repeat the same coverage and double acquisition CPU cost.
+// A two-frame window covers every one-frame pilot delay without overlapping search windows.
 const HRPD_TRAFFIC_SEARCH_STEP_FRAMES: usize = HRPD_TRAFFIC_SEARCH_WINDOW_FRAMES;
 const HRPD_TRAFFIC_REACQUISITION_TIMEOUT_CHIPS: u64 = 5 * 1_228_800;
 
-/// Sub-chip refinement search half-width in samples around the FFT hit.
-/// The FFT primitive's IFFT peak is NOT reliably chip-level accurate on
-/// real captures (observed up to ±5 chips of residual misalignment), so
-/// this sweep has to be wide. Drives both the search range and the
-/// `refinement_buffer_ready` / trim head-room reservations.
-const REFINE_SAMPLE_DELAY_RANGE: i64 = 64;
-// Keep the historic delay coverage, but score it coarsely first and only run
-// the expensive fractional search around the winning delay. HRPD-centered
-// captures can land close to zero while live composite RX has been observed
-// around +50 output samples of group delay.
+// FFT timing can differ from the despreading optimum by several chips.
+const REFINE_SAMPLE_DELAY_RANGE: i32 = 64;
 const VERIFY_SAMPLE_DELAY_MIN: i32 = -32;
 const VERIFY_SAMPLE_DELAY_MAX: i32 = 80;
 const VERIFY_SAMPLE_DELAY_COARSE_STEP: usize = 8;
@@ -414,17 +404,12 @@ impl HrpdReverseTrafficSpawnStrategy {
         }
     }
 
-    /// Returns true if `buffer` holds enough samples FORWARD of
-    /// `frame_start_chip` to despread one frame plus the
-    /// `REFINE_SAMPLE_DELAY_RANGE` positive sample-delay overhang. The
-    /// negative-delay overhang is handled by `refine_sample_delay`
-    /// clamping its search range to whatever back-history the buffer
-    /// actually has — there's no way to grow buffer history backward.
     fn refinement_buffer_ready(
         &self,
         buffer: &[Complex32],
         buffer_abs_sample: u64,
         frame_start_chip: u64,
+        sample_delay_center: i32,
     ) -> bool {
         let oversample = self.oversample.max(1);
         let frame_samples = HRPD_TRAFFIC_FRAME_CHIPS * oversample;
@@ -434,7 +419,15 @@ impl HrpdReverseTrafficSpawnStrategy {
             return false;
         }
         let offset = signed as usize;
-        offset + frame_samples + REFINE_SAMPLE_DELAY_RANGE as usize + 2 <= buffer.len()
+        let overhang =
+            if (VERIFY_SAMPLE_DELAY_MIN..=VERIFY_SAMPLE_DELAY_MAX).contains(&sample_delay_center) {
+                REFINE_SAMPLE_DELAY_RANGE as usize
+            } else {
+                sample_delay_center
+                    .saturating_add(REFINE_SAMPLE_DELAY_RANGE)
+                    .max(0) as usize
+            };
+        offset + frame_samples + overhang + 2 <= buffer.len()
     }
 
     fn build_finger(
@@ -493,12 +486,31 @@ impl HrpdReverseTrafficSpawnStrategy {
         (finger, chain)
     }
 
+    fn fft_sample_delay(
+        &self,
+        buffer_abs_sample: u64,
+        hit: &HrpdReverseFftPilotHit,
+    ) -> Option<i32> {
+        let window_start = buffer_abs_sample.checked_add(hit.window_sample_offset as u64)?;
+        let sample_phase = window_start % self.oversample.max(1) as u64;
+        let period = (HRPD_TRAFFIC_FRAME_CHIPS as u64).checked_mul(self.oversample.max(1) as u64)?;
+        let delay = (hit.delay_samples as u64).checked_add(sample_phase)? % period;
+        // Reverse PN and long code repeat each frame, so FFT peaks are periodic delays.
+        let signed_delay = if delay > period / 2 {
+            i64::try_from(delay).ok()? - i64::try_from(period).ok()?
+        } else {
+            i64::try_from(delay).ok()?
+        };
+        i32::try_from(signed_delay).ok()
+    }
+
     fn verify_fft_hit(
         &self,
         buffer: &[Complex32],
         buffer_abs_sample: u64,
         hit: &HrpdReverseFftPilotHit,
     ) -> Option<VerifiedTrafficPilot> {
+        let sample_delay_center = self.fft_sample_delay(buffer_abs_sample, hit)?;
         let oversample = self.oversample.max(1);
         let last_sample = buffer_abs_sample + buffer.len().saturating_sub(1) as u64;
         let last_chip = last_sample / oversample as u64;
@@ -510,10 +522,7 @@ impl HrpdReverseTrafficSpawnStrategy {
             if nominal + HRPD_TRAFFIC_FRAME_CHIPS as u64 > last_chip {
                 continue;
             }
-            // Generate PN/LC/composite reference once at the assigned frame
-            // boundary. Sample-delay refinement accounts for receiver timing;
-            // moving the chip-level frame start would break reverse RRI/data
-            // framing and can keep TrafficChannelComplete from decoding.
+            // C.S0024 reverse RRI/data framing remains on the assigned FrameOffset grid.
             let spans = self
                 .mask_candidates
                 .iter()
@@ -527,6 +536,7 @@ impl HrpdReverseTrafficSpawnStrategy {
                     buffer_abs_sample,
                     nominal,
                     *candidate_mask,
+                    sample_delay_center,
                     64,
                     span,
                 ) {
@@ -558,6 +568,7 @@ impl HrpdReverseTrafficSpawnStrategy {
                         buffer_abs_sample,
                         nominal,
                         *candidate_mask,
+                        sample_delay_center,
                         16,
                         span,
                     ) {
@@ -581,6 +592,7 @@ impl HrpdReverseTrafficSpawnStrategy {
         buffer_abs_sample: u64,
         frame_start_chip: u64,
         mask: HrpdTrafficMaskCandidate,
+        sample_delay_center: i32,
         pilot_chip_step: usize,
         span: &VerifyReferenceSpan,
     ) -> Option<VerifiedTrafficPilot> {
@@ -590,15 +602,30 @@ impl HrpdReverseTrafficSpawnStrategy {
             return None;
         }
         let base_start = (frame_start_sample - buffer_abs_sample) as usize;
-        let frame_samples = HRPD_TRAFFIC_FRAME_CHIPS * oversample;
-        if base_start + frame_samples + REFINE_SAMPLE_DELAY_RANGE as usize + 2 > buffer.len() {
+        if !self.refinement_buffer_ready(
+            buffer,
+            buffer_abs_sample,
+            frame_start_chip,
+            sample_delay_center,
+        ) {
             return None;
         }
         let ref_conj = span.frame_ref_conj(frame_start_chip, mask)?;
         let mut coarse_best: Option<VerifiedTrafficPilot> = None;
-        for sample_delay in (VERIFY_SAMPLE_DELAY_MIN..=VERIFY_SAMPLE_DELAY_MAX)
-            .step_by(VERIFY_SAMPLE_DELAY_COARSE_STEP)
-        {
+        let (delay_min, delay_max) =
+            if (VERIFY_SAMPLE_DELAY_MIN..=VERIFY_SAMPLE_DELAY_MAX).contains(&sample_delay_center) {
+                (VERIFY_SAMPLE_DELAY_MIN, VERIFY_SAMPLE_DELAY_MAX)
+            } else {
+                let coarse_step = VERIFY_SAMPLE_DELAY_COARSE_STEP as i32;
+                (
+                    sample_delay_center
+                        .saturating_sub(REFINE_SAMPLE_DELAY_RANGE)
+                        .div_euclid(coarse_step)
+                        * coarse_step,
+                    sample_delay_center.saturating_add(REFINE_SAMPLE_DELAY_RANGE),
+                )
+            };
+        for sample_delay in (delay_min..=delay_max).step_by(VERIFY_SAMPLE_DELAY_COARSE_STEP) {
             if let Some((pilot_phase, coherence)) = refine_inner_step(
                 buffer,
                 base_start,
@@ -626,34 +653,44 @@ impl HrpdReverseTrafficSpawnStrategy {
         }
         let coarse_best = coarse_best?;
         let mut best = Some(coarse_best);
-        let fine_min = (coarse_best.sample_delay - VERIFY_SAMPLE_DELAY_FINE_RADIUS)
-            .max(VERIFY_SAMPLE_DELAY_MIN);
-        let fine_max = (coarse_best.sample_delay + VERIFY_SAMPLE_DELAY_FINE_RADIUS)
-            .min(VERIFY_SAMPLE_DELAY_MAX);
-        for sample_delay in (fine_min..=fine_max).step_by(VERIFY_SAMPLE_DELAY_FINE_STEP) {
-            for sample_delay_fraction in [0.0_f32, -0.75, 0.75] {
-                if let Some((pilot_phase, coherence)) = refine_inner_step(
-                    buffer,
-                    base_start,
-                    oversample,
-                    sample_delay,
-                    sample_delay_fraction,
-                    &ref_conj,
-                    pilot_chip_step,
-                ) {
-                    let candidate = VerifiedTrafficPilot {
-                        frame_start_chip,
+        for (attempt, center) in [coarse_best.sample_delay, sample_delay_center]
+            .into_iter()
+            .enumerate()
+        {
+            if attempt > 0
+                && best
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.coherence >= VERIFY_COHERENCE_THRESHOLD)
+            {
+                break;
+            }
+            let fine_min = (center.saturating_sub(VERIFY_SAMPLE_DELAY_FINE_RADIUS)).max(delay_min);
+            let fine_max = (center.saturating_add(VERIFY_SAMPLE_DELAY_FINE_RADIUS)).min(delay_max);
+            for sample_delay in (fine_min..=fine_max).step_by(VERIFY_SAMPLE_DELAY_FINE_STEP) {
+                for sample_delay_fraction in [0.0_f32, -0.75, 0.75] {
+                    if let Some((pilot_phase, coherence)) = refine_inner_step(
+                        buffer,
+                        base_start,
+                        oversample,
                         sample_delay,
                         sample_delay_fraction,
-                        pilot_phase,
-                        coherence,
-                        mask,
-                    };
-                    if best
-                        .as_ref()
-                        .is_none_or(|best| candidate.coherence > best.coherence)
-                    {
-                        best = Some(candidate);
+                        &ref_conj,
+                        pilot_chip_step,
+                    ) {
+                        let candidate = VerifiedTrafficPilot {
+                            frame_start_chip,
+                            sample_delay,
+                            sample_delay_fraction,
+                            pilot_phase,
+                            coherence,
+                            mask,
+                        };
+                        if best
+                            .as_ref()
+                            .is_none_or(|best| candidate.coherence > best.coherence)
+                        {
+                            best = Some(candidate);
+                        }
                     }
                 }
             }
@@ -727,18 +764,16 @@ impl HrpdReverseFingerSpawnStrategy for HrpdReverseTrafficSpawnStrategy {
         buffer_abs_sample: u64,
         hit: &HrpdReverseFftPilotHit,
     ) -> SpawnOutcome<Self::Finger> {
-        // Snap the FFT-detected pilot hit forward to the AT's assigned
-        // reverse traffic frame grid. Per-spec, reverse Traffic Data and RRI
-        // frames are delayed by FrameOffset slots from system time.
+        let Some(sample_delay_center) = self.fft_sample_delay(buffer_abs_sample, hit) else {
+            return SpawnOutcome::Skip;
+        };
         let frame_candidates = assigned_frame_start_candidates_near(
             hit.preamble_start_chip,
             self.assignment.frame_offset,
         );
-        let Some(frame_start_chip) = frame_candidates
-            .iter()
-            .copied()
-            .find(|candidate| self.refinement_buffer_ready(buffer, buffer_abs_sample, *candidate))
-        else {
+        let Some(frame_start_chip) = frame_candidates.iter().copied().find(|candidate| {
+            self.refinement_buffer_ready(buffer, buffer_abs_sample, *candidate, sample_delay_center)
+        }) else {
             let waiting_for = frame_candidates
                 .iter()
                 .copied()
@@ -1019,6 +1054,71 @@ fn refine_inner_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_delayed_traffic_pilot_without_moving_frame_grid() {
+        use crate::receiver::hrpd::reverse_fft_pilot_search::HrpdReverseFftPilotSearcher;
+
+        const OVERSAMPLE: usize = 4;
+        const UATI: u32 = 0x1a67_421b;
+        let frame_start_chip = HRPD_TRAFFIC_FRAME_CHIPS as u64 * 100;
+        let (i_mask, q_mask) = default_reverse_traffic_long_code_masks(UATI);
+        let assignment = HrpdTrafficAssignmentRequest {
+            session_uati: UATI,
+            uati: UATI,
+            mac_index: 5,
+            reverse_rate_limit_bps: 153_600,
+            reverse_long_code_mask_i: i_mask,
+            reverse_long_code_mask_q: q_mask,
+            drc_lock: true,
+            physical_layer_subtype: 0,
+            reverse_traffic_mac_subtype: 0,
+            frame_offset: 0,
+            drc_cover: 1,
+            drc_length: 8,
+        };
+        let correlator = HrpdReverseTrafficCorrelator::new(
+            assignment,
+            OVERSAMPLE,
+            None,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let strategy = correlator.base.strategy();
+        let chips = strategy
+            .reference
+            .template_chips(frame_start_chip, HRPD_TRAFFIC_FRAME_CHIPS * 3);
+        for delay_samples in [-12_i32, 96] {
+            for buffer_phase in [0, OVERSAMPLE - 1] {
+                let mut samples = vec![Complex32::new(0.0, 0.0); delay_samples.max(0) as usize];
+                for &chip in &chips {
+                    samples.extend(std::iter::repeat_n(chip, OVERSAMPLE));
+                }
+                samples.drain(..(-delay_samples).max(0) as usize + buffer_phase);
+                let absolute_sample_start =
+                    frame_start_chip * OVERSAMPLE as u64 + buffer_phase as u64;
+                let mut searcher = HrpdReverseFftPilotSearcher::new(strategy.fft_config());
+                let hits =
+                    searcher.scan_top_hits(&samples, absolute_sample_start, 1, &strategy.reference);
+                let hit = hits.first().expect("FFT finds the delayed pilot");
+                let verified = strategy
+                    .verify_fft_hit(&samples, absolute_sample_start, hit)
+                    .expect("verification has a complete frame");
+                assert!(
+                    verified.coherence >= VERIFY_COHERENCE_THRESHOLD,
+                    "coherence={} delay={}",
+                    verified.coherence,
+                    verified.sample_delay
+                );
+                assert_eq!(
+                    verified.frame_start_chip % HRPD_TRAFFIC_FRAME_CHIPS as u64,
+                    0
+                );
+                assert!((verified.sample_delay - delay_samples).abs() <= OVERSAMPLE as i32);
+            }
+        }
+    }
 
     #[test]
     fn traffic_mask_candidates_use_canonical_q_arm_parity() {
