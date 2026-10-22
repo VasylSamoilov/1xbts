@@ -6160,7 +6160,9 @@ mod tests {
 
         let mut parts = build_bts_launch_parts(
             bts,
-            Box::new(NoopRadio::new()),
+            Box::new(NoopRadio::new(
+                cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 8,
+            )),
             BtsLaunchOptions {
                 paging_ack_timeout_ms: 100,
                 paging_max_retries: 0,

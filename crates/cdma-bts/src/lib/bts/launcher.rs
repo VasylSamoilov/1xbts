@@ -1,5 +1,4 @@
 use std::{
-    fs,
     net::SocketAddr,
     sync::Arc,
     sync::mpsc::{Receiver as StdReceiver, channel},
@@ -10,14 +9,15 @@ use cdma_common::error::Error;
 use log::{error, info, warn};
 use tokio::sync::{broadcast, mpsc};
 
-#[cfg(feature = "soapy-backend")]
-use crate::sdr::SoapySdrRadio;
 use crate::{
     lac,
     mac::{self, Layer2MacRef},
     receiver::sync::SyncChannelMessage,
-    sdr::{FileOutputRadio, NoopRadio, Radio},
+    sdr::Radio,
 };
+
+#[cfg(test)]
+use crate::sdr::NoopRadio;
 
 use super::{
     Bts, BtsHandle, BtsNodeConfig, Config, OverheadParameters, PagingChannelSettings, RadioConfig,
@@ -146,304 +146,23 @@ pub fn resolve_reverse_rx_plan(bts_config: &BtsNodeConfig) -> Result<ReverseRxPl
 
 pub fn build_radio_from_config(
     radio_config: &RadioConfig,
-    rx_freq_hz: usize,
     options: RadioBuildOptions,
 ) -> Result<Box<dyn Radio>, Error> {
-    // Native radio libraries may create streaming workers during device and
-    // streamer setup. Let UHD, libbladeRF, and LimeSuite inherit the requested
-    // scheduling class, then restore the launcher thread before returning.
     let _driver_priority =
         super::realtime::DriverPriorityGuard::enter("radio-driver-init", &options.realtime);
+    let mut config = radio_config.hardware_config()?;
+    let calibration = config.device.calibration();
     if options.null_radio {
-        let mut radio = NoopRadio::new();
-        if options.configure_rx {
-            let rate = options.rx_sample_rate_hz;
-            let bandwidth = options.rx_bandwidth_hz;
-            radio.setup_rx(
-                0,
-                "",
-                rx_freq_hz as f64,
-                rate as f64,
-                bandwidth as f64,
-                None,
-            )?;
-            info!("Using null radio (TX dropped, dummy RX paced at {rate} Hz feeding silence)");
-        } else {
-            info!("Using null radio (TX dropped, no RX)");
-        }
-        return Ok(Box::new(radio));
+        config.device = sdr_hal::config::DeviceConfig::Noop {};
     }
-    match radio_config {
-        RadioConfig::FileOutput { path } => Ok(Box::new(FileOutputRadio::new(
-            fs::File::create(path)?,
-            options.tx_sample_rate_hz,
-        )?)),
-        RadioConfig::Noop => {
-            let mut radio = NoopRadio::new();
-            if options.configure_rx {
-                let rate = options.rx_sample_rate_hz;
-                let bandwidth = options.rx_bandwidth_hz;
-                radio.setup_rx(
-                    0,
-                    "",
-                    rx_freq_hz as f64,
-                    rate as f64,
-                    bandwidth as f64,
-                    None,
-                )?;
-                info!("Using noop radio (TX dropped, dummy RX paced at {rate} Hz feeding silence)");
-            }
-            Ok(Box::new(radio))
-        }
-        #[cfg(feature = "soapy-backend")]
-        RadioConfig::Soapy {
-            device,
-            channel,
-            antenna,
-            rx_antenna,
-            tx_gain_db,
-            rx_gain_db,
-            ..
-        } => {
-            let mut radio = SoapySdrRadio::new(device, *channel, antenna, *tx_gain_db)?;
-
-            if options.configure_rx {
-                let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
-                let freq_hz = rx_freq_hz as f64;
-                let sample_rate_hz = options.rx_sample_rate_hz as f64;
-                let bandwidth_hz = options.rx_bandwidth_hz as f64;
-                radio.setup_rx(
-                    *channel,
-                    rx_ant,
-                    freq_hz,
-                    sample_rate_hz,
-                    bandwidth_hz,
-                    *rx_gain_db,
-                )?;
-                info!(
-                    "rx: configured on shared device antenna={} freq={} rate={} bw={} gain={:?}",
-                    rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
-                );
-            } else {
-                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
-            }
-
-            Ok(Box::new(radio))
-        }
-        #[cfg(not(feature = "soapy-backend"))]
-        RadioConfig::Soapy { .. } => {
-            Err("SoapySDR backend not compiled in (enable 'soapy-backend' feature)".into())
-        }
-        #[cfg(feature = "uhd-backend")]
-        RadioConfig::Uhd {
-            device,
-            channel,
-            antenna,
-            tx_gain_db,
-            master_clock_rate,
-            clock_source,
-            time_source,
-            rx_antenna,
-            rx_gain_db,
-            ..
-        } => {
-            let mut radio = crate::sdr::UhdRadio::new(
-                device,
-                *channel,
-                antenna,
-                *tx_gain_db,
-                Some(*master_clock_rate),
-                options.tx_sample_rate_hz,
-            )?;
-            if let Some(src) = clock_source {
-                radio.set_clock_source(src)?;
-            }
-            if let Some(src) = time_source {
-                radio.set_time_source(src)?;
-            }
-            if options.configure_rx {
-                let rx_ant = rx_antenna.as_deref().unwrap_or("RX2");
-                let freq_hz = rx_freq_hz as f64;
-                let sample_rate_hz = options.rx_sample_rate_hz as f64;
-                let bandwidth_hz = options.rx_bandwidth_hz as f64;
-                radio.setup_rx(
-                    *channel,
-                    rx_ant,
-                    freq_hz,
-                    sample_rate_hz,
-                    bandwidth_hz,
-                    *rx_gain_db,
-                )?;
-                info!(
-                    "rx: configured UHD RX antenna={} freq={} rate={} bw={} gain={:?}",
-                    rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
-                );
-            } else {
-                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
-            }
-            Ok(Box::new(radio))
-        }
-        #[cfg(not(feature = "uhd-backend"))]
-        RadioConfig::Uhd { .. } => {
-            Err("UHD radio backend not compiled in (enable 'uhd-backend' feature)".into())
-        }
-        #[cfg(feature = "lime-backend")]
-        RadioConfig::Lime {
-            device,
-            channel,
-            tx_antenna,
-            tx_gain_db,
-            rx_antenna,
-            rx_gain_db,
-            oversample,
-            tx_lo_offset_hz,
-            tx_fifo_size,
-            rx_fifo_size,
-            stream_throughput_vs_latency,
-            ..
-        } => {
-            let mut radio = crate::sdr::LimeRadio::with_stream_config(
-                device,
-                *channel,
-                tx_antenna,
-                *tx_gain_db,
-                options.tx_sample_rate_hz,
-                oversample.unwrap_or(0),
-                *tx_fifo_size,
-                *rx_fifo_size,
-                *stream_throughput_vs_latency,
-            )?;
-            if let Some(offset) = tx_lo_offset_hz {
-                radio.set_tx_lo_offset(*offset)?;
-            }
-            if options.configure_rx {
-                let rx_ant = rx_antenna.as_deref().unwrap_or("LNAW");
-                radio.setup_rx(
-                    *channel,
-                    rx_ant,
-                    rx_freq_hz as f64,
-                    options.rx_sample_rate_hz as f64,
-                    options.rx_bandwidth_hz as f64,
-                    rx_gain_db.map(|g| g as f64),
-                )?;
-                info!(
-                    "rx: configured LimeSDR RX antenna={} freq={} rate={} bw={} gain={:?}",
-                    rx_ant,
-                    rx_freq_hz,
-                    options.rx_sample_rate_hz,
-                    options.rx_bandwidth_hz,
-                    rx_gain_db
-                );
-            } else {
-                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
-            }
-            Ok(Box::new(radio))
-        }
-        #[cfg(not(feature = "lime-backend"))]
-        RadioConfig::Lime { .. } => {
-            Err("LimeSDR backend not compiled in (enable 'lime-backend' feature)".into())
-        }
-        #[cfg(feature = "bladerf-backend")]
-        RadioConfig::BladeRf {
-            device,
-            channel,
-            fpga_path,
-            tx_antenna,
-            rx_antenna,
-            tx_gain_db,
-            rx_gain_db,
-            tx_lo_offset_hz,
-            num_buffers,
-            buffer_size,
-            num_transfers,
-            stream_timeout_ms,
-            ..
-        } => {
-            let mut radio = crate::sdr::BladeRfRadio::with_stream_config(
-                device,
-                *channel,
-                *tx_gain_db,
-                options.tx_sample_rate_hz as u32,
-                fpga_path.as_deref(),
-                tx_antenna.as_deref(),
-                *num_buffers,
-                *buffer_size,
-                *num_transfers,
-                *stream_timeout_ms,
-            )?;
-            if let Some(offset) = tx_lo_offset_hz {
-                radio.set_tx_lo_offset(*offset)?;
-            }
-            if options.configure_rx {
-                let rx_ant = rx_antenna.as_deref().unwrap_or("");
-                let freq_hz = rx_freq_hz as f64;
-                let sample_rate_hz = options.rx_sample_rate_hz as f64;
-                let bandwidth_hz = options.rx_bandwidth_hz as f64;
-                radio.setup_rx(
-                    *channel as usize,
-                    rx_ant,
-                    freq_hz,
-                    sample_rate_hz,
-                    bandwidth_hz,
-                    rx_gain_db.map(|g| g as f64),
-                )?;
-                info!(
-                    "rx: configured bladeRF RX antenna='{}' freq={} rate={} bw={} gain={:?}",
-                    rx_ant, freq_hz, sample_rate_hz, bandwidth_hz, rx_gain_db
-                );
-            } else {
-                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
-            }
-            Ok(Box::new(radio))
-        }
-        #[cfg(not(feature = "bladerf-backend"))]
-        RadioConfig::BladeRf { .. } => {
-            Err("bladeRF backend not compiled in (enable 'bladerf-backend' feature)".into())
-        }
-        #[cfg(feature = "network-backend")]
-        RadioConfig::Network {
-            addr,
-            data_host,
-            samples_per_packet,
-            tx_transport,
-            rx_antenna,
-            rx_gain_db,
-            ..
-        } => {
-            let mut radio = crate::sdr::NetworkRadio::connect(
-                addr,
-                crate::sdr::NetworkRadioOptions {
-                    samples_per_packet: *samples_per_packet,
-                    tx_transport: *tx_transport,
-                    data_host: data_host.clone(),
-                },
-            )?;
-            if options.configure_rx {
-                // An empty antenna selects the server's own backend default.
-                let rx_ant = rx_antenna.as_deref().unwrap_or("");
-                let freq_hz = rx_freq_hz as f64;
-                let sample_rate_hz = options.rx_sample_rate_hz as f64;
-                let bandwidth_hz = options.rx_bandwidth_hz as f64;
-                radio.setup_rx(
-                    0,
-                    rx_ant,
-                    freq_hz,
-                    sample_rate_hz,
-                    bandwidth_hz,
-                    *rx_gain_db,
-                )?;
-                info!(
-                    "rx: configured network radio {addr} antenna='{rx_ant}' freq={freq_hz} rate={sample_rate_hz} bw={bandwidth_hz} gain={rx_gain_db:?}"
-                );
-            } else {
-                info!("rx: 1x reverse RX disabled by HRPD-only configuration");
-            }
-            Ok(Box::new(radio))
-        }
-        #[cfg(not(feature = "network-backend"))]
-        RadioConfig::Network { .. } => {
-            Err("network radio backend not compiled in (enable 'network-backend' feature)".into())
-        }
+    config.tx_sample_rate_hz = options.tx_sample_rate_hz;
+    config.rx_sample_rate_hz = options.configure_rx.then_some(options.rx_sample_rate_hz);
+    config.rx_bandwidth_hz = options.configure_rx.then_some(options.rx_bandwidth_hz);
+    let radio = config.open()?;
+    if options.null_radio {
+        Ok(Box::new(sdr_hal::CalibratedRadio::new(radio, calibration)?))
+    } else {
+        Ok(radio)
     }
 }
 
@@ -575,7 +294,7 @@ pub fn build_bts_launch_parts(
             chip_rate_hz: bts_config.runtime.chip_rate_hz,
             absolute_chip_start: 0,
             hardware_start_time_ns: 0,
-            tick_rate: bts_config.radio.tick_rate(bts_config.rf.rx_sample_rate_hz),
+            tick_rate: radio.tick_rate(),
             access_event_tx: None,
             hrpd_access_event_tx: None,
             hrpd_traffic_event_tx: None,
@@ -1149,7 +868,9 @@ mod tests {
         config.radio = RadioConfig::Noop;
         let parts = build_bts_launch_parts(
             config,
-            Box::new(NoopRadio::new()),
+            Box::new(NoopRadio::new(
+                cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 8,
+            )),
             BtsLaunchOptions {
                 paging_ack_timeout_ms: 100,
                 paging_max_retries: 0,
@@ -1191,7 +912,9 @@ mod tests {
 
         let parts = build_bts_launch_parts(
             bts,
-            Box::new(NoopRadio::new()),
+            Box::new(NoopRadio::new(
+                cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 8,
+            )),
             BtsLaunchOptions {
                 paging_ack_timeout_ms: 100,
                 paging_max_retries: 0,
@@ -1252,7 +975,8 @@ mod tests {
             addr: "127.0.0.1:50710".to_string(),
             data_host: None,
             samples_per_packet: crate::sdr::network::wire::DEFAULT_SAMPLES_PER_PACKET,
-            tx_transport: crate::sdr::network::wire::TxTransport::default(),
+            transport: crate::sdr::network::wire::Transport::default(),
+            tick_rate: None,
             rx_enabled: true,
             rx_antenna: None,
             rx_gain_db: None,
@@ -1270,7 +994,6 @@ mod tests {
         assert_eq!(plan.hrpd_reverse_frequency_hz, Some(843_900_000));
         assert_eq!(plan.sample_rate_hz, 4_915_200);
         assert_eq!(plan.bandwidth_hz, 3_310_000);
-        assert_eq!(bts.radio.tick_rate(plan.sample_rate_hz), 1_000_000_000);
     }
 
     #[test]
@@ -1282,7 +1005,8 @@ mod tests {
             addr: "127.0.0.1:50710".to_string(),
             data_host: None,
             samples_per_packet: crate::sdr::network::wire::DEFAULT_SAMPLES_PER_PACKET,
-            tx_transport: crate::sdr::network::wire::TxTransport::default(),
+            transport: crate::sdr::network::wire::Transport::default(),
+            tick_rate: None,
             rx_enabled: false,
             rx_antenna: None,
             rx_gain_db: None,

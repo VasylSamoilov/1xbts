@@ -49,7 +49,7 @@ The Rust workspace keeps first-party crates flat under `crates/` and external
 integration wrappers under `external/`:
 
 - `crates/` - CDMA protocol, RAN, core-network, packet, voice, and tooling crates.
-- `external/` - SDR, SIP/native, and other outside-library wrapper crates.
+- `external/` - SIP/native and other outside-library wrapper crates.
 - `1xbts-web` - Next.js dashboard backed by the management gRPC APIs.
 - `proto` - protobuf service definitions.
 

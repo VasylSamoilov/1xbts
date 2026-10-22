@@ -686,24 +686,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bladerf"
-version = "0.1.0"
-dependencies = [
- "bladerf-sys",
- "log",
- "num-complex",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "bladerf-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "pkg-config",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1024,7 +1006,6 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "biquad",
- "bladerf",
  "cdma-a10",
  "cdma-a11",
  "cdma-a8",
@@ -1044,25 +1025,26 @@ dependencies = [
  "env_logger",
  "hound",
  "libc",
- "limesuite",
  "log",
  "num",
  "num-complex",
  "parking_lot",
  "prost",
  "rustfft",
+ "sdr-hal",
+ "sdr-hal-bladerf",
+ "sdr-hal-limesuite",
+ "sdr-hal-uhd",
  "serde",
  "serde_json",
  "signal-hook",
  "soapysdr",
- "socket2 0.6.3",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",
  "tracing-subscriber",
- "uhd",
 ]
 
 [[package]]
@@ -1082,6 +1064,7 @@ dependencies = [
  "iana-time-zone",
  "log",
  "num-complex",
+ "sdr-hal",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1243,6 +1226,7 @@ dependencies = [
  "ratatui",
  "rustix 0.38.44",
  "rustyline",
+ "sdr-hal",
  "serde",
  "serde_json",
  "tokio",
@@ -1365,27 +1349,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "cdma-radiod"
-version = "0.1.0"
-dependencies = [
- "cdma-bts",
- "cdma-common",
- "cdma-ms",
- "clap",
- "crossbeam-channel",
- "env_logger",
- "log",
- "num-complex",
- "parking_lot",
- "serde",
- "serde_json",
- "socket2 0.6.3",
- "tokio",
- "tokio-stream",
- "tonic",
 ]
 
 [[package]]
@@ -3547,24 +3510,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "limesuite"
-version = "0.1.0"
-dependencies = [
- "limesuite-sys",
- "log",
- "num-complex",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "limesuite-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "pkg-config",
-]
-
-[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5431,6 +5376,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-hal"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d677b1bada15f029896649b7179806fc1bcb04a588d3eff72b39c2b69adfcb"
+dependencies = [
+ "clap",
+ "crossbeam-channel",
+ "env_logger",
+ "hound",
+ "log",
+ "num-complex",
+ "parking_lot",
+ "prost",
+ "sdr-hal-bladerf",
+ "sdr-hal-limesuite",
+ "sdr-hal-uhd",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "soapysdr",
+ "socket2 0.6.3",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "sdr-hal-bladerf"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61433a48554ef46f221330f0e38b1e1c0d99324aa3348aa19cd0f653c6f5e874"
+dependencies = [
+ "log",
+ "num-complex",
+ "sdr-hal-bladerf-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "sdr-hal-bladerf-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a22dbe2ea05996d843032f900c7c585cfe4a1cb57eb93de56d84ea11b7db2446"
+dependencies = [
+ "bindgen",
+ "pkg-config",
+]
+
+[[package]]
+name = "sdr-hal-limesuite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9909910bd78721499c60c40f081b12f5a7b9a7893aaa34068e889649820d2c5"
+dependencies = [
+ "log",
+ "num-complex",
+ "sdr-hal-limesuite-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "sdr-hal-limesuite-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaf59e04fc86c7f6e688250fdf22948ca04da0478fa28277584c7b1eb52157de"
+dependencies = [
+ "bindgen",
+ "pkg-config",
+]
+
+[[package]]
+name = "sdr-hal-uhd"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3cd0de3efef8e99af5e2d3b2a5e9451f5ef920f73cd382a5952fc9558fe7abf"
+dependencies = [
+ "anyhow",
+ "libc",
+ "num-complex",
+ "sdr-hal-uhd-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "sdr-hal-uhd-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a9ab2fe85c37800c5e72d3358cef98c0ff8c6f96801b9d4dc024c82be3602d3"
+dependencies = [
+ "bindgen",
+ "pkg-config",
+]
+
+[[package]]
 name = "selectors"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5536,6 +5576,19 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -6624,27 +6677,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uhd"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "libc",
- "log",
- "num-complex",
- "thiserror 1.0.69",
- "uhd-sys",
-]
-
-[[package]]
-name = "uhd-sys"
-version = "0.1.3"
-dependencies = [
- "bindgen",
- "pkg-config",
-]
-
-[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6711,6 +6743,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

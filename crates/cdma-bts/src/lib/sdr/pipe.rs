@@ -1,3 +1,4 @@
+use sdr_hal::error::Error as RadioError;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -72,24 +73,34 @@ impl RadioPipe {
 }
 
 impl Radio for RadioPipe {
+    fn tx_sample_rate_hz(&self) -> f64 {
+        self.tx_sample_rate_hz.load(Ordering::Relaxed) as f64
+    }
+    fn rx_sample_rate_hz(&self) -> Option<f64> {
+        None
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         1_000_000_000
     }
 
-    fn set_tx_frequency(&mut self, _: usize) -> Result<(), Error> {
+    fn set_tx_frequency(&mut self, _: usize) -> Result<(), RadioError> {
         Ok(())
     }
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: f64) -> Result<f64, RadioError> {
+        let sample_rate = sample_rate as usize;
         self.tx_sample_rate_hz.store(sample_rate, Ordering::Relaxed);
-        Ok(sample_rate)
+        Ok(sample_rate as f64)
     }
-    fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), Error> {
+    fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), RadioError> {
         Ok(())
     }
 
     fn split(
         self: Box<Self>,
-    ) -> Result<(Box<dyn RadioTx>, Option<Box<dyn super::RadioRx>>), Error> {
+    ) -> Result<(Box<dyn RadioTx>, Option<Box<dyn super::RadioRx>>), RadioError> {
         let tx = PipeTxHalf {
             tx_output: self.tx_output,
             tx_sample_rate_hz: self.tx_sample_rate_hz,
@@ -106,19 +117,28 @@ struct PipeTxHalf {
 }
 
 impl RadioTx for PipeTxHalf {
+    fn tx_sample_rate_hz(&self) -> f64 {
+        self.tx_sample_rate_hz.load(Ordering::Relaxed) as f64
+    }
+    fn set_tx_frequency_hz(&mut self, _frequency_hz: f64) -> Result<(), RadioError> {
+        Ok(())
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         1_000_000_000
     }
 
-    fn get_hardware_time(&self) -> Result<u64, Error> {
+    fn get_hardware_time(&self) -> Result<u64, RadioError> {
         Ok(self.clock_start.elapsed().as_nanos() as u64)
     }
 
-    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
+    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), RadioError> {
         self.transmit_at(samples, None)
     }
 
-    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
+    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), RadioError> {
         let sample_rate_hz = self.tx_sample_rate_hz.load(Ordering::Relaxed);
         let chip_rate_hz = SR1_CHIP_RATE_HZ as usize;
         let oversample = if sample_rate_hz >= chip_rate_hz && sample_rate_hz % chip_rate_hz == 0 {
@@ -138,7 +158,7 @@ impl RadioTx for PipeTxHalf {
         Ok(())
     }
 
-    fn enable_transmit(&mut self, _: bool) -> Result<(), Error> {
+    fn enable_transmit(&mut self, _: bool) -> Result<(), RadioError> {
         Ok(())
     }
 }

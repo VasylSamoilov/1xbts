@@ -150,9 +150,6 @@ impl LookaheadPacer {
         let needed_ns = oversleep_ns.saturating_add(PACER_OVERSLEEP_PAD_NS);
         if needed_ns > self.margin_ns {
             self.margin_ns = needed_ns.min(PACER_MAX_MARGIN_NS);
-        } else {
-            self.margin_ns = (self.margin_ns - (self.margin_ns >> PACER_MARGIN_DECAY_SHIFT))
-                .max(PACER_MIN_MARGIN_NS);
         }
     }
 
@@ -168,6 +165,9 @@ impl LookaheadPacer {
         if max_tx_lookahead_ms == 0 || tick_rate == 0 {
             return;
         }
+        // A margin longer than one batch prevents sleeps, so decay must not depend on sleeping.
+        self.margin_ns = (self.margin_ns - (self.margin_ns >> PACER_MARGIN_DECAY_SHIFT))
+            .max(PACER_MIN_MARGIN_NS);
         let lookahead_ticks = max_tx_lookahead_ms as u64 * tick_rate / 1_000;
 
         loop {
@@ -194,31 +194,81 @@ impl LookaheadPacer {
     }
 }
 
+const CLOCK_PRIME_SAMPLE_COUNT: usize = 1024;
+const CLOCK_PRIME_TIMEOUT: Duration = Duration::from_secs(1);
+const CLOCK_PRIME_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const CLOCK_PRIME_READ_TIMEOUT: Duration = Duration::from_millis(10);
+
 pub(super) fn prime_hardware_clock(
     rx: &mut dyn RadioRx,
     radio_tx: &mut dyn RadioTx,
 ) -> Result<(), Error> {
     info!("bts: priming hardware clock with initial RX reads");
     rx.rx_activate(None)?;
-    let mut prime_buf = vec![Complex32::new(0.0, 0.0); 1024];
-    let _ = rx.rx_read(&mut prime_buf, 1_000_000);
-    let t0 = radio_tx.get_hardware_time()?;
-    thread::sleep(std::time::Duration::from_millis(1));
-    let _ = rx.rx_read(&mut prime_buf, 1_000_000);
-    let t1 = radio_tx.get_hardware_time()?;
-    assert!(
-        t1 > t0,
-        "bts: hardware clock not incrementing after prime reads: t0={} t1={}",
-        t0,
-        t1
-    );
-    info!(
-        "bts: hardware clock primed and verified: t0={} t1={} delta={}",
-        t0,
-        t1,
-        t1 - t0
-    );
-    Ok(())
+    let mut prime_buf = vec![Complex32::new(0.0, 0.0); CLOCK_PRIME_SAMPLE_COUNT];
+    let result = (|| {
+        read_clock_prime_samples(rx, &mut prime_buf, CLOCK_PRIME_TIMEOUT)?;
+        let t0 = radio_tx.get_hardware_time()?;
+        let t1 = wait_for_hardware_clock_advance(t0, CLOCK_PRIME_TIMEOUT, |remaining| {
+            read_clock_prime_samples(rx, &mut prime_buf, remaining.min(CLOCK_PRIME_READ_TIMEOUT))?;
+            Ok(radio_tx.get_hardware_time()?)
+        })?;
+        info!(
+            "bts: hardware clock primed and verified: t0={} t1={} delta={}",
+            t0,
+            t1,
+            t1 - t0
+        );
+        Ok(())
+    })();
+    if result.is_err()
+        && let Err(error) = rx.stop()
+    {
+        log::warn!("bts: RX stop after hardware clock priming failure: {error}");
+    }
+    result
+}
+
+fn read_clock_prime_samples(
+    rx: &mut dyn RadioRx,
+    samples: &mut [Complex32],
+    timeout: Duration,
+) -> Result<(), Error> {
+    match rx.rx_read(samples, timeout.as_micros() as i64) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == sdr_hal::error::ErrorKind::Timeout => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn wait_for_hardware_clock_advance(
+    initial_tick: u64,
+    timeout: Duration,
+    mut poll: impl FnMut(Duration) -> Result<u64, Error>,
+) -> Result<u64, Error> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("hardware clock did not advance beyond {initial_tick} within {timeout:?}"),
+            )
+            .into());
+        }
+        let tick = poll(remaining)?;
+        if tick > initial_tick {
+            return Ok(tick);
+        }
+        if tick < initial_tick {
+            return Err(format!(
+                "hardware clock moved backward during priming: initial={initial_tick} current={tick}"
+            )
+            .into());
+        }
+        // Remote clock corrections can hold the monotonic estimate until wall time catches up.
+        thread::sleep(CLOCK_PRIME_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+    }
 }
 
 pub(super) fn compute_initial_tx_anchor(
@@ -312,9 +362,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clock_prime_accepts_advancement_after_plateau() {
+        let mut ticks = [100, 100, 101].into_iter();
+        let result = wait_for_hardware_clock_advance(100, CLOCK_PRIME_TIMEOUT, |_| {
+            Ok(ticks.next().unwrap())
+        });
+        assert_eq!(result.unwrap(), 101);
+    }
+
+    #[test]
+    fn clock_prime_times_out_on_stuck_clock() {
+        let error = wait_for_hardware_clock_advance(100, Duration::from_millis(5), |_| Ok(100))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn clock_prime_rejects_backward_clock() {
+        let error =
+            wait_for_hardware_clock_advance(100, CLOCK_PRIME_TIMEOUT, |_| Ok(99)).unwrap_err();
+        assert!(error.to_string().contains("moved backward"));
+    }
+
+    #[test]
+    fn clock_prime_propagates_radio_failure() {
+        let error = wait_for_hardware_clock_advance(100, CLOCK_PRIME_TIMEOUT, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+    }
+
+    #[test]
     fn pacer_margin_rises_to_observed_oversleep_plus_pad() {
         let mut pacer = LookaheadPacer::new();
-        // Requested 1 ms, took 1.5 ms → 500 µs oversleep.
         pacer.adapt_after_sleep(1_000_000, 1_500_000);
         assert_eq!(pacer.margin_ns, 500_000 + PACER_OVERSLEEP_PAD_NS);
     }
@@ -327,12 +414,14 @@ mod tests {
     }
 
     #[test]
-    fn pacer_margin_decays_toward_floor_on_clean_sleeps() {
+    fn pacer_margin_recovers_without_further_sleeps() {
         let mut pacer = LookaheadPacer::new();
-        pacer.adapt_after_sleep(1_000_000, 2_000_000);
+        pacer.adapt_after_sleep(1_000_000, 100_000_000);
         let raised = pacer.margin_ns;
+        let shutdown = AtomicBool::new(false);
+        let anchor = Instant::now();
         for _ in 0..10_000 {
-            pacer.adapt_after_sleep(1_000_000, 1_000_000);
+            pacer.wait_until_within_tx_lookahead(0, 0, anchor, 1_000_000_000, 5, &shutdown);
         }
         assert!(pacer.margin_ns < raised);
         assert_eq!(pacer.margin_ns, PACER_MIN_MARGIN_NS);

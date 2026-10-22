@@ -159,12 +159,10 @@ fn apply_macos(label: &str, hard_rt: bool, cpu: Option<usize>) {
 
 #[cfg(target_os = "macos")]
 fn apply_macos_qos(label: &str) {
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-        fn pthread_get_qos_class_np(thread: libc::pthread_t, relative_priority: *mut i32) -> u32;
-    }
-    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
-    let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    // SAFETY: The QoS class and relative priority are valid for the current thread.
+    let ret = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
     if ret != 0 {
         degraded(
             label,
@@ -172,12 +170,19 @@ fn apply_macos_qos(label: &str) {
         );
         return;
     }
+    let mut actual = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
     let mut relative = 0;
-    let actual = unsafe { pthread_get_qos_class_np(libc::pthread_self(), &mut relative) };
-    if actual != QOS_CLASS_USER_INTERACTIVE {
+    // SAFETY: Both output pointers refer to live storage for the native QoS query.
+    let ret =
+        unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut actual, &mut relative) };
+    if ret != 0 {
+        degraded(label, format!("could not read effective QoS (errno={ret})"));
+        return;
+    }
+    if !matches!(actual, libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE) {
         degraded(
             label,
-            format!("requested USER_INTERACTIVE, observed qos=0x{actual:x}"),
+            format!("requested USER_INTERACTIVE, observed qos={actual:?}"),
         );
     } else {
         info!("{label}: effective QoS USER_INTERACTIVE relative_priority={relative}");
@@ -295,7 +300,7 @@ pub(crate) struct DriverPriorityGuard {
     #[cfg(target_os = "linux")]
     original_affinity: libc::cpu_set_t,
     #[cfg(target_os = "macos")]
-    original_qos: u32,
+    original_qos: libc::qos_class_t,
     #[cfg(target_os = "macos")]
     original_relative_priority: i32,
     active: bool,
@@ -357,16 +362,20 @@ impl DriverPriorityGuard {
 
         #[cfg(target_os = "macos")]
         {
-            unsafe extern "C" {
-                fn pthread_get_qos_class_np(
-                    thread: libc::pthread_t,
-                    relative_priority: *mut i32,
-                ) -> u32;
-            }
+            let mut original_qos = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
             let mut original_relative_priority = 0;
-            let original_qos = unsafe {
-                pthread_get_qos_class_np(libc::pthread_self(), &mut original_relative_priority)
+            // SAFETY: Both output pointers refer to live storage for the native QoS query.
+            let read = unsafe {
+                libc::pthread_get_qos_class_np(
+                    libc::pthread_self(),
+                    &mut original_qos,
+                    &mut original_relative_priority,
+                )
             };
+            if read != 0 {
+                degraded(label, format!("could not read original QoS (errno={read})"));
+                return Self::inactive();
+            }
             apply_current(label, settings, settings.driver_priority, None, false);
             Self {
                 original_qos,
@@ -391,7 +400,7 @@ impl DriverPriorityGuard {
             #[cfg(target_os = "linux")]
             original_affinity: unsafe { std::mem::zeroed() },
             #[cfg(target_os = "macos")]
-            original_qos: 0,
+            original_qos: libc::qos_class_t::QOS_CLASS_UNSPECIFIED,
             #[cfg(target_os = "macos")]
             original_relative_priority: 0,
             active: false,
@@ -435,17 +444,13 @@ impl Drop for DriverPriorityGuard {
         }
         #[cfg(target_os = "macos")]
         {
-            unsafe extern "C" {
-                fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-            }
-            const QOS_CLASS_DEFAULT: u32 = 0x15;
-            let restore_qos = if self.original_qos == 0 {
-                QOS_CLASS_DEFAULT
-            } else {
-                self.original_qos
+            let restore_qos = match self.original_qos {
+                libc::qos_class_t::QOS_CLASS_UNSPECIFIED => libc::qos_class_t::QOS_CLASS_DEFAULT,
+                qos => qos,
             };
+            // SAFETY: These QoS settings were read from this thread before changing its priority.
             let ret = unsafe {
-                pthread_set_qos_class_self_np(restore_qos, self.original_relative_priority)
+                libc::pthread_set_qos_class_self_np(restore_qos, self.original_relative_priority)
             };
             if ret != 0 {
                 degraded(

@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_mut, unused_variables)]
 
+use cdma_common::radio::Error as RadioError;
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -242,10 +243,9 @@ fn resolve_workspace_test_wav_path(env_var: &str, file_name: &str) -> PathBuf {
     panic!("could not find {file_name} in known test fixture locations");
 }
 
-/// Radio implementation that captures final SDR-rate samples in memory.
 struct BufferRadio {
     samples: Arc<Mutex<Vec<Complex32>>>,
-    clock_start: Instant,
+    sample_rate_hz: usize,
 }
 
 impl BufferRadio {
@@ -254,7 +254,7 @@ impl BufferRadio {
         (
             BufferRadio {
                 samples: samples.clone(),
-                clock_start: Instant::now(),
+                sample_rate_hz: cdma_common::consts::SR1_CHIP_RATE_HZ as usize * 8,
             },
             samples,
         )
@@ -262,24 +262,34 @@ impl BufferRadio {
 }
 
 impl Radio for BufferRadio {
+    fn tx_sample_rate_hz(&self) -> f64 {
+        self.sample_rate_hz as f64
+    }
+    fn rx_sample_rate_hz(&self) -> Option<f64> {
+        None
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         1_000_000_000
     }
-    fn set_tx_frequency(&mut self, _: usize) -> Result<(), Error> {
+    fn set_tx_frequency(&mut self, _: usize) -> Result<(), RadioError> {
         Ok(())
     }
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
-        Ok(sample_rate)
+    fn set_tx_sample_rate(&mut self, sample_rate: f64) -> Result<f64, RadioError> {
+        self.sample_rate_hz = sample_rate as usize;
+        Ok(self.sample_rate_hz as f64)
     }
-    fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), Error> {
+    fn set_tx_bandwidth(&mut self, _: usize) -> Result<(), RadioError> {
         Ok(())
     }
     fn split(
         self: Box<Self>,
-    ) -> Result<(Box<dyn RadioTx>, Option<Box<dyn cdma_bts::sdr::RadioRx>>), Error> {
+    ) -> Result<(Box<dyn RadioTx>, Option<Box<dyn cdma_bts::sdr::RadioRx>>), RadioError> {
         let tx = BufferTxHalf {
             samples: self.samples,
-            clock_start: self.clock_start,
+            sample_rate_hz: self.sample_rate_hz,
         };
         Ok((Box::new(tx), None))
     }
@@ -287,21 +297,47 @@ impl Radio for BufferRadio {
 
 struct BufferTxHalf {
     samples: Arc<Mutex<Vec<Complex32>>>,
-    clock_start: Instant,
+    sample_rate_hz: usize,
 }
 
 impl RadioTx for BufferTxHalf {
+    fn tx_sample_rate_hz(&self) -> f64 {
+        self.sample_rate_hz as f64
+    }
+    fn set_tx_frequency_hz(&mut self, _frequency_hz: f64) -> Result<(), RadioError> {
+        Ok(())
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         1_000_000_000
     }
-    fn get_hardware_time(&self) -> Result<u64, Error> {
-        Ok(self.clock_start.elapsed().as_nanos() as u64)
+    fn get_hardware_time(&self) -> Result<u64, RadioError> {
+        Ok(
+            (self.samples.lock().unwrap().len() as u128 * self.tick_rate() as u128
+                / self.sample_rate_hz as u128) as u64,
+        )
     }
-    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
+    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), RadioError> {
         self.samples.lock().unwrap().extend_from_slice(samples);
         Ok(())
     }
-    fn enable_transmit(&mut self, _: bool) -> Result<(), Error> {
+    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), RadioError> {
+        let mut output = self.samples.lock().unwrap();
+        if let Some(tick) = tick {
+            let position = ((tick as u128 * self.sample_rate_hz as u128
+                + self.tick_rate() as u128 / 2)
+                / self.tick_rate() as u128) as usize;
+            if position < output.len() {
+                return Err("timed buffer write overlaps existing samples".into());
+            }
+            output.resize(position, Complex32::default());
+        }
+        output.extend_from_slice(samples);
+        Ok(())
+    }
+    fn enable_transmit(&mut self, _: bool) -> Result<(), RadioError> {
         Ok(())
     }
 }

@@ -227,7 +227,6 @@ pub async fn start_bts_node(
     let reverse_rx_plan = resolve_reverse_rx_plan(&bts_config)?;
     let radio = build_radio_from_config(
         &bts_config.radio,
-        reverse_rx_plan.center_frequency_hz,
         RadioBuildOptions {
             null_radio: options.null_radio,
             configure_rx: reverse_rx_plan.configure_rx,

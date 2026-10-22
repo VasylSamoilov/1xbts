@@ -320,34 +320,15 @@ impl Bts {
             .as_mut()
             .expect("radio consumed before configure");
         radio.set_tx_bandwidth(self.runtime.tx_bandwidth_hz)?;
-        let actual_tx_sample_rate = radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz)?;
-        if actual_tx_sample_rate != self.runtime.tx_sample_rate_hz {
+        let actual_tx_sample_rate =
+            radio.set_tx_sample_rate(self.runtime.tx_sample_rate_hz as f64)?;
+        if actual_tx_sample_rate != self.runtime.tx_sample_rate_hz as f64 {
             warn!(
                 "TX sample rate requested={} actual={}, the radio did not deliver the configured rate exactly",
                 self.runtime.tx_sample_rate_hz, actual_tx_sample_rate
             );
         }
         radio.set_tx_lo_offset_hz(self.runtime.tx_lo_offset_hz)?;
-        let tx_center_frequency_hz = self
-            .evdo
-            .as_ref()
-            .map(|evdo| {
-                if evdo.uses_hrpd_only() {
-                    evdo.evdo_frequency_hz
-                } else {
-                    evdo.composite_center_frequency_hz
-                }
-            })
-            .unwrap_or(self.config.tx_center_frequency_hz);
-        radio.set_tx_frequency(tx_center_frequency_hz)?;
-
-        info!(
-            "Set TX center frequency to {:.04}Mhz (LO offset {:+.03}kHz), sample rate {:.04}Mhz, spreading rate {:?}",
-            tx_center_frequency_hz as f64 / 1_000_000.0,
-            self.runtime.tx_lo_offset_hz as f64 / 1_000.0,
-            self.runtime.tx_sample_rate_hz as f64 / 1_000_000.0,
-            self.runtime.spreading_rate,
-        );
         let dl = &self.runtime.downlink;
         let db = |fraction: f32| 10.0 * fraction.max(f32::MIN_POSITIVE).log10();
         info!(
@@ -510,6 +491,31 @@ impl Bts {
                 realtime::DriverPriorityGuard::enter("radio-stream-init", &self.runtime.realtime);
             radio.split()?
         };
+        let tx_center_frequency_hz = self
+            .evdo
+            .as_ref()
+            .map(|evdo| {
+                if evdo.uses_hrpd_only() {
+                    evdo.evdo_frequency_hz
+                } else {
+                    evdo.composite_center_frequency_hz
+                }
+            })
+            .unwrap_or(self.config.tx_center_frequency_hz);
+        radio_tx.set_tx_frequency_hz(tx_center_frequency_hz as f64)?;
+        if let (Some(rx), Some(frequency_hz)) = (
+            radio_rx.as_mut(),
+            self.config
+                .rx
+                .as_ref()
+                .and_then(|rx| rx.rx_center_frequency_hz),
+        ) {
+            rx.set_rx_frequency(frequency_hz as f64)?;
+        }
+        info!(
+            "TX center frequency {} Hz, LO offset {} Hz, sample rate {} Hz",
+            tx_center_frequency_hz, self.runtime.tx_lo_offset_hz, self.runtime.tx_sample_rate_hz
+        );
         let max_tx_samples = self
             .runtime
             .tx_batch_chips
@@ -807,7 +813,7 @@ impl Bts {
         fpch.prefill_silence((paging_start_chip - chip_cursor) as usize);
         fpch.channel.advance_lc_to_chip(paging_start_chip);
 
-        radio_tx.enable_transmit_at(true, Some(state.hardware_start_tick))?;
+        radio_tx.enable_transmit(true)?;
         info!(
             "tx_timing: enable_transmit_at start_tick={} hw_now={}",
             state.hardware_start_tick,
@@ -1425,7 +1431,7 @@ impl Bts {
         );
 
         info!("disabling TX module");
-        if let Err(e) = radio_tx.enable_transmit(false) {
+        if let Err(e) = radio_tx.stop() {
             log::error!("failed to disable TX on shutdown: {}", e);
         }
 

@@ -3,8 +3,8 @@
 //! A handset Get/Post names an absolute URL. The gateway fetches it over
 //! ordinary HTTP(S), following redirects, and hands back the response with its
 //! headers and raw body so the caller can transcode HTML, wrap plain text, or
-//! pass native content through untouched. The handset's own request headers
-//! travel with the fetch, so a site sees the real User-Agent and cookies.
+//! pass native content through untouched. The gateway forwards the handset's
+//! own request headers, so a site sees the real User-Agent and cookies.
 //!
 //! The fetch refuses destinations inside the gateway's own network: loopback,
 //! RFC 1918 and the other private, link-local and reserved IPv4 ranges, and

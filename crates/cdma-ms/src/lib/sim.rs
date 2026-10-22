@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use sdr_hal::error::Error as RadioError;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -809,8 +810,6 @@ impl crate::appliance::LoopbackControl for SimHandle {
     }
 }
 
-use cdma_common::error::Error;
-
 use crate::radio::TxCalibration;
 use crate::sdr_radio::SdrRadio;
 
@@ -851,15 +850,22 @@ struct FakeSdrRx {
 }
 
 impl RadioRx for FakeSdrRx {
+    fn rx_sample_rate_hz(&self) -> f64 {
+        (self.shared.chip_rate * self.shared.oversample) as f64
+    }
     fn tick_rate(&self) -> u64 {
         self.shared.tick_rate
     }
 
-    fn get_hardware_time(&self) -> Result<u64, Error> {
+    fn get_hardware_time(&self) -> Result<u64, RadioError> {
         Ok(self.shared.hardware_time())
     }
 
-    fn rx_read(&mut self, buf: &mut [Complex32], timeout_us: i64) -> Result<RxReadResult, Error> {
+    fn rx_read(
+        &mut self,
+        buf: &mut [Complex32],
+        timeout_us: i64,
+    ) -> Result<RxReadResult, RadioError> {
         if self.pending.is_empty() {
             let deadline = Instant::now() + Duration::from_micros(timeout_us.max(0) as u64);
             loop {
@@ -904,21 +910,21 @@ impl RadioRx for FakeSdrRx {
         })
     }
 
-    fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), Error> {
+    fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), RadioError> {
         Ok(())
     }
 
-    fn rx_deactivate(&mut self) -> Result<(), Error> {
+    fn stop(&mut self) -> Result<(), RadioError> {
         Ok(())
     }
 
-    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), Error> {
+    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), RadioError> {
         let on = (frequency_hz - node_forward_hz()).abs() <= ON_CHANNEL_TOLERANCE_HZ;
         self.shared.on_channel.store(on, Ordering::Relaxed);
         Ok(())
     }
 
-    fn set_rx_gain(&mut self, _gain_db: f64) -> Result<(), Error> {
+    fn set_rx_gain(&mut self, _gain_db: f64) -> Result<(), RadioError> {
         Ok(())
     }
 }
@@ -929,39 +935,46 @@ struct FakeSdrTx {
 }
 
 impl RadioTx for FakeSdrTx {
+    fn capabilities(&self) -> sdr_hal::TxCapabilities {
+        sdr_hal::TxCapabilities::from([
+            sdr_hal::TxCapability::TimedSamples,
+            sdr_hal::TxCapability::BurstEnd,
+        ])
+    }
+    fn end_burst(&mut self) -> Result<(), RadioError> {
+        Ok(())
+    }
+    fn tx_sample_rate_hz(&self) -> f64 {
+        (self.shared.chip_rate * self.shared.oversample) as f64
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         self.shared.tick_rate
     }
 
-    fn get_hardware_time(&self) -> Result<u64, Error> {
+    fn get_hardware_time(&self) -> Result<u64, RadioError> {
         Ok(self.shared.hardware_time())
     }
 
-    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
-        self.transmit_shaped_at(samples, None)
+    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), RadioError> {
+        self.transmit_at(samples, None)
     }
 
-    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
-        self.transmit_shaped_at(samples, tick)
-    }
-
-    fn enable_transmit(&mut self, _enable: bool) -> Result<(), Error> {
+    fn enable_transmit(&mut self, _enable: bool) -> Result<(), RadioError> {
         Ok(())
     }
 
-    fn enable_transmit_at(&mut self, _enable: bool, _tick: Option<u64>) -> Result<(), Error> {
+    fn enable_transmit_at(&mut self, _enable: bool, _tick: Option<u64>) -> Result<(), RadioError> {
         Ok(())
     }
 
-    fn set_tx_frequency_hz(&mut self, _frequency_hz: f64) -> Result<(), Error> {
+    fn set_tx_frequency_hz(&mut self, _frequency_hz: f64) -> Result<(), RadioError> {
         Ok(())
     }
 
-    fn transmit_shaped_at(
-        &mut self,
-        samples: &[Complex32],
-        tick: Option<u64>,
-    ) -> Result<(), Error> {
+    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), RadioError> {
         let Some(tick) = tick else {
             return Ok(());
         };

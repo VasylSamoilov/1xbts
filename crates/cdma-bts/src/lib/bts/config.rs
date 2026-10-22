@@ -233,7 +233,9 @@ pub enum RadioConfig {
         #[serde(default = "default_network_samples_per_packet")]
         samples_per_packet: usize,
         #[serde(default)]
-        tx_transport: crate::sdr::network::wire::TxTransport,
+        transport: crate::sdr::network::wire::Transport,
+        #[serde(default)]
+        tick_rate: Option<u64>,
         #[serde(default = "default_true")]
         rx_enabled: bool,
         #[serde(default)]
@@ -262,7 +264,34 @@ impl Default for RadioConfig {
     }
 }
 
+/// sdr-hal rejects unknown device fields, so a BTS-only radio field missing here fails
+/// `hardware_config` at startup.
+const BTS_ONLY_RADIO_FIELDS: [&str; 5] = [
+    "rx_batch_pcgs",
+    "traffic_rx_continuity",
+    "rx_power_adj",
+    "rx_sample_delay",
+    "tx_sample_delay",
+];
+
 impl RadioConfig {
+    pub fn hardware_config(&self) -> Result<sdr_hal::config::RadioConfig, Error> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(fields) = value.as_object_mut() {
+            for key in BTS_ONLY_RADIO_FIELDS {
+                fields.remove(key);
+            }
+        }
+        if let Some(delay_samples) = self.tx_sample_delay() {
+            value["rx_to_tx_delay_ns"] =
+                serde_json::json!(cdma_common::radio::tx_delay_samples_to_ns(delay_samples));
+        }
+        Ok(sdr_hal::config::RadioConfig {
+            device: serde_json::from_value(value)?,
+            ..Default::default()
+        })
+    }
+
     pub fn has_rx(&self) -> bool {
         match self {
             Self::Soapy { .. }
@@ -453,16 +482,6 @@ impl RadioConfig {
             | Self::BladeRf { rx_power_adj, .. }
             | Self::Network { rx_power_adj, .. } => *rx_power_adj,
             _ => 0.0,
-        }
-    }
-
-    pub fn tick_rate(&self, rx_sample_rate_hz: usize) -> u64 {
-        match self {
-            Self::Uhd {
-                master_clock_rate, ..
-            } => *master_clock_rate,
-            Self::Lime { .. } | Self::BladeRf { .. } => rx_sample_rate_hz as u64,
-            _ => 1_000_000_000,
         }
     }
 }
@@ -1009,6 +1028,58 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cdma-bts-config-{name}-{unique}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn legacy_radio_settings_translate_without_receiver_policy() {
+        let radio: RadioConfig = serde_json::from_value(serde_json::json!({
+            "kind": "network",
+            "addr": "127.0.0.1:50710",
+            "tick_rate": 39_321_600,
+            "tx_sample_delay": -70,
+            "rx_sample_delay": 17,
+            "rx_batch_pcgs": 4,
+            "rx_power_adj": 2.0,
+            "traffic_rx_continuity": true,
+        }))
+        .unwrap();
+        let hardware = serde_json::to_value(radio.hardware_config().unwrap()).unwrap();
+        assert_eq!(
+            hardware["rx_to_tx_delay_ns"],
+            cdma_common::radio::tx_delay_samples_to_ns(-70)
+        );
+        assert_eq!(hardware["tick_rate"], 39_321_600);
+        for key in BTS_ONLY_RADIO_FIELDS {
+            assert!(hardware.get(key).is_none());
+        }
+        assert_eq!(radio.tx_sample_delay(), Some(-70));
+        assert_eq!(radio.rx_sample_delay(), 17);
+        assert!(radio.traffic_rx_continuity());
+    }
+
+    #[test]
+    fn every_shipped_radio_config_converts_to_hardware_settings() {
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let mut converted = 0;
+        for entry in fs::read_dir(&config_dir).expect("config dir") {
+            let path = entry.expect("config entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.starts_with("radio_") || name.contains(".local.") || !name.ends_with(".json") {
+                continue;
+            }
+            let radio: RadioConfig =
+                serde_json::from_str(&fs::read_to_string(&path).expect("read radio config"))
+                    .unwrap_or_else(|e| panic!("{name} parses: {e}"));
+            radio
+                .hardware_config()
+                .unwrap_or_else(|e| panic!("{name} converts: {e}"));
+            converted += 1;
+        }
+        assert!(
+            converted > 0,
+            "no radio configs found in {}",
+            config_dir.display()
+        );
     }
 
     #[test]

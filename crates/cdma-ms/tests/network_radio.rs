@@ -1,15 +1,16 @@
+use sdr_hal::CalibratedRadio;
+use sdr_hal::error::Error as RadioError;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use cdma_bts::sdr::network::wire::TxTransport;
-use cdma_bts::sdr::network::{NetworkRadio, NetworkRadioOptions};
-use cdma_bts::sdr::{Radio, RadioRx, RadioTx, RxReadResult};
-use cdma_common::error::Error;
-use cdma_radiod::{RadioCalibration, RxDefaults, serve};
 use num_complex::Complex32;
 use parking_lot::Mutex;
+use sdr_hal::daemon::{RadioCalibration, RxDefaults, serve};
+use sdr_hal::network::wire::Transport;
+use sdr_hal::network::{NetworkRadio, NetworkRadioOptions};
+use sdr_hal::{Radio, RadioRx, RadioTx, RxReadResult};
 
 /// UHD-style master clock: 40 ticks per chip, not nanoseconds.
 const INNER_TICK_RATE: u64 = 49_152_000;
@@ -27,9 +28,10 @@ const COMPOSITE_BLOCK_SAMPLES: usize = 24_576;
 #[derive(Default)]
 struct FakeState {
     tx_frequency: Option<usize>,
-    tx_sample_rate: Option<usize>,
+    tx_sample_rate: Option<f64>,
     tx_bandwidth: Option<usize>,
-    rx_setup: Option<(usize, String, f64, f64, f64, Option<f64>)>,
+    rx_setup: Option<(usize, String, f64, f64, Option<f64>)>,
+    rx_frequency_hz: Option<f64>,
     transmit_enabled: Option<(bool, Option<u64>)>,
     transmits: Vec<(Option<u64>, Vec<Complex32>)>,
     rx_activated: bool,
@@ -51,18 +53,33 @@ struct FakeRadio {
 }
 
 impl Radio for FakeRadio {
+    fn tx_capabilities(&self) -> sdr_hal::TxCapabilities {
+        sdr_hal::TxCapabilities::from([
+            sdr_hal::TxCapability::TimedSamples,
+            sdr_hal::TxCapability::TimedActivation,
+        ])
+    }
+    fn tx_sample_rate_hz(&self) -> f64 {
+        self.state.lock().tx_sample_rate.unwrap_or_default()
+    }
+    fn rx_sample_rate_hz(&self) -> Option<f64> {
+        self.state.lock().rx_setup.as_ref().map(|setup| setup.2)
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         INNER_TICK_RATE
     }
-    fn set_tx_frequency(&mut self, center_frequency: usize) -> Result<(), Error> {
+    fn set_tx_frequency(&mut self, center_frequency: usize) -> Result<(), RadioError> {
         self.state.lock().tx_frequency = Some(center_frequency);
         Ok(())
     }
-    fn set_tx_sample_rate(&mut self, sample_rate: usize) -> Result<usize, Error> {
+    fn set_tx_sample_rate(&mut self, sample_rate: f64) -> Result<f64, RadioError> {
         self.state.lock().tx_sample_rate = Some(sample_rate);
         Ok(sample_rate)
     }
-    fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), Error> {
+    fn set_tx_bandwidth(&mut self, bandwidth: usize) -> Result<(), RadioError> {
         self.state.lock().tx_bandwidth = Some(bandwidth);
         Ok(())
     }
@@ -70,22 +87,20 @@ impl Radio for FakeRadio {
         &mut self,
         channel: usize,
         antenna: &str,
-        frequency_hz: f64,
         sample_rate_hz: f64,
         bandwidth_hz: f64,
         gain_db: Option<f64>,
-    ) -> Result<(), Error> {
+    ) -> Result<f64, RadioError> {
         self.state.lock().rx_setup = Some((
             channel,
             antenna.to_string(),
-            frequency_hz,
             sample_rate_hz,
             bandwidth_hz,
             gain_db,
         ));
-        Ok(())
+        Ok(sample_rate_hz)
     }
-    fn split(self: Box<Self>) -> Result<(Box<dyn RadioTx>, Option<Box<dyn RadioRx>>), Error> {
+    fn split(self: Box<Self>) -> Result<(Box<dyn RadioTx>, Option<Box<dyn RadioRx>>), RadioError> {
         let active = Arc::new(AtomicBool::new(false));
         Ok((
             Box::new(FakeTx {
@@ -109,25 +124,41 @@ struct FakeTx {
 }
 
 impl RadioTx for FakeTx {
+    fn capabilities(&self) -> sdr_hal::TxCapabilities {
+        sdr_hal::TxCapabilities::from([
+            sdr_hal::TxCapability::TimedSamples,
+            sdr_hal::TxCapability::TimedActivation,
+        ])
+    }
+    fn tx_sample_rate_hz(&self) -> f64 {
+        self.state.lock().tx_sample_rate.unwrap_or_default()
+    }
+    fn set_tx_frequency_hz(&mut self, frequency_hz: f64) -> Result<(), RadioError> {
+        self.state.lock().tx_frequency = Some(frequency_hz as usize);
+        Ok(())
+    }
+    fn supports_timed_tx(&self) -> bool {
+        true
+    }
     fn tick_rate(&self) -> u64 {
         INNER_TICK_RATE
     }
-    fn get_hardware_time(&self) -> Result<u64, Error> {
+    fn get_hardware_time(&self) -> Result<u64, RadioError> {
         Ok(self.clock.now_ticks())
     }
-    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), Error> {
+    fn transmit(&mut self, samples: &[Complex32]) -> Result<(), RadioError> {
         self.state.lock().transmits.push((None, samples.to_vec()));
         Ok(())
     }
-    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), Error> {
+    fn transmit_at(&mut self, samples: &[Complex32], tick: Option<u64>) -> Result<(), RadioError> {
         self.state.lock().transmits.push((tick, samples.to_vec()));
         Ok(())
     }
-    fn enable_transmit(&mut self, enable: bool) -> Result<(), Error> {
+    fn enable_transmit(&mut self, enable: bool) -> Result<(), RadioError> {
         self.state.lock().transmit_enabled = Some((enable, None));
         Ok(())
     }
-    fn enable_transmit_at(&mut self, enable: bool, tick: Option<u64>) -> Result<(), Error> {
+    fn enable_transmit_at(&mut self, enable: bool, tick: Option<u64>) -> Result<(), RadioError> {
         self.state.lock().transmit_enabled = Some((enable, tick));
         Ok(())
     }
@@ -146,13 +177,29 @@ fn ramp_value(n: u64) -> f32 {
 }
 
 impl RadioRx for FakeRx {
+    fn rx_sample_rate_hz(&self) -> f64 {
+        self.state
+            .lock()
+            .rx_setup
+            .as_ref()
+            .map(|setup| setup.2)
+            .unwrap_or_default()
+    }
+    fn set_rx_frequency(&mut self, frequency_hz: f64) -> Result<(), RadioError> {
+        self.state.lock().rx_frequency_hz = Some(frequency_hz);
+        Ok(())
+    }
     fn tick_rate(&self) -> u64 {
         INNER_TICK_RATE
     }
-    fn get_hardware_time(&self) -> Result<u64, Error> {
+    fn get_hardware_time(&self) -> Result<u64, RadioError> {
         Ok(self.clock.now_ticks())
     }
-    fn rx_read(&mut self, buf: &mut [Complex32], _timeout_us: i64) -> Result<RxReadResult, Error> {
+    fn rx_read(
+        &mut self,
+        buf: &mut [Complex32],
+        _timeout_us: i64,
+    ) -> Result<RxReadResult, RadioError> {
         if !self.active.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(1));
             return Ok(RxReadResult {
@@ -181,12 +228,12 @@ impl RadioRx for FakeRx {
             overflow: false,
         })
     }
-    fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), Error> {
+    fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), RadioError> {
         self.state.lock().rx_activated = true;
         self.active.store(true, Ordering::Relaxed);
         Ok(())
     }
-    fn rx_deactivate(&mut self) -> Result<(), Error> {
+    fn stop(&mut self) -> Result<(), RadioError> {
         self.state.lock().rx_activated = false;
         self.active.store(false, Ordering::Relaxed);
         Ok(())
@@ -197,7 +244,7 @@ fn start_server(state: Arc<Mutex<FakeState>>) -> (std::thread::JoinHandle<()>, S
     start_server_with_calibration(
         state,
         RadioCalibration {
-            tx_sample_delay: Some(TX_SAMPLE_DELAY),
+            rx_to_tx_delay_ns: Some(cdma_common::radio::tx_delay_samples_to_ns(TX_SAMPLE_DELAY)),
             tx_full_scale_power_estimate_dbm: Some(-6.0),
             rx_reference_dbm: Some(-39.0),
         },
@@ -214,6 +261,12 @@ fn start_server_with_calibration(
             start: Instant::now(),
         }),
     });
+    let radio = Box::new(
+        CalibratedRadio::new(radio, calibration)
+            .unwrap()
+            .with_rx_reference_gain_db(Some(30.0))
+            .unwrap(),
+    );
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -232,7 +285,7 @@ fn start_server_with_calibration(
                     antenna: "FAKE_RX".to_string(),
                     gain_db: Some(30.0),
                 },
-                calibration,
+                None,
                 localhost,
                 localhost,
                 Some(tonic_ready_tx),
@@ -284,45 +337,60 @@ fn loopback_tx_rx_end_to_end() {
         NetworkRadio::connect(&control_addr.to_string(), NetworkRadioOptions::default())
             .expect("client connects"),
     );
-    assert_eq!(radio.tick_rate(), 1_000_000_000);
-    assert_eq!(radio.tx_sample_delay(), Some(TX_SAMPLE_DELAY));
+    assert_eq!(radio.tick_rate(), INNER_TICK_RATE);
+    assert_eq!(
+        radio
+            .rx_to_tx_delay_ns()
+            .map(cdma_common::radio::tx_delay_ns_to_samples),
+        Some(TX_SAMPLE_DELAY)
+    );
     assert_eq!(radio.tx_full_scale_power_estimate_dbm(), Some(-6.0));
     assert_eq!(radio.rx_reference_dbm(), Some(-39.0));
 
     radio.set_tx_bandwidth(1_250_000).expect("bandwidth");
     radio
-        .set_tx_sample_rate(TX_RATE_HZ as usize)
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
         .expect("sample rate");
-    radio.set_tx_frequency(881_520_000).expect("frequency");
+    assert!(state.lock().tx_frequency.is_none());
     radio
-        .setup_rx(0, "", 836_520_000.0, RX_RATE_HZ, 2_500_000.0, None)
+        .setup_rx(0, "", RX_RATE_HZ, 2_500_000.0, None)
         .expect("setup rx");
     {
         let state = state.lock();
-        assert_eq!(state.tx_frequency, Some(881_520_000));
-        assert_eq!(state.tx_sample_rate, Some(TX_RATE_HZ as usize));
+        assert!(state.tx_frequency.is_none());
+        assert_eq!(state.tx_sample_rate, Some(TX_RATE_HZ as f64));
         assert_eq!(state.tx_bandwidth, Some(1_250_000));
-        // Empty antenna and unset gain resolve to the server-side defaults.
         let rx = state.rx_setup.as_ref().expect("rx setup reached inner");
         assert_eq!(rx.1, "FAKE_RX");
-        assert_eq!(rx.5, Some(30.0));
+        assert_eq!(rx.4, Some(30.0));
     }
 
     let (mut tx, rx) = (radio as Box<dyn Radio>).split().expect("split");
     let mut rx = rx.expect("rx half");
+    tx.set_tx_frequency_hz(881_520_000.0).unwrap();
+    rx.set_rx_frequency(836_520_000.0).unwrap();
+    assert_eq!(state.lock().tx_frequency, Some(881_520_000));
+    assert_eq!(state.lock().rx_frequency_hz, Some(836_520_000.0));
 
     let t0 = tx.get_hardware_time().expect("time");
     std::thread::sleep(Duration::from_millis(5));
     let t1 = tx.get_hardware_time().expect("time");
     assert!(t1 > t0, "clock not advancing: {t0} {t1}");
-    assert!(t1 - t0 >= 4_000_000, "clock too slow: {t0} {t1}");
-    assert!(t1 - t0 < 50_000_000, "clock too fast: {t0} {t1}");
+    assert!(
+        t1 - t0 >= INNER_TICK_RATE * 4 / 1_000,
+        "clock too slow: {t0} {t1}"
+    );
+    assert!(
+        t1 - t0 < INNER_TICK_RATE * 50 / 1_000,
+        "clock too fast: {t0} {t1}"
+    );
 
-    tx.enable_transmit_at(true, Some(t1 + 100_000_000))
+    let enable_lead = INNER_TICK_RATE / 10;
+    tx.enable_transmit_at(true, Some(t1 + enable_lead))
         .expect("enable tx");
 
-    let batch_ns = TX_BLOCK_SAMPLES as u64 * 1_000_000_000 / TX_RATE_HZ;
-    let start_ns = t1 + 200_000_000;
+    let batch_ticks = TX_BLOCK_SAMPLES as u64 * INNER_TICK_RATE / TX_RATE_HZ;
+    let start_ticks = t1 + INNER_TICK_RATE / 5;
     for batch in 0..2u64 {
         let samples: Vec<Complex32> = (0..TX_BLOCK_SAMPLES)
             .map(|i| {
@@ -330,7 +398,7 @@ fn loopback_tx_rx_end_to_end() {
                 Complex32::new(v, -v)
             })
             .collect();
-        tx.transmit_at(&samples, Some(start_ns + batch * batch_ns))
+        tx.transmit_at(&samples, Some(start_ticks + batch * batch_ticks))
             .expect("transmit");
     }
 
@@ -364,13 +432,12 @@ fn loopback_tx_rx_end_to_end() {
                 .iter()
                 .all(|(_, samples)| samples.len() == TX_BLOCK_SAMPLES)
         );
-        let expected =
-            ((t1 + 100_000_000) as u128 * INNER_TICK_RATE as u128 / 1_000_000_000) as u64;
+        let expected = t1 + enable_lead;
         let tick = enable_tick.expect("timed enable");
         assert!(tick.abs_diff(expected) <= 1, "{tick} vs {expected}");
 
         let (first_tick, _) = &state.transmits[0];
-        let expected_first = (start_ns as u128 * INNER_TICK_RATE as u128 / 1_000_000_000) as u64;
+        let expected_first = start_ticks;
         assert!(
             first_tick.expect("timed transmit").abs_diff(expected_first) <= 1,
             "{first_tick:?} vs {expected_first}"
@@ -438,18 +505,19 @@ fn loopback_tx_rx_end_to_end() {
             sample.re
         );
     }
-    let (first_ns, _) = reads[0];
+    let (first_ticks, _) = reads[0];
     let mut offset = 0u64;
-    for (time_ns, count) in &reads {
-        let expected = first_ns + (offset as u128 * 1_000_000_000 / RX_RATE_HZ as u128) as u64;
-        assert!(
-            time_ns.abs_diff(expected) <= 1_000,
-            "read at offset {offset}: {time_ns} vs {expected}"
+    for (time_ticks, count) in &reads {
+        let expected =
+            first_ticks + (offset as u128 * INNER_TICK_RATE as u128 / RX_RATE_HZ as u128) as u64;
+        assert_eq!(
+            *time_ticks, expected,
+            "read at offset {offset}: {time_ticks} vs {expected}"
         );
         offset += *count as u64;
     }
 
-    rx.rx_deactivate().expect("rx deactivate");
+    rx.stop().expect("RX stop");
     assert!(!state.lock().rx_activated);
     tx.enable_transmit(false).expect("disable tx");
 }
@@ -468,32 +536,33 @@ fn composite_rate_tx_block_arrives_intact() {
         .expect("bandwidth");
     assert_eq!(
         radio
-            .set_tx_sample_rate(COMPOSITE_TX_RATE_HZ as usize)
+            .set_tx_sample_rate(COMPOSITE_TX_RATE_HZ as f64)
             .expect("sample rate"),
-        COMPOSITE_TX_RATE_HZ as usize
+        COMPOSITE_TX_RATE_HZ as f64
     );
     radio
         .setup_rx(
             0,
             "",
-            COMPOSITE_RX_CENTER_HZ,
             COMPOSITE_TX_RATE_HZ as f64,
             COMPOSITE_BANDWIDTH_HZ as f64,
             None,
         )
         .expect("setup rx");
     let (mut tx, rx) = radio.split().expect("split");
-    assert!(rx.is_some(), "composite reverse capture needs an RX half");
+    let mut rx = rx.expect("composite reverse capture needs an RX half");
+    rx.set_rx_frequency(COMPOSITE_RX_CENTER_HZ).unwrap();
 
     let t0 = tx.get_hardware_time().expect("time");
-    let start_ns = t0 + 200_000_000;
+    let start_ticks = t0 + INNER_TICK_RATE / 5;
     let samples: Vec<Complex32> = (0..COMPOSITE_BLOCK_SAMPLES)
         .map(|i| {
             let v = (i % 500) as f32 / 500.0 - 0.5;
             Complex32::new(v, -v)
         })
         .collect();
-    tx.transmit_at(&samples, Some(start_ns)).expect("transmit");
+    tx.transmit_at(&samples, Some(start_ticks))
+        .expect("transmit");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -501,8 +570,7 @@ fn composite_rate_tx_block_arrives_intact() {
             let state = state.lock();
             if let Some((tick, received)) = state.transmits.first() {
                 assert_eq!(received.len(), COMPOSITE_BLOCK_SAMPLES);
-                let expected_tick =
-                    (start_ns as u128 * INNER_TICK_RATE as u128 / 1_000_000_000) as u64;
+                let expected_tick = start_ticks;
                 assert!(
                     tick.expect("timed transmit").abs_diff(expected_tick) <= 1,
                     "{tick:?} vs {expected_tick}"
@@ -529,13 +597,13 @@ fn composite_rate_tx_block_arrives_intact() {
     let state = state.lock();
     assert_eq!(
         state.tx_sample_rate,
-        Some(COMPOSITE_TX_RATE_HZ as usize),
+        Some(COMPOSITE_TX_RATE_HZ as f64),
         "server must apply the composite TX rate to the inner radio"
     );
     let rx_setup = state.rx_setup.as_ref().expect("rx setup reached inner");
-    assert_eq!(rx_setup.2, COMPOSITE_RX_CENTER_HZ);
-    assert_eq!(rx_setup.3, COMPOSITE_TX_RATE_HZ as f64);
-    assert_eq!(rx_setup.4, COMPOSITE_BANDWIDTH_HZ as f64);
+    assert_eq!(state.rx_frequency_hz, Some(COMPOSITE_RX_CENTER_HZ));
+    assert_eq!(rx_setup.2, COMPOSITE_TX_RATE_HZ as f64);
+    assert_eq!(rx_setup.3, COMPOSITE_BANDWIDTH_HZ as f64);
 }
 
 #[test]
@@ -560,23 +628,23 @@ fn tcp_transport_delivers_whole_tx_blocks() {
         NetworkRadio::connect(
             &control_addr.to_string(),
             NetworkRadioOptions {
-                tx_transport: TxTransport::Tcp,
+                transport: Transport::Tcp,
                 ..NetworkRadioOptions::default()
             },
         )
         .expect("client connects"),
     );
     radio
-        .set_tx_sample_rate(TX_RATE_HZ as usize)
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
         .expect("sample rate");
 
     let (mut tx, _rx) = (radio as Box<dyn Radio>).split().expect("split");
     let t0 = tx.get_hardware_time().expect("time");
-    tx.enable_transmit_at(true, Some(t0 + 100_000_000))
+    tx.enable_transmit_at(true, Some(t0 + INNER_TICK_RATE / 10))
         .expect("enable tx");
 
-    let batch_ns = TX_BLOCK_SAMPLES as u64 * 1_000_000_000 / TX_RATE_HZ;
-    let start_ns = t0 + 200_000_000;
+    let batch_ticks = TX_BLOCK_SAMPLES as u64 * INNER_TICK_RATE / TX_RATE_HZ;
+    let start_ticks = t0 + INNER_TICK_RATE / 5;
     for batch in 0..2u64 {
         let samples: Vec<Complex32> = (0..TX_BLOCK_SAMPLES)
             .map(|i| {
@@ -584,7 +652,7 @@ fn tcp_transport_delivers_whole_tx_blocks() {
                 Complex32::new(v, -v)
             })
             .collect();
-        tx.transmit_at(&samples, Some(start_ns + batch * batch_ns))
+        tx.transmit_at(&samples, Some(start_ticks + batch * batch_ticks))
             .expect("transmit");
     }
 
@@ -638,7 +706,7 @@ fn silent_client_has_transmit_disabled_by_server() {
             .expect("client connects"),
     ) as Box<dyn Radio>;
     radio
-        .set_tx_sample_rate(TX_RATE_HZ as usize)
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
         .expect("set tx sample rate");
     let (mut tx, _rx) = radio.split().expect("split");
     tx.enable_transmit(true).expect("enable tx");
@@ -664,7 +732,7 @@ fn untimed_transmit_uses_inner_untimed_path() {
             .expect("client connects"),
     ) as Box<dyn Radio>;
     radio
-        .set_tx_sample_rate(TX_RATE_HZ as usize)
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
         .expect("set tx sample rate");
     let (mut tx, _rx) = radio.split().expect("split");
 
@@ -696,7 +764,7 @@ fn get_hardware_time_tracks_server_clock() {
             .expect("client connects"),
     ) as Box<dyn Radio>;
     radio
-        .set_tx_sample_rate(TX_RATE_HZ as usize)
+        .set_tx_sample_rate(TX_RATE_HZ as f64)
         .expect("set tx sample rate");
     let (tx, _rx) = radio.split().expect("split");
 
@@ -725,7 +793,7 @@ fn mobile_inherits_server_tx_delay_and_preserves_explicit_overrides() {
         let (_server, control_addr) = start_server_with_calibration(
             state,
             RadioCalibration {
-                tx_sample_delay: server_delay,
+                rx_to_tx_delay_ns: server_delay.map(cdma_common::radio::tx_delay_samples_to_ns),
                 ..Default::default()
             },
         );

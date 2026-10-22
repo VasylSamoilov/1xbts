@@ -1,3 +1,5 @@
+#[cfg(test)]
+use sdr_hal::error::Error as RadioError;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -339,7 +341,6 @@ impl SdrRadio {
         let rate = sample_rate_hz as usize;
         let mut radio = build_radio_from_config(
             config,
-            forward_hz as usize,
             RadioBuildOptions {
                 null_radio: false,
                 configure_rx: true,
@@ -355,15 +356,20 @@ impl SdrRadio {
         }
         calibration.tx_delay_samples = config
             .tx_sample_delay()
-            .or_else(|| radio.tx_sample_delay())
+            .or_else(|| {
+                radio
+                    .rx_to_tx_delay_ns()
+                    .map(cdma_common::radio::tx_delay_ns_to_samples)
+            })
             .unwrap_or(calibration.tx_delay_samples);
         let rx_reference_dbm = radio.rx_reference_dbm();
         radio.set_tx_bandwidth(TX_BANDWIDTH_HZ)?;
-        radio.set_tx_sample_rate(sample_rate_hz as usize)?;
-        radio.set_tx_frequency(reverse_hz as usize)?;
+        radio.set_tx_sample_rate(sample_rate_hz)?;
         let tick_rate = radio.tick_rate();
-        let (tx, rx) = radio.split()?;
-        let rx = rx.ok_or_else(|| Error::from("the radio provides no receiver"))?;
+        let (mut tx, rx) = radio.split()?;
+        tx.set_tx_frequency_hz(reverse_hz)?;
+        let mut rx = rx.ok_or_else(|| Error::from("the radio provides no receiver"))?;
+        rx.set_rx_frequency(forward_hz)?;
         let estimated_reference = calibration
             .estimated_full_scale_dbm
             .map_or_else(|| "unavailable".to_string(), |dbm| format!("{dbm:.1} dBm"));
@@ -648,7 +654,7 @@ fn rx_thread(
         }
     }
 
-    if let Err(e) = rx.rx_deactivate() {
+    if let Err(e) = rx.stop() {
         log::warn!("sdr_radio: RX deactivate failed: {}", e);
     }
     shared.running.store(false, Ordering::Relaxed);
@@ -676,7 +682,7 @@ fn tx_thread(mut tx: Box<dyn RadioTx>, shared: Arc<Shared>, commands: Receiver<T
                             e
                         );
                         if burst.end_of_burst && in_burst {
-                            end_burst(tx.as_mut(), &mut in_burst);
+                            stop_tx(tx.as_mut(), &mut in_burst);
                         }
                         continue;
                     }
@@ -689,12 +695,12 @@ fn tx_thread(mut tx: Box<dyn RadioTx>, shared: Arc<Shared>, commands: Receiver<T
                         (now + min_lead_ticks - burst.tick) as f64 / tick_rate * 1e3
                     );
                     if burst.end_of_burst && in_burst {
-                        end_burst(tx.as_mut(), &mut in_burst);
+                        stop_tx(tx.as_mut(), &mut in_burst);
                     }
                     continue;
                 }
                 if !in_burst {
-                    if let Err(e) = tx.enable_transmit_at(true, Some(burst.tick)) {
+                    if let Err(e) = tx.enable_transmit(true) {
                         log::warn!("sdr_radio: TX enable failed: {}", e);
                         continue;
                     }
@@ -726,12 +732,22 @@ fn tx_thread(mut tx: Box<dyn RadioTx>, shared: Arc<Shared>, commands: Receiver<T
                         (burst.tick - now) as f64 / tick_rate * 1e3
                     );
                 }
-                if let Err(e) = tx.transmit_shaped_at(&burst.samples, Some(burst.tick)) {
+                if let Err(e) = tx.write_all(
+                    &burst.samples,
+                    sdr_hal::TxMetadata {
+                        schedule: sdr_hal::Schedule::At(sdr_hal::DeviceTime::from_ticks(
+                            burst.tick,
+                        )),
+                        end_of_burst: burst.end_of_burst,
+                    },
+                ) {
                     log::warn!("sdr_radio: TX send failed: {}", e);
+                    stop_tx(tx.as_mut(), &mut in_burst);
+                    continue;
                 }
                 shared.tx_bursts.fetch_add(1, Ordering::Relaxed);
                 if burst.end_of_burst {
-                    end_burst(tx.as_mut(), &mut in_burst);
+                    in_burst = false;
                 }
             }
             TxCommand::Tune { frequency_hz, done } => {
@@ -745,19 +761,19 @@ fn tx_thread(mut tx: Box<dyn RadioTx>, shared: Arc<Shared>, commands: Receiver<T
             }
             TxCommand::Mute => {
                 log_flushed(&mut flushed);
-                end_burst(tx.as_mut(), &mut in_burst);
+                stop_tx(tx.as_mut(), &mut in_burst);
             }
             TxCommand::Stop => break,
         }
     }
     log_flushed(&mut flushed);
-    end_burst(tx.as_mut(), &mut in_burst);
+    stop_tx(tx.as_mut(), &mut in_burst);
     log::info!("sdr_radio: TX thread stopped");
 }
 
-fn end_burst(tx: &mut dyn RadioTx, in_burst: &mut bool) {
-    if let Err(e) = tx.enable_transmit(false) {
-        log::warn!("sdr_radio: TX disable failed: {}", e);
+fn stop_tx(tx: &mut dyn RadioTx, in_burst: &mut bool) {
+    if let Err(e) = tx.stop() {
+        log::warn!("sdr_radio: TX stop failed: {}", e);
     }
     *in_burst = false;
 }
@@ -1076,7 +1092,7 @@ impl Drop for SdrRadio {
     fn drop(&mut self) {
         Radio::stop(self);
         if let Some(tx) = self.tx.as_mut()
-            && let Err(e) = tx.enable_transmit(false)
+            && let Err(e) = tx.stop()
         {
             log::debug!("sdr_radio: TX disable on drop failed: {}", e);
         }
@@ -1087,6 +1103,7 @@ impl Drop for SdrRadio {
 mod tests {
     use super::*;
 
+    const MOCK_SAMPLE_RATE_HZ: f64 = 1_000_000.0;
     const MOCK_TICK_RATE: u64 = 1_000_000;
     const MOCK_NOW_TICK: u64 = 1_000;
     const MOCK_BURST_TICK: u64 = 1_000_000;
@@ -1096,6 +1113,7 @@ mod tests {
     enum TxEvent {
         Enable(bool),
         Transmit(u64),
+        BurstEnd,
     }
 
     #[derive(Default)]
@@ -1127,26 +1145,59 @@ mod tests {
     }
 
     impl RadioTx for MockTx {
+        fn capabilities(&self) -> sdr_hal::TxCapabilities {
+            sdr_hal::TxCapabilities::from([
+                sdr_hal::TxCapability::TimedSamples,
+                sdr_hal::TxCapability::BurstEnd,
+            ])
+        }
+        fn end_burst(&mut self) -> Result<(), RadioError> {
+            self.state.events.lock().unwrap().push(TxEvent::BurstEnd);
+            Ok(())
+        }
+
+        fn write_all(
+            &mut self,
+            samples: &[Complex32],
+            metadata: sdr_hal::TxMetadata,
+        ) -> Result<(), RadioError> {
+            let tick = match metadata.schedule {
+                sdr_hal::Schedule::Immediate => None,
+                sdr_hal::Schedule::At(time) => Some(time.ticks()),
+            };
+            self.transmit_at(samples, tick)?;
+            if metadata.end_of_burst {
+                self.end_burst()?;
+            }
+            Ok(())
+        }
+
+        fn tx_sample_rate_hz(&self) -> f64 {
+            MOCK_SAMPLE_RATE_HZ
+        }
+        fn supports_timed_tx(&self) -> bool {
+            true
+        }
         fn tick_rate(&self) -> u64 {
             MOCK_TICK_RATE
         }
 
-        fn get_hardware_time(&self) -> Result<u64, Error> {
+        fn get_hardware_time(&self) -> Result<u64, RadioError> {
             if self.state.time_unavailable.load(Ordering::Relaxed) {
                 return Err("hardware time unavailable".into());
             }
             Ok(MOCK_NOW_TICK)
         }
 
-        fn transmit(&mut self, _samples: &[Complex32]) -> Result<(), Error> {
+        fn transmit(&mut self, _samples: &[Complex32]) -> Result<(), RadioError> {
             Ok(())
         }
 
-        fn transmit_shaped_at(
+        fn transmit_at(
             &mut self,
             _samples: &[Complex32],
             tick: Option<u64>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), RadioError> {
             self.state
                 .events
                 .lock()
@@ -1161,7 +1212,7 @@ mod tests {
             Ok(())
         }
 
-        fn enable_transmit(&mut self, enable: bool) -> Result<(), Error> {
+        fn enable_transmit(&mut self, enable: bool) -> Result<(), RadioError> {
             self.state
                 .events
                 .lock()
@@ -1174,11 +1225,14 @@ mod tests {
     struct IdleRx;
 
     impl RadioRx for IdleRx {
+        fn rx_sample_rate_hz(&self) -> f64 {
+            MOCK_SAMPLE_RATE_HZ
+        }
         fn tick_rate(&self) -> u64 {
             MOCK_TICK_RATE
         }
 
-        fn get_hardware_time(&self) -> Result<u64, Error> {
+        fn get_hardware_time(&self) -> Result<u64, RadioError> {
             Ok(MOCK_NOW_TICK)
         }
 
@@ -1186,7 +1240,7 @@ mod tests {
             &mut self,
             _buf: &mut [Complex32],
             _timeout_us: i64,
-        ) -> Result<cdma_common::radio::RxReadResult, Error> {
+        ) -> Result<cdma_common::radio::RxReadResult, RadioError> {
             thread::sleep(Duration::from_millis(1));
             Ok(cdma_common::radio::RxReadResult {
                 samples_read: 0,
@@ -1195,11 +1249,11 @@ mod tests {
             })
         }
 
-        fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), Error> {
+        fn rx_activate(&mut self, _time_ticks: Option<u64>) -> Result<(), RadioError> {
             Ok(())
         }
 
-        fn rx_deactivate(&mut self) -> Result<(), Error> {
+        fn stop(&mut self) -> Result<(), RadioError> {
             Ok(())
         }
     }
@@ -1272,6 +1326,34 @@ mod tests {
         );
         send_tx_priority(&shared, &commands, TxCommand::Stop);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn completed_bursts_use_markers_and_stop_only_on_shutdown() {
+        let state = Arc::new(MockTxState::default());
+        let (shared, commands, handle) = spawn_tx(MockTx::new(state.clone()));
+        commands
+            .send(timed_burst(MOCK_BURST_TICK, true, 0))
+            .unwrap();
+        wait_for_events(&state, 3);
+        commands
+            .send(timed_burst(MOCK_BURST_TICK + 4, true, 0))
+            .unwrap();
+        wait_for_events(&state, 6);
+        assert_eq!(
+            state.events(),
+            [
+                TxEvent::Enable(true),
+                TxEvent::Transmit(MOCK_BURST_TICK),
+                TxEvent::BurstEnd,
+                TxEvent::Enable(true),
+                TxEvent::Transmit(MOCK_BURST_TICK + 4),
+                TxEvent::BurstEnd
+            ]
+        );
+        send_tx_priority(&shared, &commands, TxCommand::Stop);
+        handle.join().unwrap();
+        assert_eq!(state.events().last(), Some(&TxEvent::Enable(false)));
     }
 
     #[test]
