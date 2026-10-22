@@ -1,5 +1,6 @@
 # HEAD
 
+- Fix default PDSN config mismatch with A11 key.
 - Move SDR code out into [`sdr-hal`](https://github.com/chrismoos/sdr-hal).
 - Femtocell site configuration now forces ACS username, password, and SIP password to be set.
 - Added SMPP SMS support.
