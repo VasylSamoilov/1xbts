@@ -3956,6 +3956,13 @@ pub fn extended_cam_supported(band_class: u8, mob_p_rev: u8) -> bool {
     mob_p_rev >= min_p_rev
 }
 
+/// Whether a mobile at `mob_p_rev` in `band_class` supports Rate Set 2 traffic
+/// (RC2). TSB-74 and J-STD-008 add Rate Set 2 at the same P_REV as ASSIGN_MODE
+/// '100', so P_REV 1 qualifies in PCS but not in Band Class 0.
+pub fn rate_set_2_supported(band_class: u8, mob_p_rev: u8) -> bool {
+    extended_cam_supported(band_class, mob_p_rev)
+}
+
 /// DEFAULT_CONFIG for a forward/reverse RC pair (C.S0005-A Table
 /// 3.7.2.3.2.8-3).
 pub fn channel_default_config_for_rcs(for_rc: u8, rev_rc: u8) -> Option<u8> {

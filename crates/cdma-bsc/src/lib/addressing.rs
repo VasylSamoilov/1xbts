@@ -2,7 +2,9 @@ use cdma_common::consts::{
     SERVICE_OPTION_ASYNC_DATA, SERVICE_OPTION_BASIC_VOICE, SERVICE_OPTION_PACKET_DATA,
     SERVICE_OPTION_PACKET_DATA_RC3, SERVICE_OPTION_QCELP13,
 };
-use cdma_common::lac::paging_messages::{self as paging_messages, MsAddress, MsPageAddress};
+use cdma_common::lac::paging_messages::{
+    self as paging_messages, MsAddress, MsPageAddress, rate_set_2_supported,
+};
 use log::{info, warn};
 
 use crate::config::TrafficAssignmentConfig;
@@ -158,6 +160,7 @@ pub(crate) fn select_initial_traffic_rcs_for_so(
     for_pref: Option<u8>,
     rev_pref: Option<u8>,
     mob_p_rev: u8,
+    band_class: u8,
     service_option: Option<u16>,
 ) -> Option<(u8, u8)> {
     if service_option == Some(SERVICE_OPTION_BASIC_VOICE) {
@@ -176,7 +179,7 @@ pub(crate) fn select_initial_traffic_rcs_for_so(
     ) {
         let admits_rc2_policy =
             policy.supported_for_rcs.contains(&2) && policy.supported_rev_rcs.contains(&2);
-        let admits_rc2_mobile = mob_p_rev >= 3
+        let admits_rc2_mobile = rate_set_2_supported(band_class, mob_p_rev)
             && (mob_p_rev < 6
                 || ((for_rcs.is_empty() || for_rcs.contains(&2))
                     && (rev_rcs.is_empty() || rev_rcs.contains(&2))));
@@ -184,13 +187,14 @@ pub(crate) fn select_initial_traffic_rcs_for_so(
             return Some((2, 2));
         }
         warn!(
-            "BSC: Rate Set 2 service SO{} requested but RC2 not admissible (policy for={:?} rev={:?} mobile for={:?} rev={:?} mob_p_rev={})",
+            "BSC: Rate Set 2 service SO{} requested but RC2 not admissible (policy for={:?} rev={:?} mobile for={:?} rev={:?} mob_p_rev={} band_class={})",
             service_option.unwrap_or_default(),
             policy.supported_for_rcs,
             policy.supported_rev_rcs,
             for_rcs,
             rev_rcs,
             mob_p_rev,
+            band_class,
         );
         return None;
     }
@@ -332,6 +336,9 @@ pub(crate) fn format_ms_page_address(addr: &MsPageAddress) -> String {
 mod tests {
     use super::*;
     use crate::config::{RcPairConfig, TrafficAssignmentConfig};
+
+    const BAND_CLASS_CELLULAR: u8 = 0;
+    const BAND_CLASS_PCS: u8 = 1;
 
     // ---- is_packet_data_so ----
 
@@ -742,6 +749,7 @@ mod tests {
             None,
             None,
             3,
+            BAND_CLASS_CELLULAR,
             Some(SERVICE_OPTION_QCELP13),
         );
         assert_eq!(result, Some((2, 2)));
@@ -756,6 +764,7 @@ mod tests {
             None,
             None,
             3,
+            BAND_CLASS_CELLULAR,
             Some(SERVICE_OPTION_ASYNC_DATA),
         );
         assert_eq!(result, Some((2, 2)));
@@ -770,9 +779,40 @@ mod tests {
             Some(3),
             Some(3),
             6,
+            BAND_CLASS_CELLULAR,
             Some(SERVICE_OPTION_BASIC_VOICE),
         );
         assert_eq!(result, Some((1, 1)));
+    }
+
+    #[test]
+    fn qcelp_pcs_p_rev1_selects_rc2() {
+        let result = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[],
+            &[],
+            None,
+            None,
+            1,
+            BAND_CLASS_PCS,
+            Some(SERVICE_OPTION_QCELP13),
+        );
+        assert_eq!(result, Some((2, 2)));
+    }
+
+    #[test]
+    fn qcelp_cellular_p_rev1_rejects_rc2() {
+        let result = select_initial_traffic_rcs_for_so(
+            &default_policy(),
+            &[],
+            &[],
+            None,
+            None,
+            1,
+            BAND_CLASS_CELLULAR,
+            Some(SERVICE_OPTION_QCELP13),
+        );
+        assert!(result.is_none());
     }
 
     #[test]
@@ -784,6 +824,7 @@ mod tests {
             None,
             None,
             3,
+            BAND_CLASS_CELLULAR,
             Some(SERVICE_OPTION_QCELP13),
         );
         assert!(result.is_none());
@@ -798,6 +839,7 @@ mod tests {
             None,
             None,
             6,
+            BAND_CLASS_CELLULAR,
             Some(SERVICE_OPTION_QCELP13),
         );
         let unsupported = select_initial_traffic_rcs_for_so(
@@ -807,6 +849,7 @@ mod tests {
             None,
             None,
             6,
+            BAND_CLASS_CELLULAR,
             Some(SERVICE_OPTION_QCELP13),
         );
         assert_eq!(supported, Some((2, 2)));

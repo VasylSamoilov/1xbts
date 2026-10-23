@@ -186,6 +186,7 @@ impl Bsc {
                 ms.for_preferred_rc,
                 ms.rev_preferred_rc,
                 ms.mob_p_rev,
+                cell_params.overhead.band_class.unwrap_or(0),
                 event.service_option,
             )
         };
@@ -572,6 +573,7 @@ impl Bsc {
                 ms.for_preferred_rc,
                 ms.rev_preferred_rc,
                 ms.mob_p_rev,
+                cell_params.overhead.band_class.unwrap_or(0),
                 Some(so),
             )
         };
@@ -783,6 +785,7 @@ impl Bsc {
                 ms.for_preferred_rc,
                 ms.rev_preferred_rc,
                 ms.mob_p_rev,
+                cell_params.overhead.band_class.unwrap_or(0),
                 Some(service_option),
             )
         }
