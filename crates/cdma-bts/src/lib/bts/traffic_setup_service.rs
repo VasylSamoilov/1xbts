@@ -48,6 +48,8 @@ pub(crate) struct Session {
     /// F-SCH code allocated through the Abis Burst path for this FCH session,
     /// or `None` before supplemental allocation. Freed in `handle_remove`.
     pub(crate) sch_walsh_code: Option<u8>,
+    /// Service option from the BTS Setup Service Option element.
+    pub(crate) requested_service_option: Option<u16>,
 }
 
 /// Service responsible for traffic channel setup and release procedures.
@@ -187,6 +189,7 @@ impl TrafficSetupService {
                             release: TrafficReleaseProcedure::new(ccr),
                             traffic_lac: None,
                             sch_walsh_code,
+                            requested_service_option: setup.service_option.map(|so| so.0),
                         },
                     );
                     responses.push(msg);
@@ -365,13 +368,19 @@ impl TrafficSetupService {
                         return true;
                     }
                 };
-                let (for_rc, rev_rc) = match super::abis_agent::cam_radio_config(&cam) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        warn!("traffic_setup: {e}");
-                        return true;
-                    }
-                };
+                let requested_service_option = self
+                    .sessions
+                    .values()
+                    .find(|s| s.walsh_code == cam.code_chan && !s.committed)
+                    .and_then(|s| s.requested_service_option);
+                let (for_rc, rev_rc) =
+                    match super::abis_agent::cam_radio_config(&cam, requested_service_option) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!("traffic_setup: {e}");
+                            return true;
+                        }
+                    };
                 (cam.code_chan, for_rc, rev_rc, 0, false, "CAM")
             } else if aim.message_type == ecam_wire {
                 let mut bs = Bitstream::new_bytes(&aim.message);

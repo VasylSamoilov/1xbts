@@ -8,9 +8,9 @@ use cdma_common::error::Error;
 use cdma_common::events::AccessChannelEvent;
 use cdma_common::lac::message_types::MessageId;
 use cdma_common::lac::paging_messages::{
-    CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
-    CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
+    CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
     ExtendedChannelAssignmentMessage, MsAddress, PagingChannelMessage,
+    channel_default_config_for_rcs, extended_cam_supported, service_option_default_rc,
 };
 use cdma_common::overhead::OverheadParameters;
 use cdma_common::phy::long_code::LongCodeGenerator;
@@ -32,8 +32,6 @@ use super::{
 
 #[derive(Default)]
 pub(crate) struct TrafficAssignmentService;
-
-const EXTENDED_CAM_MIN_P_REV: u8 = 3;
 
 fn should_use_ecam(mob_p_rev: u8, legacy_so1_assignment: bool, band_class: u8) -> bool {
     mob_p_rev >= 6 && (!legacy_so1_assignment || band_class != 0)
@@ -208,17 +206,24 @@ impl Bsc {
         let alloc_result = match selected_rcs {
             (3, 3) => {
                 bts_client
-                    .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
+                    .allocate_rc3_traffic(
+                        traffic_lc.clone(),
+                        0,
+                        12,
+                        esn,
+                        false,
+                        event.service_option,
+                    )
                     .await
             }
             (2, 2) => {
                 bts_client
-                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn)
+                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn, event.service_option)
                     .await
             }
             (1, 1) => {
                 bts_client
-                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn, event.service_option)
                     .await
             }
             other => {
@@ -392,11 +397,18 @@ impl Bsc {
 
         let alloc_result = if use_rc3 {
             bts_client
-                .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
+                .allocate_rc3_traffic(
+                    traffic_lc.clone(),
+                    0,
+                    12,
+                    esn,
+                    false,
+                    Some(SERVICE_OPTION_SMS),
+                )
                 .await
         } else {
             bts_client
-                .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                .allocate_rc1_traffic(traffic_lc.clone(), 0, esn, Some(SERVICE_OPTION_SMS))
                 .await
         };
         let Some(handle) = alloc_result else {
@@ -581,17 +593,24 @@ impl Bsc {
         let alloc_result = match selected_rcs {
             (3, 3) => {
                 bts_client
-                    .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, include_sch)
+                    .allocate_rc3_traffic(
+                        traffic_lc.clone(),
+                        0,
+                        12,
+                        esn,
+                        include_sch,
+                        event.service_option,
+                    )
                     .await
             }
             (2, 2) => {
                 bts_client
-                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn)
+                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn, event.service_option)
                     .await
             }
             (1, 1) => {
                 bts_client
-                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn, event.service_option)
                     .await
             }
             other => {
@@ -768,21 +787,29 @@ impl Bsc {
             )
         }
         .ok_or_else(|| "no configured traffic RC pair matches mobile capabilities".to_string())?;
+        let requested_service_option = Some(origination_service_option.unwrap_or(service_option));
         // F-SCH is only for SO33 packet data.
         let alloc_result = match selected_rcs {
             (3, 3) => {
                 bts_client
-                    .allocate_rc3_traffic(traffic_lc.clone(), 0, 12, esn, false)
+                    .allocate_rc3_traffic(
+                        traffic_lc.clone(),
+                        0,
+                        12,
+                        esn,
+                        false,
+                        requested_service_option,
+                    )
                     .await
             }
             (2, 2) => {
                 bts_client
-                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn)
+                    .allocate_rc2_traffic(traffic_lc.clone(), 0, esn, requested_service_option)
                     .await
             }
             (1, 1) => {
                 bts_client
-                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn)
+                    .allocate_rc1_traffic(traffic_lc.clone(), 0, esn, requested_service_option)
                     .await
             }
             other => {
@@ -897,6 +924,7 @@ impl TrafficAssignmentService {
             ms_gating_req,
             needs_service_negotiation,
             legacy_so1_assignment,
+            requested_service_option,
         ) = mobiles
             .get(addr)
             .map(|ms| {
@@ -916,9 +944,21 @@ impl TrafficAssignmentService {
                     needs_service_negotiation,
                     ms.find_traffic_channel_by_walsh(walsh_code)
                         .is_some_and(|tc| tc.service_option == SERVICE_OPTION_BASIC_VOICE),
+                    ms.find_traffic_channel_by_walsh(walsh_code)
+                        .map(|tc| tc.origination_service_option.unwrap_or(tc.service_option)),
                 )
             })
-            .unwrap_or((1, Vec::new(), Vec::new(), None, None, false, false, false));
+            .unwrap_or((
+                1,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            ));
 
         let serving_band_class = overhead.band_class.unwrap_or(0);
         let is_bc0 = serving_band_class == 0;
@@ -1016,39 +1056,37 @@ impl TrafficAssignmentService {
                 )
                 .into());
             }
-            let cam = match (for_rc, rev_rc) {
-                (2, 2) if mob_p_rev >= EXTENDED_CAM_MIN_P_REV => {
-                    let (default_config, granted_mode) = if needs_service_negotiation {
-                        (
-                            CHANNEL_DEFAULT_CONFIG_RC2_RC2,
-                            ChannelAssignmentGrantedMode::DefaultConfiguration,
-                        )
-                    } else {
-                        (
-                            CHANNEL_DEFAULT_CONFIG_RC1_RC1,
-                            ChannelAssignmentGrantedMode::RequestedService,
-                        )
-                    };
-                    ChannelAssignmentMessage::new_extended_traffic_assignment(
-                        walsh_code,
-                        0,
-                        default_config,
-                        granted_mode,
-                        false,
-                    )
-                }
-                (2, 2) => {
-                    return Err("RC2 CAM requires mobile P_REV >= 3".into());
-                }
-                (1, 1) if !is_bc0 => ChannelAssignmentMessage::new_extended_traffic_assignment(
+            let extended_cam = extended_cam_supported(serving_band_class, mob_p_rev);
+            let cam = if (for_rc, rev_rc) == (1, 1) && (is_bc0 || !extended_cam) {
+                ChannelAssignmentMessage::new_traffic_assignment(walsh_code, 0)
+            } else if extended_cam {
+                let default_config = channel_default_config_for_rcs(for_rc, rev_rc)
+                    .ok_or_else(|| format!("legacy CAM cannot represent RC{for_rc}/{rev_rc}"))?;
+                // Under GRANTED_MODE '10' the mobile starts on the default
+                // multiplex option of its requested service option (C.S0005-A
+                // §2.6.4.1), so that mode is granted only when that default is
+                // the assigned RC pair. DEFAULT_CONFIG (C.S0005-A Table
+                // 3.7.2.3.2.8-3) still names the assigned RCs. A BTS without
+                // the BTS Setup Service Option (A.S0003-A §6.2.5) reads it.
+                let so_default_matches = for_rc == rev_rc
+                    && requested_service_option.and_then(service_option_default_rc) == Some(for_rc);
+                let granted_mode = if so_default_matches && !needs_service_negotiation {
+                    ChannelAssignmentGrantedMode::RequestedService
+                } else {
+                    ChannelAssignmentGrantedMode::DefaultConfiguration
+                };
+                ChannelAssignmentMessage::new_extended_traffic_assignment(
                     walsh_code,
                     0,
-                    CHANNEL_DEFAULT_CONFIG_RC1_RC1,
-                    ChannelAssignmentGrantedMode::RequestedService,
+                    default_config,
+                    granted_mode,
                     false,
-                ),
-                (1, 1) => ChannelAssignmentMessage::new_traffic_assignment(walsh_code, 0),
-                _ => unreachable!("legacy CAM RC pair validated above"),
+                )
+            } else {
+                return Err(format!(
+                    "RC{for_rc}/{rev_rc} CAM needs ASSIGN_MODE 100, which MOB_P_REV {mob_p_rev} does not support in band class {serving_band_class}"
+                )
+                .into());
             };
             let assign_mode = cam.assign_mode;
             (

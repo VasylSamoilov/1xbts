@@ -108,6 +108,7 @@ pub trait BtsControlClient: Send + Sync {
         lc_generator: LongCodeGenerator,
         initial_lc_chip: u64,
         esn: u32,
+        service_option: Option<u16>,
     ) -> Option<BtsTrafficChannelHandle>;
 
     /// Allocate an RC2 forward traffic channel.
@@ -116,6 +117,7 @@ pub trait BtsControlClient: Send + Sync {
         lc_generator: LongCodeGenerator,
         initial_lc_chip: u64,
         esn: u32,
+        service_option: Option<u16>,
     ) -> Option<BtsTrafficChannelHandle>;
 
     /// Allocate an RC3 forward traffic channel.
@@ -128,6 +130,7 @@ pub trait BtsControlClient: Send + Sync {
         fpc_subchan_gain: u8,
         esn: u32,
         include_sch: bool,
+        service_option: Option<u16>,
     ) -> Option<BtsTrafficChannelHandle>;
 
     /// Deallocate an RC1 / RC3 forward traffic channel by Walsh code.

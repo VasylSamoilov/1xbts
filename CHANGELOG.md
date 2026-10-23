@@ -1,5 +1,6 @@
 # HEAD
 
+- Added support for legacy IS-95 devices on PCS (default `min_p_rev` is now 1).
 - Improved HRPD connection reliability, packet recovery, and reverse power control.
 - Fix default PDSN config mismatch with A11 key.
 - Move SDR code out into [`sdr-hal`](https://github.com/chrismoos/sdr-hal).

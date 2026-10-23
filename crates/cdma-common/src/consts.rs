@@ -6,8 +6,14 @@ pub const SERVICE_OPTION_REJECTED: u16 = 0;
 /// SO1: default Basic Variable Rate Voice Service.
 pub const SERVICE_OPTION_BASIC_VOICE: u16 = 1;
 
+/// SO2: Mobile Station Loopback, Rate Set 1.
+pub const SERVICE_OPTION_LOOPBACK_RS1: u16 = 2;
+
 /// SO3: EVRC-A / IS-127 narrowband.
 pub const SERVICE_OPTION_EVRC_A: u16 = 3;
+
+/// SO4: asynchronous data service, Rate Set 1.
+pub const SERVICE_OPTION_ASYNC_DATA_RS1: u16 = 4;
 
 /// SO6: Short Message Services.
 pub const SERVICE_OPTION_SMS: u16 = 6;
@@ -15,11 +21,26 @@ pub const SERVICE_OPTION_SMS: u16 = 6;
 /// SO7: packet data bearer service using RLP Type 1 and Rate Set 1 by default.
 pub const SERVICE_OPTION_PACKET_DATA: u16 = 7;
 
+/// SO9: Mobile Station Loopback, Rate Set 2.
+pub const SERVICE_OPTION_LOOPBACK_RS2: u16 = 9;
+
 /// SO12: asynchronous data service using RLP Type 1 and Rate Set 2 by default.
 pub const SERVICE_OPTION_ASYNC_DATA: u16 = 12;
 
+/// SO14: Short Message Services, Rate Set 2.
+pub const SERVICE_OPTION_SMS_RS2: u16 = 14;
+
+/// SO15: packet data bearer service, Rate Set 2.
+pub const SERVICE_OPTION_PACKET_DATA_RS2: u16 = 15;
+
+/// SO17: IS-733 high-rate (13 kbps) speech, Rate Set 2.
+pub const SERVICE_OPTION_HIGH_RATE_VOICE: u16 = 17;
+
 /// SO18: OTASP (C.S0016-D §1.2).
 pub const SERVICE_OPTION_OTASP: u16 = 18;
+
+/// SO19: OTASP, Rate Set 2 (C.S0016-D §1.2).
+pub const SERVICE_OPTION_OTASP_RS2: u16 = 19;
 
 /// SO33: High-rate packet data service.
 pub const SERVICE_OPTION_PACKET_DATA_RC3: u16 = 33;

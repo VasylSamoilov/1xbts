@@ -15,8 +15,7 @@ use cdma_common::lac::{
         CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
         CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
         CHANNEL_DEFAULT_CONFIG_RC1_RC2, CHANNEL_DEFAULT_CONFIG_RC2_RC1,
-        CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
-        GeneralPageRecord, MsAddress, PagingChannelMessage,
+        CHANNEL_DEFAULT_CONFIG_RC2_RC2, GeneralPageRecord, MsAddress, PagingChannelMessage,
     },
 };
 use log::{info, warn};
@@ -1283,7 +1282,7 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
         PagingChannelMessage::FlexDuplexCdmaChannelList(_) => None,
         PagingChannelMessage::BroadcastServiceParameters(_) => None,
         PagingChannelMessage::ChannelAssignment(m) => {
-            let effective_rcs = cam_effective_radio_config(m);
+            let effective_rcs = m.initial_radio_config(None);
             let assign_mode_name = match m.assign_mode {
                 CHANNEL_ASSIGN_MODE_TRAFFIC => "IS-95 Traffic",
                 CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC => "Extended Traffic (IS-2000)",
@@ -1392,32 +1391,6 @@ fn to_proto_paging_event(ev: &PagingEvent) -> proto::PagingEvent {
         // record. The per-cell transmission stream carries the cell that
         // actually put it on air.
         cell: None,
-    }
-}
-
-fn cam_effective_radio_config(cam: &ChannelAssignmentMessage) -> Option<(u8, u8)> {
-    const DEFAULT_CONFIGURATION: u8 = ChannelAssignmentGrantedMode::DefaultConfiguration as u8;
-    const REQUESTED_SERVICE: u8 = ChannelAssignmentGrantedMode::RequestedService as u8;
-    match (cam.assign_mode, cam.granted_mode, cam.default_config) {
-        (CHANNEL_ASSIGN_MODE_TRAFFIC, _, _) => Some((1, 1)),
-        (
-            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
-            Some(DEFAULT_CONFIGURATION),
-            Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
-        ) => Some((1, 1)),
-        (
-            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
-            Some(DEFAULT_CONFIGURATION),
-            Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2),
-        ) => Some((2, 2)),
-        // The supported requested-service CAM is the P_REV 3 QCELP 13K
-        // assignment. DEFAULT_CONFIG remains the RC1 fallback.
-        (
-            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
-            Some(REQUESTED_SERVICE),
-            Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
-        ) => Some((2, 2)),
-        _ => None,
     }
 }
 
@@ -2185,7 +2158,9 @@ fn load_server_tls_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cdma_common::lac::paging_messages::ChannelAssignmentGrantedMode;
+    use cdma_common::lac::paging_messages::{
+        ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
+    };
 
     #[test]
     fn merging_bsc_loop_state_keeps_the_bts_reverse_measurements() {
@@ -2262,13 +2237,16 @@ mod tests {
         );
 
         assert_eq!(cam.default_config, Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1));
-        assert_eq!(cam_effective_radio_config(&cam), Some((2, 2)));
+        assert_eq!(
+            cam.initial_radio_config(Some(cdma_common::consts::SERVICE_OPTION_QCELP13)),
+            Some((2, 2))
+        );
     }
 
     #[test]
     fn default_configuration_cam_reports_selected_pair() {
         let rc1 = ChannelAssignmentMessage::new_traffic_assignment(10, 0);
-        assert_eq!(cam_effective_radio_config(&rc1), Some((1, 1)));
+        assert_eq!(rc1.initial_radio_config(None), Some((1, 1)));
 
         let rc2 = ChannelAssignmentMessage::new_extended_traffic_assignment(
             11,
@@ -2277,7 +2255,7 @@ mod tests {
             ChannelAssignmentGrantedMode::DefaultConfiguration,
             false,
         );
-        assert_eq!(cam_effective_radio_config(&rc2), Some((2, 2)));
+        assert_eq!(rc2.initial_radio_config(None), Some((2, 2)));
     }
 }
 

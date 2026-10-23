@@ -837,7 +837,7 @@ impl Default for ExtendedSystemParametersDefaults {
             bcast_index: 0,
             imsi_t_supported: false,
             p_rev: 11,
-            min_p_rev: 3,
+            min_p_rev: 1,
             soft_slope: 0,
             add_intercept: 0,
             drop_intercept: 0,
@@ -3923,6 +3923,7 @@ pub struct ChannelAssignmentMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelAssignmentGrantedMode {
     DefaultConfiguration = 0b00,
+    RequestedServiceNegotiated = 0b01,
     RequestedService = 0b10,
 }
 
@@ -3934,6 +3935,72 @@ pub const CHANNEL_DEFAULT_CONFIG_RC2_RC2: u8 = 0b001;
 pub const CHANNEL_DEFAULT_CONFIG_RC1_RC2: u8 = 0b010;
 pub const CHANNEL_DEFAULT_CONFIG_RC2_RC1: u8 = 0b011;
 pub const CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS: u8 = 0b100;
+
+const BAND_CLASS_PCS: u8 = 1;
+const BAND_CLASS_KOREAN_PCS: u8 = 4;
+/// Lowest P_REV that defines ASSIGN_MODE '100' in Band Classes 1 and 4
+/// (J-STD-008).
+const EXTENDED_CAM_MIN_P_REV_PCS: u8 = 1;
+/// Lowest P_REV that defines ASSIGN_MODE '100' in the other band classes
+/// (TSB-74).
+const EXTENDED_CAM_MIN_P_REV: u8 = 3;
+
+/// Whether a mobile at `mob_p_rev` in `band_class` accepts a Channel
+/// Assignment Message with ASSIGN_MODE '100'. MOB_P_REV is numbered per band
+/// class (C.S0005-A §2.6.1.3), so P_REV 1 in PCS is J-STD-008.
+pub fn extended_cam_supported(band_class: u8, mob_p_rev: u8) -> bool {
+    let min_p_rev = match band_class {
+        BAND_CLASS_PCS | BAND_CLASS_KOREAN_PCS => EXTENDED_CAM_MIN_P_REV_PCS,
+        _ => EXTENDED_CAM_MIN_P_REV,
+    };
+    mob_p_rev >= min_p_rev
+}
+
+/// DEFAULT_CONFIG for a forward/reverse RC pair (C.S0005-A Table
+/// 3.7.2.3.2.8-3).
+pub fn channel_default_config_for_rcs(for_rc: u8, rev_rc: u8) -> Option<u8> {
+    match (for_rc, rev_rc) {
+        (1, 1) => Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
+        (2, 2) => Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2),
+        (1, 2) => Some(CHANNEL_DEFAULT_CONFIG_RC1_RC2),
+        (2, 1) => Some(CHANNEL_DEFAULT_CONFIG_RC2_RC1),
+        _ => None,
+    }
+}
+
+fn channel_default_config_rcs(default_config: u8) -> Option<(u8, u8)> {
+    match default_config {
+        CHANNEL_DEFAULT_CONFIG_RC1_RC1 => Some((1, 1)),
+        CHANNEL_DEFAULT_CONFIG_RC2_RC2 => Some((2, 2)),
+        CHANNEL_DEFAULT_CONFIG_RC1_RC2 => Some((1, 2)),
+        CHANNEL_DEFAULT_CONFIG_RC2_RC1 => Some((2, 1)),
+        _ => None,
+    }
+}
+
+/// RC of the default multiplex option for a service option, which a mobile
+/// starts on when a CAM grants GRANTED_MODE '01' or '10' (C.S0005-A
+/// §2.6.4.1). Multiplex Option 1 is RC1 and Multiplex Option 2 is RC2.
+pub fn service_option_default_rc(service_option: u16) -> Option<u8> {
+    use crate::consts::*;
+    match service_option {
+        SERVICE_OPTION_BASIC_VOICE
+        | SERVICE_OPTION_LOOPBACK_RS1
+        | SERVICE_OPTION_EVRC_A
+        | SERVICE_OPTION_ASYNC_DATA_RS1
+        | SERVICE_OPTION_SMS
+        | SERVICE_OPTION_PACKET_DATA
+        | SERVICE_OPTION_OTASP => Some(1),
+        SERVICE_OPTION_LOOPBACK_RS2
+        | SERVICE_OPTION_ASYNC_DATA
+        | SERVICE_OPTION_SMS_RS2
+        | SERVICE_OPTION_PACKET_DATA_RS2
+        | SERVICE_OPTION_HIGH_RATE_VOICE
+        | SERVICE_OPTION_OTASP_RS2
+        | SERVICE_OPTION_QCELP13 => Some(2),
+        _ => None,
+    }
+}
 
 impl ChannelAssignmentMessage {
     /// Create a simple same-frequency traffic channel assignment.
@@ -3978,6 +4045,37 @@ impl ChannelAssignmentMessage {
             granted_mode: Some(granted_mode as u8),
             plcm_type_incl: None,
             plcm_type: None,
+        }
+    }
+
+    /// Forward and reverse RC the mobile starts the traffic channel on
+    /// (C.S0005-A §2.6.4.1).
+    ///
+    /// Under GRANTED_MODE '01' or '10' the mobile ignores DEFAULT_CONFIG and
+    /// uses the default multiplex option of the service option it requested,
+    /// which Abis reports in the BTS Setup Service Option element (A.S0003-A
+    /// §6.2.5). Without `requested_service_option` the result falls back to
+    /// DEFAULT_CONFIG, which is correct only when the base station set it to
+    /// match that service option.
+    pub fn initial_radio_config(&self, requested_service_option: Option<u16>) -> Option<(u8, u8)> {
+        const REQUESTED_SERVICE_NEGOTIATED: u8 =
+            ChannelAssignmentGrantedMode::RequestedServiceNegotiated as u8;
+        const REQUESTED_SERVICE: u8 = ChannelAssignmentGrantedMode::RequestedService as u8;
+        match (
+            self.assign_mode,
+            self.granted_mode,
+            requested_service_option,
+        ) {
+            (CHANNEL_ASSIGN_MODE_TRAFFIC, _, _) => Some((1, 1)),
+            (
+                CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
+                Some(REQUESTED_SERVICE_NEGOTIATED | REQUESTED_SERVICE),
+                Some(service_option),
+            ) => service_option_default_rc(service_option).map(|rc| (rc, rc)),
+            (CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, _, _) => {
+                self.default_config.and_then(channel_default_config_rcs)
+            }
+            _ => None,
         }
     }
 

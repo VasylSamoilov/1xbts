@@ -3320,6 +3320,8 @@ async fn run_bts_to_wav_to_receiver_pipeline_case(
     bts_config.radio = RadioConfig::FileOutput {
         path: wav_path.display().to_string(),
     };
+    // The file radio records baseband and rejects a nonzero TX LO offset.
+    bts_config.runtime.tx_lo_offset_hz = 0;
     bts_config.validate()?;
     assert_eq!(
         bts_config.overhead.max_slot_cycle_index, E2E_MAX_SLOT_CYCLE_INDEX,
@@ -3848,6 +3850,8 @@ async fn run_sync_overhead_window_case(
     bts_config.radio = RadioConfig::FileOutput {
         path: wav_path.display().to_string(),
     };
+    // The file radio records baseband and rejects a nonzero TX LO offset.
+    bts_config.runtime.tx_lo_offset_hz = 0;
     bts_config.validate()?;
 
     let (mac_to_lac_tx, mac_to_lac_rx) = channel();

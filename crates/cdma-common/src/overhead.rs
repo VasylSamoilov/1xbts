@@ -56,7 +56,7 @@ impl Default for OverheadParameters {
             auth_mode: 0,
             t1b_ms: 1280,
             p_rev: 11,
-            min_p_rev: 3,
+            min_p_rev: 1,
             lp_sec: 0,
             ltm_off: 0,
             daylt: 0,

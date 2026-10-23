@@ -20,6 +20,7 @@ use cdma_bts::lac::paging_messages::{
     CHANNEL_DEFAULT_CONFIG_RC1_RC1, ChannelAssignmentGrantedMode, ChannelAssignmentMessage,
     ExtendedChannelAssignmentMessage,
 };
+use cdma_common::consts::SERVICE_OPTION_QCELP13;
 use cdma_common::lac::message_types::{MessageId, WireChannel};
 
 fn agent_config() -> AbisAgentConfig {
@@ -137,7 +138,10 @@ async fn abis_tcp_setup_allocates_walsh() {
     let harness = AbisTestHarness::new().await;
 
     let lc = LongCodeGenerator::new_traffic_channel(0xDEAD);
-    let result = harness.client().allocate_rc1_traffic(lc, 0, 0xDEAD).await;
+    let result = harness
+        .client()
+        .allocate_rc1_traffic(lc, 0, 0xDEAD, None)
+        .await;
     assert!(
         result.is_some(),
         "network client should return an opaque bearer handle"
@@ -167,14 +171,14 @@ async fn abis_tcp_qcelp_setup_commits_rc2_from_requested_service_cam() {
             LongCodeGenerator::new_traffic_channel(0x13_0000),
             0,
             0x13_0000,
+            Some(SERVICE_OPTION_QCELP13),
         )
         .await
         .expect("RC2 allocation should succeed");
     assert!(harness.controller.traffic_channels_pool().is_empty());
     assert_eq!(
         *harness.setup_service_options.lock().unwrap(),
-        vec![None],
-        "RC2 setup must not add a service-option IE"
+        vec![Some(SERVICE_OPTION_QCELP13)]
     );
 
     send_qcelp_cam_commit(harness.client(), handle.walsh_code);
@@ -208,7 +212,7 @@ async fn abis_tcp_setup_then_release() {
     let lc = LongCodeGenerator::new_traffic_channel(0xBEEF);
     let handle = harness
         .client()
-        .allocate_rc1_traffic(lc, 0, 0xBEEF)
+        .allocate_rc1_traffic(lc, 0, 0xBEEF, None)
         .await
         .expect("allocation should succeed");
 
@@ -294,7 +298,12 @@ async fn abis_tcp_setup_and_udp_bearer_delivers_forward_fch() {
         .await
         .unwrap();
     let handle = client
-        .allocate_rc1_traffic(LongCodeGenerator::new_traffic_channel(0xCAFE), 0, 0xCAFE)
+        .allocate_rc1_traffic(
+            LongCodeGenerator::new_traffic_channel(0xCAFE),
+            0,
+            0xCAFE,
+            None,
+        )
         .await
         .expect("traffic allocation should return bearer handle");
 

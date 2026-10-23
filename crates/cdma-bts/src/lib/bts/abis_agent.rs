@@ -33,8 +33,6 @@ use super::traffic_lac::{TrafficArqConfig, TrafficChannelArqState, TrafficLacEve
 use crate::bts::AccessChannelEvent;
 use crate::lac::message_types::{MessageId, WireChannel};
 use crate::lac::paging_messages::{
-    CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
-    CHANNEL_DEFAULT_CONFIG_RC1_RC1, CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentGrantedMode,
     ChannelAssignmentMessage, ExtendedChannelAssignmentMessage, GeneralPageMessage, MsAddress,
     MsPageAddress,
 };
@@ -64,29 +62,17 @@ fn profile_from_sch_rate_index(index: u8) -> Option<Rc3FschProfile> {
     }
 }
 
-pub(super) fn cam_radio_config(cam: &ChannelAssignmentMessage) -> Result<(u8, u8), String> {
-    match (cam.assign_mode, cam.granted_mode) {
-        (CHANNEL_ASSIGN_MODE_TRAFFIC, _) => Ok((1, 1)),
-        (CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, Some(mode))
-            if mode == ChannelAssignmentGrantedMode::DefaultConfiguration as u8 =>
-        {
-            match cam.default_config {
-                Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1) => Ok((1, 1)),
-                Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2) => Ok((2, 2)),
-                other => Err(format!("unsupported CAM DEFAULT_CONFIG={other:?}")),
-            }
-        }
-        (CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, Some(mode))
-            if mode == ChannelAssignmentGrantedMode::RequestedService as u8
-                && cam.default_config == Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1) =>
-        {
-            Ok((2, 2))
-        }
-        _ => Err(format!(
-            "unsupported CAM ASSIGN_MODE=0b{:03b} GRANTED_MODE={:?}",
-            cam.assign_mode, cam.granted_mode
-        )),
-    }
+pub(super) fn cam_radio_config(
+    cam: &ChannelAssignmentMessage,
+    requested_service_option: Option<u16>,
+) -> Result<(u8, u8), String> {
+    cam.initial_radio_config(requested_service_option)
+        .ok_or_else(|| {
+            format!(
+                "unsupported CAM ASSIGN_MODE=0b{:03b} GRANTED_MODE={:?} DEFAULT_CONFIG={:?} SO={:?}",
+                cam.assign_mode, cam.granted_mode, cam.default_config, requested_service_option
+            )
+        })
 }
 
 /// Per-CCR session tracking on the BTS side.
@@ -107,6 +93,8 @@ struct Session {
     /// or `None` before supplemental allocation. Freed when the session is
     /// removed.
     sch_walsh_code: Option<u8>,
+    /// Service option from the BTS Setup Service Option element.
+    requested_service_option: Option<u16>,
 }
 
 /// Events emitted by the agent to BTS-internal consumers.
@@ -573,6 +561,7 @@ impl AbisAgent {
                             release: TrafficReleaseProcedure::new(ccr),
                             traffic_lac: None,
                             sch_walsh_code,
+                            requested_service_option: setup.service_option.map(|so| so.0),
                         },
                     );
                     responses.push(msg);
@@ -1023,7 +1012,12 @@ impl AbisAgent {
                         return true;
                     }
                 };
-                let (for_rc, rev_rc) = match cam_radio_config(&cam) {
+                let requested_service_option = self
+                    .sessions
+                    .values()
+                    .find(|s| s.walsh_code == cam.code_chan && !s.committed)
+                    .and_then(|s| s.requested_service_option);
+                let (for_rc, rev_rc) = match cam_radio_config(&cam, requested_service_option) {
                     Ok(pair) => pair,
                     Err(e) => {
                         warn!("abis_agent: {e}");
@@ -1313,7 +1307,8 @@ impl AbisAgent {
 mod tests {
     use super::*;
     use crate::lac::paging_messages::{
-        ChannelAssignmentMessage, ExtendedChannelAssignmentMessage, GeneralPageRecord,
+        CHANNEL_DEFAULT_CONFIG_RC2_RC2, ChannelAssignmentMessage, ExtendedChannelAssignmentMessage,
+        GeneralPageRecord,
     };
     use crate::receiver::access_layer3::{AccessMessageHeader, PageResponseMessage};
     use cdma_abis::control::typed::{
@@ -1336,16 +1331,16 @@ mod tests {
     #[test]
     fn cam_radio_config_distinguishes_legacy_rc1_and_requested_service_rc2() {
         let rc1 = ChannelAssignmentMessage::new_traffic_assignment(32, 0);
-        assert_eq!(cam_radio_config(&rc1), Ok((1, 1)));
+        assert_eq!(cam_radio_config(&rc1, None), Ok((1, 1)));
 
         let rc2 = ChannelAssignmentMessage::new_extended_traffic_assignment(
             33,
             0,
-            CHANNEL_DEFAULT_CONFIG_RC1_RC1,
+            CHANNEL_DEFAULT_CONFIG_RC2_RC2,
             crate::lac::paging_messages::ChannelAssignmentGrantedMode::RequestedService,
             false,
         );
-        assert_eq!(cam_radio_config(&rc2), Ok((2, 2)));
+        assert_eq!(cam_radio_config(&rc2, None), Ok((2, 2)));
     }
 
     fn minimal_access_event(imsi: &str, msg_seq: u8) -> AccessChannelEvent {

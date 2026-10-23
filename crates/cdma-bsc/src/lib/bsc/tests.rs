@@ -86,6 +86,7 @@ impl BtsControlClient for CapturingBtsClient {
         _lc_generator: cdma_common::phy::long_code::LongCodeGenerator,
         _initial_lc_chip: u64,
         _esn: u32,
+        _service_option: Option<u16>,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         None
     }
@@ -95,6 +96,7 @@ impl BtsControlClient for CapturingBtsClient {
         _lc_generator: cdma_common::phy::long_code::LongCodeGenerator,
         _initial_lc_chip: u64,
         _esn: u32,
+        _service_option: Option<u16>,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         None
     }
@@ -106,6 +108,7 @@ impl BtsControlClient for CapturingBtsClient {
         _fpc_subchan_gain: u8,
         _esn: u32,
         _include_sch: bool,
+        _service_option: Option<u16>,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         None
     }
@@ -150,9 +153,10 @@ impl BtsControlClient for CapturingNetworkBtsClient {
         lc_generator: cdma_common::phy::long_code::LongCodeGenerator,
         initial_lc_chip: u64,
         esn: u32,
+        service_option: Option<u16>,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         self.inner
-            .allocate_rc1_traffic(lc_generator, initial_lc_chip, esn)
+            .allocate_rc1_traffic(lc_generator, initial_lc_chip, esn, service_option)
             .await
     }
 
@@ -161,9 +165,10 @@ impl BtsControlClient for CapturingNetworkBtsClient {
         lc_generator: cdma_common::phy::long_code::LongCodeGenerator,
         initial_lc_chip: u64,
         esn: u32,
+        service_option: Option<u16>,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         self.inner
-            .allocate_rc2_traffic(lc_generator, initial_lc_chip, esn)
+            .allocate_rc2_traffic(lc_generator, initial_lc_chip, esn, service_option)
             .await
     }
 
@@ -174,6 +179,7 @@ impl BtsControlClient for CapturingNetworkBtsClient {
         fpc_subchan_gain: u8,
         esn: u32,
         include_sch: bool,
+        service_option: Option<u16>,
     ) -> Option<crate::abis_edge::BtsTrafficChannelHandle> {
         self.inner
             .allocate_rc3_traffic(
@@ -182,6 +188,7 @@ impl BtsControlClient for CapturingNetworkBtsClient {
                 fpc_subchan_gain,
                 esn,
                 include_sch,
+                service_option,
             )
             .await
     }
@@ -7444,7 +7451,7 @@ async fn qcelp13k_origination_assigns_rc2_traffic_channel() {
     let cam = lac::paging_messages::ChannelAssignmentMessage::from_sdu(&mut bits)
         .expect("CAM should decode");
     assert_eq!(cam.assign_mode, 0b100);
-    assert_eq!(cam.default_config, Some(0));
+    assert_eq!(cam.default_config, Some(0b001));
     assert_eq!(cam.granted_mode, Some(0b10));
     assert_eq!(cam.bypass_alert_answer, Some(false));
     assert!(!cam.freq_incl);

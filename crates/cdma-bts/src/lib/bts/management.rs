@@ -19,8 +19,7 @@ use cdma_common::lac::paging_messages::{
     CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC, CHANNEL_ASSIGN_MODE_TRAFFIC,
     CHANNEL_DEFAULT_CONFIG_EXPLICIT_RCS, CHANNEL_DEFAULT_CONFIG_RC1_RC1,
     CHANNEL_DEFAULT_CONFIG_RC1_RC2, CHANNEL_DEFAULT_CONFIG_RC2_RC1, CHANNEL_DEFAULT_CONFIG_RC2_RC2,
-    ChannelAssignmentGrantedMode, ChannelAssignmentMessage, GeneralPageRecord, MsAddress,
-    PagingChannelMessage,
+    GeneralPageRecord, MsAddress, PagingChannelMessage,
 };
 use cdma_common::mac::ChannelType;
 use cdma_common::overhead::OverheadParameters;
@@ -1007,32 +1006,6 @@ fn ms_address_to_proto(addr: &MsAddress) -> proto::PagingAddress {
     }
 }
 
-fn cam_effective_radio_config(cam: &ChannelAssignmentMessage) -> Option<(u8, u8)> {
-    const DEFAULT_CONFIGURATION: u8 = ChannelAssignmentGrantedMode::DefaultConfiguration as u8;
-    const REQUESTED_SERVICE: u8 = ChannelAssignmentGrantedMode::RequestedService as u8;
-    match (cam.assign_mode, cam.granted_mode, cam.default_config) {
-        (CHANNEL_ASSIGN_MODE_TRAFFIC, _, _) => Some((1, 1)),
-        (
-            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
-            Some(DEFAULT_CONFIGURATION),
-            Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
-        ) => Some((1, 1)),
-        (
-            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
-            Some(DEFAULT_CONFIGURATION),
-            Some(CHANNEL_DEFAULT_CONFIG_RC2_RC2),
-        ) => Some((2, 2)),
-        // The supported requested-service CAM is the P_REV 3 QCELP 13K
-        // assignment. DEFAULT_CONFIG remains the RC1 fallback.
-        (
-            CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC,
-            Some(REQUESTED_SERVICE),
-            Some(CHANNEL_DEFAULT_CONFIG_RC1_RC1),
-        ) => Some((2, 2)),
-        _ => None,
-    }
-}
-
 fn next_pch_event_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1235,7 +1208,7 @@ fn to_proto_paging_event(
             ))
         }
         PagingChannelMessage::ChannelAssignment(m) => {
-            let effective_rcs = cam_effective_radio_config(m);
+            let effective_rcs = m.initial_radio_config(None);
             let assign_mode_name = match m.assign_mode {
                 CHANNEL_ASSIGN_MODE_TRAFFIC => "IS-95 Traffic",
                 CHANNEL_ASSIGN_MODE_EXTENDED_TRAFFIC => "Extended Traffic (IS-2000)",

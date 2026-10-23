@@ -23,7 +23,7 @@ use cdma_abis::bearer_transport::BearerTransport;
 use cdma_abis::control::typed::{
     A3RemoveInformation, BurstCommitMessage, BurstRequestMessage, BurstResponseMessage,
     CdmaServingOneWayDelay, CellId, CellIdWithMscId, ForwardBurstRadioInfo, MobileIdentity,
-    PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate,
+    PhysicalChannelInfo, PhysicalChannelType, PilotGatingRate, ServiceOption,
 };
 use cdma_abis::control::{
     AbisMessage, AchMessageTransferMessage, BtsReleaseMessage, BtsSetupAckMessage, BtsSetupMessage,
@@ -832,6 +832,7 @@ impl NetworkBtsControlClient {
         ccr: CallConnectionReference,
         esn: u32,
         include_sch: bool,
+        service_option: Option<u16>,
     ) -> Option<SetupResult> {
         if include_sch {
             log::info!(
@@ -852,7 +853,7 @@ impl NetworkBtsControlClient {
                 otd: false,
                 physical_channels,
             }),
-            service_option: None,
+            service_option: service_option.map(ServiceOption),
             paca_timestamp: None,
             quality_of_service_parameters: None,
             connect_information: Vec::new(),
@@ -1215,13 +1216,14 @@ impl BtsControlClient for NetworkBtsControlClient {
         _lc_generator: LongCodeGenerator,
         _initial_lc_chip: u64,
         esn: u32,
+        service_option: Option<u16>,
     ) -> Option<BtsTrafficChannelHandle> {
         let ccr = {
             let mut guard = self.inner.lock().await;
             self.allocate_ccr(&mut guard)
         };
         // RC1 calls never carry F-SCH (Phase 1 is RC3-only).
-        let result = self.send_bts_setup(ccr, esn, false).await?;
+        let result = self.send_bts_setup(ccr, esn, false, service_option).await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
@@ -1246,6 +1248,7 @@ impl BtsControlClient for NetworkBtsControlClient {
         _lc_generator: LongCodeGenerator,
         _initial_lc_chip: u64,
         esn: u32,
+        service_option: Option<u16>,
     ) -> Option<BtsTrafficChannelHandle> {
         let ccr = {
             let mut guard = self.inner.lock().await;
@@ -1253,7 +1256,7 @@ impl BtsControlClient for NetworkBtsControlClient {
         };
         // RC2 (IS-95B Rate Set 2 — QCELP-13K) shares the RC1 PHY scaffolding
         // and carries no F-SCH.
-        let result = self.send_bts_setup(ccr, esn, false).await?;
+        let result = self.send_bts_setup(ccr, esn, false, service_option).await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
@@ -1280,12 +1283,15 @@ impl BtsControlClient for NetworkBtsControlClient {
         _fpc_subchan_gain: u8,
         esn: u32,
         include_sch: bool,
+        service_option: Option<u16>,
     ) -> Option<BtsTrafficChannelHandle> {
         let ccr = {
             let mut guard = self.inner.lock().await;
             self.allocate_ccr(&mut guard)
         };
-        let result = self.send_bts_setup(ccr, esn, include_sch).await?;
+        let result = self
+            .send_bts_setup(ccr, esn, include_sch, service_option)
+            .await?;
         {
             let mut guard = self.inner.lock().await;
             guard.walsh_to_ccr.insert(result.walsh_code, ccr);
