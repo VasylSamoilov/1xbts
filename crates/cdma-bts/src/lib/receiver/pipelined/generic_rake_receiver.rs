@@ -217,6 +217,8 @@ pub struct FingerProgress {
     pub saw_traffic_completed_event: bool,
     pub saw_traffic_phy_activity: bool,
     pub saw_access_preamble_activity: bool,
+    /// Keeps a finger out of idle pruning during a long preamble.
+    pub saw_preamble_energy: bool,
 }
 
 impl FingerProgress {
@@ -352,6 +354,7 @@ impl BaseFinger {
         }
 
         let keep_alive_activity = progress.saw_crc_valid
+            || progress.saw_preamble_energy
             || progress.saw_traffic_completed_event
             || progress.saw_traffic_phy_activity;
 
@@ -550,6 +553,9 @@ pub struct DefaultPrunePolicy {
 }
 
 const UNVALIDATED_FINGER_IDLE_CHIPS: u64 = 614_400;
+// The capsule continues past the message CRC.
+const ACCESS_RETIRE_SIGNAL_LOST_CHIPS: u64 = 6_144;
+const ACCESS_RETIRE_IDLE_CHIPS: u64 = 196_608;
 
 impl Default for DefaultPrunePolicy {
     fn default() -> Self {
@@ -639,6 +645,7 @@ struct ActiveFinger<F: RakeFinger> {
     last_report_process_ns: u64,
     last_report_process_calls: u64,
     notified_validated: bool,
+    decoded_access_message: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +822,7 @@ pub struct GenericRakeReceiver<C: Correlator> {
     recent_access_burst_order: VecDeque<AccessBurstKey>,
     finger_pool: Option<FingerFeedPool<C::Finger>>,
     finger_pool_size: usize,
+    retire_after_access_message: bool,
 }
 
 impl<C: Correlator> GenericRakeReceiver<C> {
@@ -838,7 +846,15 @@ impl<C: Correlator> GenericRakeReceiver<C> {
             recent_access_burst_order: VecDeque::new(),
             finger_pool: None,
             finger_pool_size: Self::DEFAULT_FINGER_POOL_SIZE,
+            retire_after_access_message: false,
         }
+    }
+
+    /// Retire a finger once the burst that produced a new CRC-valid access
+    /// message has ended. Each access probe is then acquired by its own finger.
+    pub fn with_retire_after_access_message(mut self, retire: bool) -> Self {
+        self.retire_after_access_message = retire;
+        self
     }
 
     /// Override the pruning policy.
@@ -927,6 +943,7 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                 last_report_process_ns: 0,
                 last_report_process_calls: 0,
                 notified_validated: false,
+                decoded_access_message: false,
             });
         }
     }
@@ -1143,18 +1160,38 @@ impl<C: Correlator> GenericRakeReceiver<C> {
     /// Fingers are retired according to the configured policy.  For bursty
     /// reverse-link traffic, even hard-validated fingers should eventually
     /// expire so later bursts can reacquire cleanly.
+    fn mark_decoded_access_messages(&mut self, blocks: &[SampleBlock]) {
+        for blk in blocks {
+            if blk.tags.get("access_crc_valid").copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let Some(&finger_id) = blk.tags.get("finger_id") else {
+                continue;
+            };
+            for af in &mut self.fingers {
+                if af.finger.id() as i64 == finger_id as i64 {
+                    af.decoded_access_message = true;
+                }
+            }
+        }
+    }
+
     fn prune_fingers(&mut self) {
         let before = self.fingers.len();
         let mut kept = Vec::with_capacity(self.fingers.len());
         let mut removed_ids = Vec::new();
 
         for af in self.fingers.drain(..) {
-            let should_drop =
-                af.finger.should_retire() || self.prune_policy.should_prune(&af.finger);
+            let burst_over = af.finger.signal_lost_chips() >= ACCESS_RETIRE_SIGNAL_LOST_CHIPS
+                || af.finger.idle_chips() >= ACCESS_RETIRE_IDLE_CHIPS;
+            let should_drop = (af.decoded_access_message && burst_over)
+                || af.finger.should_retire()
+                || self.prune_policy.should_prune(&af.finger);
             if should_drop {
                 info!(
-                    "GenericRakeReceiver: pruning finger {} (idle_blocks={}, idle_chips={}, validated={}, crc_misses={}, post_walsh_no_event_chips={}, post_walsh_no_event_ms={}, post_walsh_misses={}, signal_lost_chips={})",
+                    "GenericRakeReceiver: pruning finger {} (decoded_access_message={}, idle_blocks={}, idle_chips={}, validated={}, crc_misses={}, post_walsh_no_event_chips={}, post_walsh_no_event_ms={}, post_walsh_misses={}, signal_lost_chips={}) [{}]",
                     af.finger.id(),
+                    af.decoded_access_message,
                     af.finger.idle_blocks(),
                     af.finger.idle_chips(),
                     af.finger.is_hard_validated(),
@@ -1163,6 +1200,7 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                     af.finger.post_walsh_no_event_ms(),
                     af.finger.post_walsh_miss_count(),
                     af.finger.signal_lost_chips(),
+                    af.finger.describe(),
                 );
                 af.finger.print_timing();
                 for stage in &af.chain {
@@ -1202,8 +1240,8 @@ mod tests {
     use num_complex::Complex32;
 
     use super::{
-        BaseFinger, Correlator, FingerProgress, GenericRakeReceiver, PipelineProcessor,
-        PipelineProcessorShared, RakeFinger,
+        ACCESS_RETIRE_IDLE_CHIPS, BaseFinger, Correlator, FingerProgress, GenericRakeReceiver,
+        PipelineProcessor, PipelineProcessorShared, RakeFinger,
     };
     use crate::receiver::pipelined::SampleBlock;
 
@@ -1350,6 +1388,7 @@ mod tests {
     struct MockFinger {
         id: u64,
         outputs: VecDeque<Vec<SampleBlock>>,
+        idle_chips: u64,
     }
 
     impl MockFinger {
@@ -1357,6 +1396,7 @@ mod tests {
             Self {
                 id,
                 outputs: outputs.into(),
+                idle_chips: 0,
             }
         }
     }
@@ -1384,6 +1424,10 @@ mod tests {
 
         fn idle_blocks(&self) -> u64 {
             0
+        }
+
+        fn idle_chips(&self) -> u64 {
+            self.idle_chips
         }
     }
 
@@ -1488,6 +1532,58 @@ mod tests {
             .tags
             .insert("absolute_chip_start", absolute_chip_start);
         block
+    }
+
+    #[test]
+    fn retires_finger_once_its_decoded_burst_ends() {
+        let finger = MockFinger::new(
+            3,
+            vec![vec![access_event_block(3, 42_000, 0, &[1, 0, 1, 1])]],
+        );
+        let mut receiver = GenericRakeReceiver::new(MockCorrelator {
+            detections: vec![(finger, Vec::new())],
+            ..MockCorrelator::default()
+        })
+        .with_retire_after_access_message(true);
+
+        let out = receiver.process_block(SampleBlock::new(Vec::new(), 0));
+        assert_eq!(1, out.len());
+        assert_eq!(
+            1,
+            receiver.finger_count(),
+            "the capsule tail is still on air"
+        );
+
+        receiver.fingers[0].finger.idle_chips = ACCESS_RETIRE_IDLE_CHIPS;
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+        assert_eq!(0, receiver.finger_count());
+        assert_eq!(vec![3], receiver.correlator.removed_ids);
+    }
+
+    #[test]
+    fn previously_emitted_message_does_not_retire_finger() {
+        let first = MockFinger::new(
+            3,
+            vec![vec![access_event_block(3, 42_000, 0, &[1, 0, 1, 1])]],
+        );
+        let mut receiver = GenericRakeReceiver::new(MockCorrelator {
+            detections: vec![(first, Vec::new())],
+            ..MockCorrelator::default()
+        })
+        .with_retire_after_access_message(true);
+        receiver.process_block(SampleBlock::new(Vec::new(), 0));
+        receiver.fingers.clear();
+
+        let mut replayed = MockFinger::new(
+            7,
+            vec![vec![access_event_block(7, 42_000, 0, &[1, 0, 1, 1])]],
+        );
+        replayed.idle_chips = ACCESS_RETIRE_IDLE_CHIPS;
+        receiver.correlator.detections = vec![(replayed, Vec::new())];
+        let out = receiver.process_block(SampleBlock::new(Vec::new(), 0));
+
+        assert!(out.is_empty());
+        assert_eq!(1, receiver.finger_count());
     }
 
     #[test]
@@ -1731,6 +1827,9 @@ impl<C: Correlator> PipelineProcessor for GenericRakeReceiver<C> {
         let finger_out = self.feed_fingers(block);
         let finger_out = self.suppress_duplicate_access_events(finger_out);
         let finger_out = self.suppress_previously_emitted_access_events(finger_out);
+        if self.retire_after_access_message {
+            self.mark_decoded_access_messages(&finger_out);
+        }
         out.extend(finger_out);
         let fingers_ns = t1.elapsed().as_nanos() as u64;
 

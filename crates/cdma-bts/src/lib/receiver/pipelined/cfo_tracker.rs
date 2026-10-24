@@ -5,9 +5,16 @@
 //! Walsh-symbol pilot sums; RC3 traffic uses it for chip-rate carrier tracking
 //! before `Rc3BpskDespread` performs per-PCG pilot-coherent demodulation.
 
+use cdma_common::consts::SR1_CHIP_RATE_HZ;
 use num_complex::Complex32;
 
 const ACCESS_GAIN_STEADY: f32 = 0.08;
+
+/// The tracker works in radians per chip, so the conversion uses the chip
+/// rate, not the sample rate.
+fn rad_per_chip_to_hz(cfo_rad_per_chip: f32) -> f64 {
+    cfo_rad_per_chip as f64 * SR1_CHIP_RATE_HZ as f64 / std::f64::consts::TAU
+}
 
 /// ~1 Hz loop. Wider turns pilot phase noise into a carrier random walk.
 const RC3_GAIN_STEADY: f32 = 0.02;
@@ -177,15 +184,30 @@ impl CfoTracker {
 
                 self.total_updates += 1;
 
-                // Diagnostic: record residual in Hz.
-                let residual_hz = measured_cfo as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
-                let abs_res = residual_hz.abs();
-                self.diag_signed_sum += residual_hz;
-                self.diag_abs_sum += abs_res;
-                self.diag_sq_sum += residual_hz * residual_hz;
-                self.diag_max = self.diag_max.max(abs_res as f32);
-                self.diag_count += 1;
+                self.record_diag(measured_cfo);
             }
+        }
+        self.prev_pilot = Some(pilot_sum);
+    }
+
+    /// Observe a coherent pilot sum taken after [`CfoTracker::derotate_chips`].
+    /// Its phase advance is the residual left by the current correction, so
+    /// the correction moves against it. Reverse access feeds derotated
+    /// Walsh-symbol sums here.
+    pub fn observe_residual_pilot(&mut self, pilot_sum: Complex32, n_chips: usize) {
+        if n_chips == 0 || pilot_sum.norm_sqr() <= 1e-12 {
+            return;
+        }
+        if let Some(prev) = self.prev_pilot
+            && pilot_sum.norm_sqr().min(prev.norm_sqr()) > PILOT_QUALITY_GATE
+        {
+            let cross = pilot_sum * prev.conj();
+            let residual = cross.im.atan2(cross.re) / n_chips as f32;
+            let gain = self.gain();
+            self.cfo_rad_per_chip -= gain * residual;
+            self.total_updates += 1;
+
+            self.record_diag(residual);
         }
         self.prev_pilot = Some(pilot_sum);
     }
@@ -201,13 +223,7 @@ impl CfoTracker {
         self.cfo_rad_per_chip = (1.0 - gain) * self.cfo_rad_per_chip + gain * measured_cfo;
         self.total_updates += 1;
 
-        let residual_hz = measured_cfo as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
-        let abs_res = residual_hz.abs();
-        self.diag_signed_sum += residual_hz;
-        self.diag_abs_sum += abs_res;
-        self.diag_sq_sum += residual_hz * residual_hz;
-        self.diag_max = self.diag_max.max(abs_res as f32);
-        self.diag_count += 1;
+        self.record_diag(measured_cfo);
     }
 
     /// Observe an averaged cross-product of adjacent decision-directed RC1 Walsh
@@ -222,9 +238,8 @@ impl CfoTracker {
         let alias_period = 2.0 * std::f32::consts::PI / SYMBOL_CHIPS;
         let alias = ((self.cfo_rad_per_chip - principal) / alias_period).round();
         let measured_cfo = principal + alias * alias_period;
-        let innovation_hz =
-            (measured_cfo - self.cfo_rad_per_chip) * 1_228_800.0 / (2.0 * std::f32::consts::PI);
-        if !innovation_hz.is_finite() || innovation_hz.abs() > RC1_MAX_CFO_JUMP_HZ {
+        let innovation_hz = rad_per_chip_to_hz(measured_cfo - self.cfo_rad_per_chip);
+        if !innovation_hz.is_finite() || innovation_hz.abs() > f64::from(RC1_MAX_CFO_JUMP_HZ) {
             return false;
         }
 
@@ -232,14 +247,18 @@ impl CfoTracker {
         self.cfo_rad_per_chip = (1.0 - gain) * self.cfo_rad_per_chip + gain * measured_cfo;
         self.total_updates += 1;
 
-        let measured_hz = measured_cfo as f64 * 1_228_800.0 / (2.0 * std::f64::consts::PI);
-        let abs_hz = measured_hz.abs();
-        self.diag_signed_sum += measured_hz;
+        self.record_diag(measured_cfo);
+        true
+    }
+
+    fn record_diag(&mut self, cfo_rad_per_chip: f32) {
+        let hz = rad_per_chip_to_hz(cfo_rad_per_chip);
+        let abs_hz = hz.abs();
+        self.diag_signed_sum += hz;
         self.diag_abs_sum += abs_hz;
-        self.diag_sq_sum += measured_hz * measured_hz;
+        self.diag_sq_sum += hz * hz;
         self.diag_max = self.diag_max.max(abs_hz as f32);
         self.diag_count += 1;
-        true
     }
 
     /// Chip-rate CFO derotation. RC3 corrects with `e^{-j·cfo_phase}`, reverse
@@ -446,6 +465,32 @@ mod tests {
         assert!(
             (tracked_hz - 350.0).abs() < 0.1,
             "adjacent-PCG averaging should retain 350 Hz, got {tracked_hz} Hz"
+        );
+    }
+
+    #[test]
+    fn residual_loop_converges_to_the_correcting_cfo() {
+        const BLOCK_CHIPS: usize = 256;
+        let true_cfo = 150.0 * 2.0 * std::f32::consts::PI / 1_228_800.0;
+        let mut tracker = CfoTracker::new_reverse_access(-true_cfo);
+        let mut received_phase = 0.0f32;
+        for _ in 0..200 {
+            let mut chips: Vec<Complex32> = (0..BLOCK_CHIPS)
+                .map(|chip| {
+                    let phase = received_phase + true_cfo * chip as f32;
+                    Complex32::new(phase.cos(), phase.sin())
+                })
+                .collect();
+            received_phase += true_cfo * BLOCK_CHIPS as f32;
+            tracker.derotate_chips(&mut chips, 1);
+            tracker.observe_residual_pilot(chips.iter().copied().sum(), BLOCK_CHIPS);
+        }
+        let correction_error = (tracker.cfo_rad_per_chip() + true_cfo).abs();
+        assert!(
+            correction_error < 0.02 * true_cfo,
+            "correction must settle at -true_cfo, got {} for true {}",
+            tracker.cfo_rad_per_chip(),
+            true_cfo
         );
     }
 

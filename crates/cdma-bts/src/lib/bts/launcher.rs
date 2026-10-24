@@ -288,6 +288,13 @@ pub fn build_bts_launch_parts(
                 .first()
                 .copied()
                 .unwrap_or(0),
+            access_pam_sz: bts_config
+                .runtime
+                .downlink
+                .paging
+                .message_defaults
+                .access_parameters
+                .pam_sz,
             paging_channel_number: bts_config.runtime.downlink.paging.paging_channel_number,
             base_id: bts_config.overhead.base_id,
             pilot_pn: bts_config.pilot_offset as u16,

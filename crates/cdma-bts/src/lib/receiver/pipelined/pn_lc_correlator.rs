@@ -33,6 +33,7 @@ mod config;
 mod finger;
 mod interpolation;
 
+use config::DEFAULT_REPLAY_PREAMBLE_SYMBOLS;
 pub use config::PnLcConfig;
 pub use finger::PnLcFinger;
 
@@ -44,6 +45,7 @@ use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
 use crate::phy::coding::long_code::LongCodeGenerator;
+use crate::phy::walsh::WalshGenerator;
 use crate::receiver::pipelined::{
     PipelineProcessorShared, SampleBlock, build_fft_search_pn_samples_with_kind,
     build_oqpsk_pn_samples_with_kind,
@@ -51,6 +53,7 @@ use crate::receiver::pipelined::{
 
 use super::generic_rake_receiver::Correlator;
 
+use cdma_common::consts::{RC1_PN_CHIPS_PER_WALSH_CHIP, RC1_WALSH_CHIPS_PER_SYMBOL};
 use finger::{
     ADAPTIVE_FINGER_TIMING_LATE_SNR_THRESHOLD, ActiveFingerState, DEFAULT_REACQUIRE_CRC_MISS_COUNT,
     DEFAULT_REACQUIRE_IDLE_CHIPS, DEFAULT_REACQUIRE_SIGNAL_LOST_CHIPS,
@@ -58,6 +61,13 @@ use finger::{
     PLAIN_CFO_REFINE_MAX_DELTA_RAD_PER_CHIP, PendingCandidate, PnReferenceKind,
 };
 use interpolation::interp_complex_wrapped;
+
+const ACCESS_PN_CHIPS_PER_SYMBOL: usize = RC1_PN_CHIPS_PER_WALSH_CHIP * RC1_WALSH_CHIPS_PER_SYMBOL;
+// Strongest Walsh code energy over the mean of the other 63. Noise alone
+// exceeds 10 in about 0.3% of symbols.
+const BURST_SYMBOL_PEAK_RATIO_MIN: f32 = 10.0;
+const BURST_START_QUIET_SYMBOLS: usize = 4;
+const BURST_START_GUARD_SYMBOLS: usize = 2;
 
 // PnLcConfig → config.rs
 
@@ -513,6 +523,136 @@ impl PnLcCorrelator {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         offsets
+    }
+
+    /// Walsh-0 energy over mean off-code energy in a verified preamble window.
+    #[allow(clippy::too_many_arguments)]
+    fn timing_gate_score(
+        &self,
+        pn_reference: &[Complex32],
+        window: &[Complex32],
+        delay_samples: i32,
+        timing_mu: f32,
+        base_phase: usize,
+        lc_chip: usize,
+        cfo_rad_per_chip: f32,
+    ) -> f32 {
+        let n_chips = self.cfg.coherent_chips;
+        let despread = if timing_mu.abs() <= f32::EPSILON {
+            self.pn_despread_with_reference(
+                pn_reference,
+                window,
+                delay_samples,
+                base_phase,
+                n_chips,
+            )
+        } else {
+            self.pn_despread_with_reference_fractional(
+                pn_reference,
+                window,
+                delay_samples,
+                timing_mu,
+                base_phase,
+                n_chips,
+            )
+        };
+        let first = (ACCESS_PN_CHIPS_PER_SYMBOL - lc_chip % ACCESS_PN_CHIPS_PER_SYMBOL)
+            % ACCESS_PN_CHIPS_PER_SYMBOL;
+        let symbols = n_chips.saturating_sub(first) / ACCESS_PN_CHIPS_PER_SYMBOL;
+        if symbols == 0 {
+            return 0.0;
+        }
+        let lc_signs = self.i_lc_signs_from(lc_chip + first, symbols * ACCESS_PN_CHIPS_PER_SYMBOL);
+
+        let mut w0_energy = 0.0f32;
+        let mut off_code_energy = 0.0f32;
+        for symbol in 0..symbols {
+            let mut walsh_chips = [Complex32::new(0.0, 0.0); RC1_WALSH_CHIPS_PER_SYMBOL];
+            for (walsh_idx, walsh_chip) in walsh_chips.iter_mut().enumerate() {
+                for pn in 0..RC1_PN_CHIPS_PER_WALSH_CHIP {
+                    let rel = symbol * ACCESS_PN_CHIPS_PER_SYMBOL
+                        + walsh_idx * RC1_PN_CHIPS_PER_WALSH_CHIP
+                        + pn;
+                    let k = first + rel;
+                    let derotate = Complex32::from_polar(1.0, -cfo_rad_per_chip * k as f32);
+                    *walsh_chip += despread[k] * lc_signs[rel] * derotate;
+                }
+            }
+            WalshGenerator::fwht_fixed(&mut walsh_chips);
+            w0_energy += walsh_chips[0].norm_sqr();
+            off_code_energy += walsh_chips[1..].iter().map(|c| c.norm_sqr()).sum::<f32>();
+        }
+        let off_code_mean = off_code_energy / (RC1_WALSH_CHIPS_PER_SYMBOL - 1) as f32;
+        w0_energy / off_code_mean.max(1e-12)
+    }
+
+    /// First sample of the burst containing the verified hit. Uses the
+    /// strongest Walsh code so the scan also crosses message data.
+    fn burst_start_sample(
+        &self,
+        pn_reference: &[Complex32],
+        aligned_delay: i32,
+        verified_sample: usize,
+        verified_tx_chip: usize,
+        max_symbols: usize,
+    ) -> usize {
+        let os = self.cfg.oversample.max(1);
+        let sym = ACCESS_PN_CHIPS_PER_SYMBOL;
+        let pp = self.phase_period as i64;
+        let abs = self.absolute_origin_sample.unwrap_or(0) as i64;
+        let pn_base = abs - self.cfg.composite_filter_delay as i64 - aligned_delay as i64;
+        let history_end = self.recent_start_offset + self.recent_samples.len();
+
+        let first_tx = verified_tx_chip - verified_tx_chip % sym;
+        let sample_of = |tx: usize| -> Option<usize> {
+            let back = (verified_tx_chip - tx) * os;
+            verified_sample.checked_sub(back)
+        };
+        let Some(first_sample) = sample_of(first_tx) else {
+            return verified_sample;
+        };
+        let history_symbols = first_sample.saturating_sub(self.recent_start_offset) / (sym * os);
+        let symbols = max_symbols.min(history_symbols).min(first_tx / sym);
+        if symbols == 0 {
+            return first_sample;
+        }
+        let scan_tx = first_tx - symbols * sym;
+        let lc_signs = self.i_lc_signs_from(scan_tx, symbols * sym);
+
+        let mut earliest = first_sample;
+        let mut quiet = 0usize;
+        for n in 1..=symbols {
+            let tx = first_tx - n * sym;
+            let Some(s0) = sample_of(tx) else {
+                break;
+            };
+            if s0 < self.recent_start_offset || s0 + sym * os > history_end {
+                break;
+            }
+            let lc_base = tx - scan_tx;
+            let mut walsh_chips = [Complex32::new(0.0, 0.0); RC1_WALSH_CHIPS_PER_SYMBOL];
+            for c in 0..sym {
+                let s = s0 + c * os;
+                let sample = self.recent_samples[s - self.recent_start_offset];
+                let pn = pn_reference[(pn_base + s as i64).rem_euclid(pp) as usize];
+                walsh_chips[c / RC1_PN_CHIPS_PER_WALSH_CHIP] += sample * pn * lc_signs[lc_base + c];
+            }
+            WalshGenerator::fwht_fixed(&mut walsh_chips);
+            let energies = walsh_chips.map(|c| c.norm_sqr());
+            let total: f32 = energies.iter().sum();
+            let peak = energies.iter().copied().fold(0.0f32, f32::max);
+            let off_mean = (total - peak) / (RC1_WALSH_CHIPS_PER_SYMBOL - 1) as f32;
+            if peak >= BURST_SYMBOL_PEAK_RATIO_MIN * off_mean.max(1e-12) {
+                earliest = s0;
+                quiet = 0;
+            } else {
+                quiet += 1;
+                if quiet >= BURST_START_QUIET_SYMBOLS {
+                    break;
+                }
+            }
+        }
+        earliest
     }
 
     fn verification_references(
@@ -984,6 +1124,14 @@ impl PnLcCorrelator {
         })
     }
 
+    fn blocked_by_active_finger(&self, delay_samples: i32) -> bool {
+        self.cfg.active_finger_block_samples.is_some_and(|block| {
+            self.active_fingers
+                .iter()
+                .any(|f| (f.delay_samples - delay_samples).abs() <= block)
+        })
+    }
+
     fn active_finger_allows_reacquisition(&self, finger: &ActiveFingerState) -> bool {
         finger.idle_chips >= self.reacquire_idle_chips
             || finger.signal_lost_chips >= self.reacquire_signal_lost_chips
@@ -1090,6 +1238,13 @@ impl PnLcCorrelator {
 
         for mut cand in pending {
             let aligned_delay = cand.delay_samples;
+            if self.blocked_by_active_finger(aligned_delay) {
+                trace!(
+                    "PnLcCorrelator: dropping candidate id={} delay={} covered by an active finger",
+                    cand.id, aligned_delay
+                );
+                continue;
+            }
             if !self.can_reacquire_over_active(aligned_delay)
                 || self.has_overlapping_active_finger(aligned_delay)
             {
@@ -1319,8 +1474,41 @@ impl PnLcCorrelator {
                     .cfg
                     .replay_preamble_symbols
                     .saturating_mul(self.cfg.chip_block_size);
-                let desired_start =
-                    verify_chip_start.saturating_sub(replay_chips.saturating_mul(os));
+                let default_replay_chips = self
+                    .cfg
+                    .replay_preamble_symbols
+                    .min(DEFAULT_REPLAY_PREAMBLE_SYMBOLS)
+                    .saturating_mul(self.cfg.chip_block_size);
+                let default_start =
+                    verify_chip_start.saturating_sub(default_replay_chips.saturating_mul(os));
+                let desired_start = if self.cfg.replay_from_burst_start {
+                    let pn_reference: &[Complex32] =
+                        match cand.pn_reference_kind.unwrap_or(PnReferenceKind::Plain) {
+                            PnReferenceKind::Plain => &self.pn_fft_seq,
+                            PnReferenceKind::Oqpsk => &self.pn_despread_seq,
+                        };
+                    let burst_start = self.burst_start_sample(
+                        pn_reference,
+                        aligned_delay,
+                        verified_sample,
+                        verified_tx_chip,
+                        self.cfg.replay_preamble_symbols,
+                    );
+                    let guard = BURST_START_GUARD_SYMBOLS * ACCESS_PN_CHIPS_PER_SYMBOL * os;
+                    debug!(
+                        "PnLcCorrelator: burst start id={} delay={} backtrack_symbols={}",
+                        cand.id,
+                        aligned_delay,
+                        verified_sample.saturating_sub(burst_start)
+                            / (ACCESS_PN_CHIPS_PER_SYMBOL * os),
+                    );
+                    burst_start
+                        .saturating_sub(center_offset)
+                        .saturating_sub(guard)
+                        .min(default_start)
+                } else {
+                    verify_chip_start.saturating_sub(replay_chips.saturating_mul(os))
+                };
                 let aligned_history_start = align_up_to_residue(
                     self.recent_start_offset,
                     verify_chip_start % os.max(1),
@@ -1363,6 +1551,51 @@ impl PnLcCorrelator {
                     PnReferenceKind::Oqpsk => {
                         self.finger_timing_offsets(cand.timing_mu_samples, snr)
                     }
+                };
+                let timing_offsets = if self.cfg.finger_timing_gate
+                    && valid
+                    && timing_offsets.len() > 1
+                {
+                    let pn_reference: &[Complex32] = match finger_pn_kind {
+                        PnReferenceKind::Plain => &self.pn_fft_seq,
+                        PnReferenceKind::Oqpsk => &self.pn_despread_seq,
+                    };
+                    let lc_chip = (expected_chip as i64 + best_phase as i64).max(0) as usize;
+                    let step = self.cfg.finger_timing_step_samples.max(1e-3);
+                    let center = cand.timing_mu_samples;
+                    let scores: Vec<(f32, f32)> = [center - step, center, center + step]
+                        .into_iter()
+                        .map(|mu| {
+                            let score = self.timing_gate_score(
+                                pn_reference,
+                                window,
+                                verify_delay,
+                                mu,
+                                verify_base_phase,
+                                lc_chip,
+                                est_cfo,
+                            );
+                            (mu, score)
+                        })
+                        .collect();
+                    let (chosen_mu, _) = scores
+                        .iter()
+                        .copied()
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .expect("timing gate scores three hypotheses");
+                    debug!(
+                        "PnLcCorrelator: timing gate id={} delay={} snr={:.1}x early={:.2} prompt={:.2} late={:.2} chosen_mu={:+.3}",
+                        cand.id,
+                        aligned_delay,
+                        snr,
+                        scores[0].1,
+                        scores[1].1,
+                        scores[2].1,
+                        chosen_mu
+                    );
+                    vec![chosen_mu]
+                } else {
+                    timing_offsets
                 };
                 let timing_total = timing_offsets.len();
 
@@ -1876,6 +2109,14 @@ impl PnLcCorrelator {
             trace!(
                 "PnLcCorrelator: LC ratio gate failed: {:.2} < {:.2}",
                 lc_best_over_second, self.cfg.lc_best_over_second_min,
+            );
+            return Vec::new();
+        }
+
+        if self.blocked_by_active_finger(best_delay) {
+            trace!(
+                "PnLcCorrelator: delay={} covered by an active finger, skipping",
+                best_delay
             );
             return Vec::new();
         }
@@ -2868,6 +3109,27 @@ mod tests {
         });
 
         assert!(!correlator.has_overlapping_active_finger(654));
+    }
+
+    #[test]
+    fn active_finger_block_ignores_staleness() {
+        let cfg = PnLcConfig::default_4x().with_active_finger_block(16);
+        let lc = LongCodeGenerator::new_access_channel_with_state(0, 0, 0, 0, 1u64 << 41);
+        let mut correlator = PnLcCorrelator::new(cfg, lc, noop_chain_builder());
+        correlator.active_fingers.push(ActiveFingerState {
+            id: 1,
+            delay_samples: 654,
+            hard_validated: true,
+            idle_chips: correlator.reacquire_idle_chips,
+            signal_lost_chips: correlator.reacquire_signal_lost_chips,
+            crc_miss_count: correlator.reacquire_crc_miss_count,
+            post_walsh_no_event_ms: 0,
+        });
+
+        assert!(correlator.can_reacquire_over_active(660));
+        assert!(correlator.blocked_by_active_finger(670));
+        assert!(correlator.blocked_by_active_finger(638));
+        assert!(!correlator.blocked_by_active_finger(671));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use super::super::ShortCodeReferenceKind;
 use super::super::gardner_timing_recovery::GardnerTimingConfig;
 
+pub(super) const DEFAULT_REPLAY_PREAMBLE_SYMBOLS: usize = 16;
+
 /// Tuning parameters for [`PnLcCorrelator`].
 #[derive(Debug, Clone)]
 pub struct PnLcConfig {
@@ -30,6 +32,9 @@ pub struct PnLcConfig {
     /// Number of preamble Walsh symbols to replay ahead of the first verified
     /// PN+LC hit when seeding a new finger.
     pub replay_preamble_symbols: usize,
+
+    /// Start a new finger at its burst start, at most `replay_preamble_symbols` back.
+    pub replay_from_burst_start: bool,
 
     /// Number of sub-windows for noncoherent FFT accumulation.
     ///
@@ -127,6 +132,9 @@ pub struct PnLcConfig {
     /// One-sided sample threshold for active-finger delay overlap suppression.
     pub active_finger_delay_suppress_samples: i32,
 
+    /// No finger spawns within this many samples of an active one, even an idle one.
+    pub active_finger_block_samples: Option<i32>,
+
     /// Enable instrumentation-only early/prompt/late chip-timing measurement
     /// on every finger spawned by this correlator, once each finger crosses
     /// hard-validation. Pure measurement: never moves `despread_phase`, never
@@ -196,6 +204,10 @@ pub struct PnLcConfig {
     /// reverse-access SNR rule.
     pub finger_timing_symmetric: bool,
 
+    /// When true, score the prompt and both adjacent timing hypotheses on the
+    /// verified preamble window and spawn one finger at the best of them.
+    pub finger_timing_gate: bool,
+
     /// Emit every PN×LC-despread sub-sample in each chip interval instead of
     /// collapsing immediately to one prompt sample per chip.
     ///
@@ -231,7 +243,8 @@ impl PnLcConfig {
             lc_best_over_second_min: 1.3,
             preamble_coh_norm_min: 0.20,
             preamble_hits_required: 1,
-            replay_preamble_symbols: 16,
+            replay_preamble_symbols: DEFAULT_REPLAY_PREAMBLE_SYMBOLS,
+            replay_from_burst_start: false,
             noncoherent_segments: 1,
             // 4 chips worth of guard at 4× oversample
             peak_suppress_samples: 16,
@@ -253,6 +266,7 @@ impl PnLcConfig {
             retain_search_suppression_after_validation: false,
             suppress_active_finger_delay_overlap: false,
             active_finger_delay_suppress_samples: 0,
+            active_finger_block_samples: None,
             enable_epl_tracking: false,
             enable_epl_slew: false,
             epl_pilot: false,
@@ -266,6 +280,7 @@ impl PnLcConfig {
             finger_timing_half_samples: 0.0,
             finger_timing_step_samples: 0.25,
             finger_timing_symmetric: true,
+            finger_timing_gate: false,
             output_oversampled_chips: false,
             integrate_and_dump: false,
             gardner_timing: GardnerTimingConfig::disabled(),
@@ -298,6 +313,11 @@ impl PnLcConfig {
         self.finger_timing_half_samples = half_samples.max(0.0);
         self.finger_timing_step_samples = step_samples.max(1e-3);
         self.finger_timing_symmetric = false;
+        self
+    }
+
+    pub fn with_finger_timing_gate(mut self, enable: bool) -> Self {
+        self.finger_timing_gate = enable;
         self
     }
 
@@ -413,6 +433,17 @@ impl PnLcConfig {
     ) -> Self {
         self.suppress_active_finger_delay_overlap = enable;
         self.active_finger_delay_suppress_samples = suppress_samples.max(0);
+        self
+    }
+
+    pub fn with_replay_from_burst_start(mut self, max_symbols: usize) -> Self {
+        self.replay_preamble_symbols = max_symbols;
+        self.replay_from_burst_start = true;
+        self
+    }
+
+    pub fn with_active_finger_block(mut self, block_samples: i32) -> Self {
+        self.active_finger_block_samples = Some(block_samples.max(0));
         self
     }
 

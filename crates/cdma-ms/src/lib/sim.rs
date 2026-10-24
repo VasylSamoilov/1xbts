@@ -109,6 +109,7 @@ fn rx_settings(pilot_pn: u16) -> bts::RxSettings {
         capture_iq_wav: None,
         capture_seconds: None,
         access_channel_number: 0,
+        access_pam_sz: 0,
         paging_channel_number: 1,
         base_id: 1,
         pilot_pn,

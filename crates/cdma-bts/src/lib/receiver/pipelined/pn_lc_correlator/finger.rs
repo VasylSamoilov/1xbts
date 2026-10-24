@@ -26,6 +26,8 @@ pub(super) const DEFAULT_REACQUIRE_CRC_MISS_COUNT: u64 = 8;
 // two probe intervals before same-delay reacquisition keeps timing diversity
 // coverage while avoiding a large bank of stale unvalidated fingers.
 pub(super) const DEFAULT_REACQUIRE_IDLE_CHIPS: u64 = 196_608;
+// High enough that noise alone does not keep a finger alive.
+const ACCESS_PREAMBLE_COH_MIN: f32 = 0.25;
 pub(super) const MAX_PENDING_ATTEMPTS_WITHOUT_HIT: u32 = 10;
 pub(super) const MAX_PENDING_ATTEMPTS_WITH_HIT: u32 = 10;
 // Plain rectangular PN verification stays on the integer prompt, but a tiny
@@ -2328,6 +2330,7 @@ impl PnLcFinger {
         let buffered_chips = self.sample_buffer.len() / output_oversample;
         let first_abs_chip = self.lc_chip_counter.saturating_sub(buffered_chips);
         let mut all_samples = Vec::with_capacity(total_len);
+        let mut saw_preamble_energy = false;
 
         // Process in chip_block_size windows for CFO correction + pilot
         // estimation, but collect all corrected samples into one buffer.
@@ -2488,7 +2491,10 @@ impl PnLcFinger {
             if let Some(ref mut cfo) = self.access_cfo {
                 const ACCESS_CFO_COH_GATE: f32 = 0.12;
                 if pilot_coh_norm >= ACCESS_CFO_COH_GATE {
-                    cfo.observe_pilot(pilot, block_len_chips);
+                    cfo.observe_residual_pilot(pilot, block_len_chips);
+                }
+                if pilot_coh_norm >= ACCESS_PREAMBLE_COH_MIN {
+                    saw_preamble_energy = true;
                 }
             }
 
@@ -2612,7 +2618,10 @@ impl PnLcFinger {
         // can forward them to the real emitter.
         let mut emitter = crate::receiver::pipelined::VecEmitter::new();
         let mut chain_blocks = vec![blk];
-        let mut progress = FingerProgress::default();
+        let mut progress = FingerProgress {
+            saw_preamble_energy,
+            ..FingerProgress::default()
+        };
         for (si, proc) in chain.iter_mut().enumerate() {
             let t = std::time::Instant::now();
             let mut next = Vec::new();

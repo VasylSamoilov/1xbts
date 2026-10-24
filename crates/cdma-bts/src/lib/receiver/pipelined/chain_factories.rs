@@ -5,6 +5,9 @@ use crate::phy::coding::convolutional::{
 use crate::phy::coding::long_code::LongCodeGenerator;
 use crate::phy::walsh::WalshDecoder;
 use crate::receiver::hrpd::access::{ACCESS_PACKET_CHIPS, HRPD_DEFAULT_ACCESS_PREAMBLE_FRAMES};
+use cdma_common::consts::{
+    RC1_PN_CHIPS_PER_WALSH_CHIP, RC1_WALSH_CHIPS_PER_SYMBOL, SR1_CHIPS_PER_FRAME,
+};
 
 use super::gardner_timing_recovery::GardnerTimingConfig;
 use super::rake_access_searcher;
@@ -26,6 +29,8 @@ use super::{generic_rake_receiver, pn_lc_correlator};
 
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESSION: bool = true;
 const REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESS_SAMPLES: i32 = 0;
+const REVERSE_ACCESS_ACTIVE_FINGER_BLOCK_SAMPLES: i32 = 16;
+const REVERSE_ACCESS_MAX_SEARCH_INTERVAL_WINDOWS: u64 = 32;
 const RC1_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.15;
 const RC3_TRAFFIC_PREAMBLE_COH_NORM_MIN: f32 = 0.20;
 /// Reverse-access finger budget, fixed to the value the access capture
@@ -216,15 +221,34 @@ pub fn access_channel_chain() -> Vec<PipelineProcessorShared> {
 /// Uses the `PnLcCorrelator + GenericRakeReceiver` frontend and the chip-rate
 /// preamble/Walsh/frame alignment chain (4x oversampled).
 pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProcessorShared> {
+    let config = pn_lc_correlator::PnLcConfig::default_4x();
+    // An access preamble is (1 + PAM_SZ) frames. The search runs often enough
+    // that one full coherent window always falls inside it. Message data does
+    // not correlate over a coherent window, so a missed preamble is a missed
+    // probe.
+    let frame_chips = SR1_CHIPS_PER_FRAME as usize;
+    let preamble_chips = (1 + settings.pam_sz as usize) * frame_chips;
+    let search_interval_windows = ((preamble_chips - config.coherent_chips) / config.coherent_chips)
+        .clamp(1, REVERSE_ACCESS_MAX_SEARCH_INTERVAL_WINDOWS as usize)
+        as u64;
+    // The burst-start scan reaches back one search interval plus a whole
+    // preamble frame. ReverseAccessDecoder needs a full W0 frame before it
+    // starts frame search.
+    let replay_chips = search_interval_windows as usize * config.coherent_chips + frame_chips;
+    let replay_symbols =
+        replay_chips.div_ceil(RC1_PN_CHIPS_PER_WALSH_CHIP * RC1_WALSH_CHIPS_PER_SYMBOL);
     let correlator = pn_lc_correlator::PnLcCorrelator::new(
-        pn_lc_correlator::PnLcConfig::default_4x()
+        config
+            .with_search_interval_windows(search_interval_windows)
+            .with_replay_from_burst_start(replay_symbols)
             .with_snr_threshold(20.0)
             .with_lc_half_span(4)
-            .with_search_interval_windows(32)
             .with_split_pn_reference(true)
             .with_reanchor_origin(settings.reanchor_origin)
             .with_fractional_timing_recovery(false)
             .with_finger_timing_adaptive_search(0.5, 0.5)
+            .with_finger_timing_gate(true)
+            .with_active_finger_block(REVERSE_ACCESS_ACTIVE_FINGER_BLOCK_SAMPLES)
             .with_active_finger_delay_suppression(
                 REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESSION,
                 REVERSE_ACCESS_ACTIVE_FINGER_DELAY_SUPPRESS_SAMPLES,
@@ -254,6 +278,7 @@ pub fn reverse_access_chain(settings: ReverseAccessSettings) -> Vec<PipelineProc
         Box::new(
             generic_rake_receiver::GenericRakeReceiver::new(correlator)
                 .with_max_fingers(REVERSE_ACCESS_MAX_FINGERS)
+                .with_retire_after_access_message(true)
                 .with_finger_pool_size(settings.finger_pool_size),
         ),
     ]

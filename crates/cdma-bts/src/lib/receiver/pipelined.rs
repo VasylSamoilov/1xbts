@@ -264,6 +264,10 @@ pub struct ReverseAccessSettings {
     pub reanchor_origin: bool,
     /// Thread pool size for parallel finger feeding.  Default 8.
     pub finger_pool_size: usize,
+    /// PAM_SZ broadcast in the Access Parameters Message. The access search
+    /// runs often enough to land inside a (1 + PAM_SZ)-frame preamble, so a
+    /// value larger than the broadcast one misses short-preamble probes.
+    pub pam_sz: u8,
 }
 
 impl Default for ReverseAccessSettings {
@@ -279,6 +283,7 @@ impl Default for ReverseAccessSettings {
             fixed_finger_phase: None,
             reanchor_origin: false,
             finger_pool_size: 8,
+            pam_sz: 0,
         }
     }
 }
@@ -1535,6 +1540,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1791617173891930.wav",
             1791617173891930,
+            15,
             "uplink_access_probe_full_chain",
         ) else {
             return;
@@ -1564,9 +1570,14 @@ mod tests {
         max_batch_wall_ms: f64,
     }
 
+    /// The recording's preamble length is not known, so the access search
+    /// assumes the shortest one.
+    const UNKNOWN_PAM_SZ: u8 = 0;
+
     fn run_uplink_access_probe_full_chain_capture(
         wav_name: &str,
         chip_start: u64,
+        pam_sz: u8,
         label: &str,
     ) -> Option<UplinkAccessProbeCaptureStats> {
         let wav_path = test_capture_path(wav_name);
@@ -1612,6 +1623,7 @@ mod tests {
             fixed_finger_phase: None,
             reanchor_origin: false,
             finger_pool_size: 1,
+            pam_sz,
         };
         let pipeline = super::reverse_access_chain(settings);
 
@@ -2919,6 +2931,7 @@ mod tests {
         let Some(default_stats) = run_uplink_access_probe_full_chain_capture(
             "1791707212196254.wav",
             1791707212196254,
+            15,
             "wav_3_default",
         ) else {
             return;
@@ -2944,6 +2957,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1792124445932252.wav",
             1792124445932252,
+            15,
             "wav_access_bursts_decode_nonzero",
         ) else {
             return;
@@ -2968,6 +2982,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1792233789071851.wav",
             1792233789071851,
+            15,
             "wav_1792233789071851",
         ) else {
             return;
@@ -2988,6 +3003,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1792576442605628.wav",
             1792576442605628,
+            5,
             "wav_1792576442605628_repeated_probe_bursts",
         ) else {
             return;
@@ -3008,6 +3024,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1793040844076000.wav",
             1793040844076000,
+            1,
             "wav_1793040844076000_short_preamble",
         ) else {
             return;
@@ -3036,6 +3053,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1793678826011477.wav",
             1793678826011477,
+            UNKNOWN_PAM_SZ,
             "wav_1793678826011477",
         ) else {
             return;
@@ -3058,6 +3076,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1794057106107467.wav",
             1794057106107467,
+            UNKNOWN_PAM_SZ,
             "wav_1794057106107467_low_snr",
         ) else {
             return;
@@ -3075,6 +3094,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1793041280153327.wav",
             1793041280153327,
+            UNKNOWN_PAM_SZ,
             "wav_1793041280153327_short_preamble",
         ) else {
             return;
@@ -3095,6 +3115,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1792631693292558.wav",
             1792631693292558,
+            5,
             "wav_1792631693292558_none_decoded2",
         ) else {
             return;
@@ -3118,6 +3139,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1793200139566170.wav",
             1793200139566170,
+            10,
             "optimize_perf",
         ) else {
             return;
@@ -3143,6 +3165,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1793062609071211.wav",
             1793062609071211,
+            10,
             "probe_ran_9",
         ) else {
             return;
@@ -3163,6 +3186,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1793161835652125.wav",
             1793161835652125,
+            10,
             "v60s_decode",
         ) else {
             return;
@@ -3185,6 +3209,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1795077999123595.wav",
             1795077999123595,
+            10,
             "v60s_decode_fail",
         ) else {
             return;
@@ -3207,6 +3232,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1795081057573573.wav",
             1795081057573573,
+            10,
             "v60s_decode_fail_bad",
         ) else {
             return;
@@ -3229,6 +3255,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1794579769922112.wav",
             1794579769922112,
+            10,
             "v60s_slow_decode",
         ) else {
             return;
@@ -3249,6 +3276,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1794630927745164.wav",
             1794630927745164,
+            10,
             "v60s_1794630927745164",
         ) else {
             return;
@@ -3269,6 +3297,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1791587434867463.wav",
             1791587434867463,
+            15,
             "uplink_access_probe_full_chain_previous_capture",
         ) else {
             return;
@@ -6013,6 +6042,7 @@ mod tests {
         let Some(stats) = run_uplink_access_probe_full_chain_capture(
             "1794968212722404.wav",
             1794968212722404,
+            10,
             "cfo_regression_access",
         ) else {
             return;

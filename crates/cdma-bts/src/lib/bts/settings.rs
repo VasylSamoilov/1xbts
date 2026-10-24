@@ -623,6 +623,8 @@ pub struct RxSettings {
     pub capture_iq_wav: Option<PathBuf>,
     pub capture_seconds: Option<f64>,
     pub access_channel_number: u8,
+    /// PAM_SZ broadcast in the Access Parameters Message.
+    pub access_pam_sz: u8,
     pub paging_channel_number: u8,
     pub base_id: u16,
     pub pilot_pn: u16,

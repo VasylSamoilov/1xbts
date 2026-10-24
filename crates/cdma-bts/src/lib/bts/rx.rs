@@ -1720,6 +1720,7 @@ pub(super) fn open_rx_runtime(rx: RxSettings) -> Result<RxRuntime, Error> {
             fixed_finger_phase: None,
             reanchor_origin: rx.reanchor_origin,
             finger_pool_size: rx.reverse_access_finger_pool_size,
+            pam_sz: rx.access_pam_sz,
         });
         let timings = processors
             .iter()
