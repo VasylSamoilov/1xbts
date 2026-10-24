@@ -61,6 +61,23 @@ impl VoiceGatewayService {
         })
     }
 
+    pub fn try_new_with_codec_factory(
+        config: VoiceGatewayConfig,
+        factory: Arc<dyn crate::codec::SpeechCodecFactory>,
+    ) -> Result<Self, SipBackendError> {
+        let logging = config.logging.clone();
+        let media_stream_capacity = config.queues.media_stream_frames;
+        Ok(Self {
+            sip_backend: Arc::new(LibreSipBackend::new_with_codec_factory(config, factory)?),
+            logging,
+            media_stream_capacity,
+        })
+    }
+
+    pub async fn shutdown(&self) -> Result<(), SipBackendError> {
+        self.sip_backend.shutdown().await
+    }
+
     pub fn with_logging(mut self, logging: LoggingConfig) -> Self {
         self.logging = logging;
         self
@@ -77,6 +94,21 @@ impl Default for VoiceGatewayService {
 impl VoiceGateway for VoiceGatewayService {
     type ControlStream = ControlResponseStream;
     type MediaStream = MediaResponseStream;
+
+    async fn get_media_stats(
+        &self,
+        request: Request<crate::proto::MediaStatsRequest>,
+    ) -> Result<Response<crate::proto::MediaStatsResponse>, Status> {
+        let requested = request.into_inner().session_ids;
+        let sessions = self
+            .sip_backend
+            .media_stats()
+            .into_iter()
+            .filter(|stats| requested.is_empty() || requested.contains(&stats.session_id))
+            .map(media_stats_message)
+            .collect();
+        Ok(Response::new(crate::proto::MediaStatsResponse { sessions }))
+    }
 
     async fn control(
         &self,
@@ -220,7 +252,29 @@ async fn handle_control_event(
     match event.event {
         Some(MscEvent::StartOutboundCall(start)) => {
             let session_id = start.session_id.clone();
-            let service_option = match start_service_option_to_u16(start.service_option) {
+            let air_codec = match crate::proto::AirCodec::try_from(start.air_codec) {
+                Ok(codec) => codec,
+                Err(_) => {
+                    send_gateway_failed(
+                        outbound_tx,
+                        session_id,
+                        SipBackendError::Codec(crate::codec::CodecError::Unsupported(
+                            start.air_codec,
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let service_option = match if matches!(
+                air_codec,
+                crate::proto::AirCodec::IdenVselp8k | crate::proto::AirCodec::IdenVselp4k2
+            ) && start.service_option == 0
+            {
+                Ok(0)
+            } else {
+                start_service_option_to_u16(start.service_option)
+            } {
                 Ok(service_option) => service_option,
                 Err(err) => {
                     send_gateway_failed(outbound_tx, session_id, err).await;
@@ -232,6 +286,7 @@ async fn handle_control_event(
                 called_number: start.called_number,
                 caller_number: start.caller_number,
                 service_option,
+                air_codec,
             };
 
             if let Err(err) = sip_backend.start_outbound_call(call, sip_event_tx).await {
@@ -338,6 +393,7 @@ fn describe_gateway_event(event: &SipBackendEvent) -> String {
             session_id,
             sip_status,
             codec,
+            ..
         } => format!("Answered session={session_id} sip_status={sip_status} codec={codec}"),
         SipBackendEvent::Failed {
             session_id,
@@ -353,6 +409,7 @@ fn describe_gateway_event(event: &SipBackendEvent) -> String {
             caller_number,
             caller_display,
             offered_codecs,
+            ..
         } => format!(
             "InboundInvite session={session_id} called={called_number} from=\"{caller_display}\" <{caller_number}> codecs={offered_codecs:?}"
         ),
@@ -388,10 +445,12 @@ fn sip_backend_event_to_gateway_event(event: SipBackendEvent) -> GatewayToMscEve
             session_id,
             sip_status,
             codec,
+            telephone_event_payload_type,
         } => GatewayEvent::Answered(GatewayAnswered {
             session_id,
             sip_status: u32::from(sip_status),
             codec,
+            telephone_event_payload_type: telephone_event_payload_type.map(u32::from),
         }),
         SipBackendEvent::Failed {
             session_id,
@@ -415,12 +474,14 @@ fn sip_backend_event_to_gateway_event(event: SipBackendEvent) -> GatewayToMscEve
             caller_number,
             caller_display,
             offered_codecs,
+            telephone_event_payload_type,
         } => GatewayEvent::InboundCall(crate::proto::GatewayInboundCall {
             session_id,
             called_number,
             caller_number,
             caller_display,
             offered_codecs,
+            telephone_event_payload_type: telephone_event_payload_type.map(u32::from),
         }),
         SipBackendEvent::InboundCancel { session_id } => {
             GatewayEvent::InboundCancel(crate::proto::GatewayInboundCancel { session_id })
@@ -467,6 +528,33 @@ pub async fn run_grpc_server(
         .add_service(VoiceGatewayServer::new(service))
         .serve(addr)
         .await
+}
+
+fn media_stats_message(stats: crate::media::RtpMediaStats) -> crate::proto::MediaStats {
+    crate::proto::MediaStats {
+        session_id: stats.session_id,
+        local_address: stats
+            .local_addr
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+        remote_address: stats
+            .remote_addr
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+        codec: format!("{:?}", stats.codec),
+        duration_ms: u64::try_from(stats.duration_ms).unwrap_or(u64::MAX),
+        idle_ms: u64::try_from(stats.idle_ms).unwrap_or(u64::MAX),
+        rtp_tx_packets: stats.rtp_tx_packets,
+        rtp_rx_packets: stats.rtp_rx_packets,
+        rtp_rx_dropped_packets: stats.rtp_rx_dropped_packets,
+        rtp_late_or_duplicate_packets: stats.rtp_late_or_duplicate_packets,
+        rtp_missing_packets: stats.rtp_missing_packets,
+        gateway_voice_frames: stats.gateway_voice_frames,
+        gateway_silence_frames: stats.gateway_silence_frames,
+        decode_failures: stats.evrc_decode_failures,
+        erasure_frames: stats.erasure_frames,
+        rtp_tx_silence_packets: stats.rtp_tx_silence_packets,
+    }
 }
 
 #[cfg(test)]
@@ -525,11 +613,64 @@ mod tests {
     }
 
     #[test]
+    fn media_stats_preserve_counters_addresses_and_durations() {
+        let stats = media_stats_message(crate::media::RtpMediaStats {
+            session_id: "stats-a".into(),
+            local_addr: Some("127.0.0.1:16000".parse().unwrap()),
+            remote_addr: Some("127.0.0.1:17000".parse().unwrap()),
+            codec: crate::media::G711Codec::Pcmu,
+            voice_codec: None,
+            duration_ms: 1234,
+            idle_ms: 56,
+            rtp_tx_packets: 10,
+            rtp_tx_silence_packets: 2,
+            rtp_rx_packets: 20,
+            rtp_rx_dropped_packets: 3,
+            rtp_late_or_duplicate_packets: 4,
+            rtp_missing_packets: 5,
+            gateway_voice_frames: 6,
+            gateway_silence_frames: 7,
+            evrc_decode_failures: 8,
+            erasure_frames: 9,
+        });
+        assert_eq!(stats.session_id, "stats-a");
+        assert_eq!(stats.local_address, "127.0.0.1:16000");
+        assert_eq!(stats.remote_address, "127.0.0.1:17000");
+        assert_eq!((stats.duration_ms, stats.idle_ms), (1234, 56));
+        assert_eq!(
+            (
+                stats.rtp_tx_packets,
+                stats.rtp_rx_packets,
+                stats.rtp_tx_silence_packets
+            ),
+            (10, 20, 2)
+        );
+        assert_eq!(
+            (
+                stats.rtp_rx_dropped_packets,
+                stats.rtp_late_or_duplicate_packets,
+                stats.rtp_missing_packets
+            ),
+            (3, 4, 5)
+        );
+        assert_eq!(
+            (
+                stats.gateway_voice_frames,
+                stats.gateway_silence_frames,
+                stats.decode_failures,
+                stats.erasure_frames
+            ),
+            (6, 7, 8, 9)
+        );
+    }
+
+    #[test]
     fn maps_sip_answer_event_to_gateway_event() {
         let event = sip_backend_event_to_gateway_event(SipBackendEvent::Answered {
             session_id: "session-1".to_string(),
             sip_status: 200,
             codec: "PCMU".to_string(),
+            telephone_event_payload_type: None,
         });
 
         assert!(matches!(
@@ -556,6 +697,7 @@ mod tests {
                         called_number: "18005550199".to_string(),
                         caller_number: "15551230000".to_string(),
                         service_option: 68,
+                        air_codec: 0,
                     },
                 )),
             },
@@ -576,6 +718,7 @@ mod tests {
                 called_number: "18005550199".to_string(),
                 caller_number: "15551230000".to_string(),
                 service_option: 68,
+                air_codec: crate::proto::AirCodec::Unspecified,
             }]
         );
         assert!(outbound_rx.try_recv().is_err());
@@ -599,6 +742,7 @@ mod tests {
                         called_number: "18005550199".to_string(),
                         caller_number: "15551230000".to_string(),
                         service_option: 3,
+                        air_codec: 0,
                     },
                 )),
             },

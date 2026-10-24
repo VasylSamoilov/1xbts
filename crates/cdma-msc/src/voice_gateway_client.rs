@@ -404,6 +404,7 @@ async fn send_command(
                         called_number,
                         caller_number,
                         service_option: u32::from(service_option),
+                        ..Default::default()
                     },
                 )),
             })
@@ -434,6 +435,7 @@ async fn send_command(
             rate_bps,
             sequence,
             service_option: u32::from(service_option),
+            ..Default::default()
         }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Ok(()),
@@ -631,6 +633,7 @@ mod tests {
                 rate: proto::VoiceFrameRate::Full as i32,
                 sequence: 3,
                 service_option: u32::from(cdma_voice::SERVICE_OPTION_QCELP_13K),
+                ..Default::default()
             },
             &handles,
         )

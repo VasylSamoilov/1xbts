@@ -88,6 +88,8 @@ struct cdma_libre_registration {
 	struct cdma_libre_sipreg_ctx *ctx;
 };
 
+int cdma_libre_sip_options_listen(struct sip_lsnr **listener, struct sip *sip);
+void cdma_libre_sip_options_deref(struct sip_lsnr *listener);
 int cdma_libre_sip_alloc(struct sip **sipp, const char *software,
 			 struct cdma_libre_sip_ctx *ctx);
 int cdma_libre_sip_transp_add(struct sip *sip, enum sip_transp tp,
@@ -177,6 +179,8 @@ int cdma_libre_sip_msg_from_user(const struct sip_msg *msg, char *out,
 				 size_t out_len);
 int cdma_libre_sip_msg_from_display(const struct sip_msg *msg, char *out,
 				    size_t out_len);
+int cdma_libre_sip_msg_transaction(const struct sip_msg *msg, char *out,
+                                  size_t out_len);
 int cdma_libre_sip_msg_body(const struct sip_msg *msg, uint8_t *out,
 			    size_t out_len);
 

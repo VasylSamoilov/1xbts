@@ -3,6 +3,7 @@ package voice_gateway.v1;
 
 // Voice gateway service connecting MSC call control to SIP/RTP media handling.
 service VoiceGateway {
+  rpc GetMediaStats(MediaStatsRequest) returns (MediaStatsResponse);
   // Bidirectional control stream for call setup, answer, failure, and release events.
   rpc Control(stream MscToGatewayEvent) returns (stream GatewayToMscEvent);
   // Bidirectional media stream carrying air-interface voice frames and gateway frames.
@@ -20,6 +21,14 @@ enum ReleaseReason {
   RELEASE_REASON_MEDIA_ERROR = 6;
   RELEASE_REASON_MSC_TEARDOWN = 7;
   RELEASE_REASON_SETUP_FAILED = 8;
+}
+
+enum AirCodec {
+  AIR_CODEC_UNSPECIFIED = 0;
+  AIR_CODEC_CDMA = 1;
+  AIR_CODEC_IDEN_VSELP_8K = 2;
+  // Three native 126-bit frames per 90 ms unit, with each field least-significant-bit first.
+  AIR_CODEC_IDEN_VSELP_4K2 = 3;
 }
 
 // CDMA voice frame rate carried by gateway-to-MSC media frames.
@@ -89,9 +98,10 @@ message StartOutboundCall {
   string called_number = 2;
   // Caller ID digits presented to the called party.
   string caller_number = 3;
-  // CDMA voice service option for the mobile leg. Supported values are
-  // SO3 EVRC-A, SO68 EVRC-B, and SO70 EVRC-WB.
+  // CDMA service option. Zero selects EVRC-A when air_codec is unspecified.
   uint32 service_option = 4;
+  // Unspecified preserves CDMA service-option selection.
+  AirCodec air_codec = 5;
 }
 
 // Requests release of an active gateway call.
@@ -135,6 +145,7 @@ message GatewayInboundCall {
   string caller_display = 4;
   // Codecs offered in the SDP. The MSC echoes one of these in InboundCallAnswer.
   repeated string offered_codecs = 5;
+  optional uint32 telephone_event_payload_type = 6;
 }
 
 // SIP 180/183 provisional. `codec` is set when the provisional carried SDP.
@@ -151,6 +162,7 @@ message GatewayAnswered {
   // Normally 200. Zero means unavailable.
   uint32 sip_status = 2;
   string codec = 3;
+  optional uint32 telephone_event_payload_type = 4;
 }
 
 // Gateway-side call setup or media failure.
@@ -175,24 +187,58 @@ message GatewayReleased {
 message AirVoiceFrame {
   // MSC call/session identifier.
   string session_id = 1;
-  // EVRC-family primary traffic bits from the MS. One byte per bit, value 0 or 1.
-  // No full-rate MuxPDU MM header bit is included.
+  // Codec-specific bits, one byte per bit with values 0 or 1.
+  // CDMA excludes the full-rate MuxPDU MM header bit.
   bytes bits = 2;
   uint32 num_bits = 3;
   uint32 rate_bps = 4;
   uint64 sequence = 5;
   uint32 service_option = 6;
+  AirCodec air_codec = 7;
+  // PCM duration at 8 kHz. Zero preserves the CDMA 160-sample default.
+  uint32 samples = 8;
 }
 
 // Voice frame produced by the gateway for transmission to the mobile.
 message GatewayVoiceFrame {
   // MSC call/session identifier.
   string session_id = 1;
-  // EVRC-family primary traffic bits to send to the MS. One byte per bit, value 0 or 1.
-  // The BSC adds any required MuxPDU header before queueing the traffic frame.
+  // Codec-specific bits, one byte per bit with values 0 or 1.
+  // CDMA excludes the MuxPDU header.
   bytes bits = 2;
   uint32 num_bits = 3;
   VoiceFrameRate rate = 4;
   uint64 sequence = 5;
   uint32 service_option = 6;
+  AirCodec air_codec = 7;
+  // PCM duration at 8 kHz. Zero preserves the CDMA 160-sample default.
+  uint32 samples = 8;
+  uint32 rate_bps = 9;
+}
+
+message MediaStatsRequest {
+  repeated string session_ids = 1;
+}
+
+message MediaStatsResponse {
+  repeated MediaStats sessions = 1;
+}
+
+message MediaStats {
+  string session_id = 1;
+  string local_address = 2;
+  string remote_address = 3;
+  string codec = 4;
+  uint64 duration_ms = 5;
+  uint64 idle_ms = 6;
+  uint64 rtp_tx_packets = 7;
+  uint64 rtp_rx_packets = 8;
+  uint64 rtp_rx_dropped_packets = 9;
+  uint64 rtp_late_or_duplicate_packets = 10;
+  uint64 rtp_missing_packets = 11;
+  uint64 gateway_voice_frames = 12;
+  uint64 gateway_silence_frames = 13;
+  uint64 decode_failures = 14;
+  uint64 erasure_frames = 15;
+  uint64 rtp_tx_silence_packets = 16;
 }

@@ -5,6 +5,9 @@ use crate::error::{Error, Result, native_status};
 
 static LIBRE_REFCOUNT: Mutex<usize> = Mutex::new(0);
 
+// Matches libre's RE_THREAD_WORKERS. Each cross-thread SIP call queues a wake job on this pool.
+const ASYNC_WORKERS: u16 = 4;
+
 #[derive(Debug)]
 pub struct Library {
     _private: (),
@@ -66,20 +69,31 @@ impl EventLoop {
             .name("libre-main".to_string())
             .spawn(move || {
                 let library = match Library::init() {
-                    Ok(library) => {
-                        let _ = ready_tx.send(Ok(()));
-                        library
-                    }
+                    Ok(library) => library,
                     Err(err) => {
                         let _ = ready_tx.send(Err(err));
                         return Ok(());
                     }
                 };
 
+                // Async notifications wake polling after cross-thread timer changes and cancellation.
+                // SAFETY: this thread owns the initialized RE context and async worker lifetime.
+                let async_status = unsafe { libre_sys::re_thread_async_init(ASYNC_WORKERS) };
+                if let Err(error) = native_status("re_thread_async_init", async_status) {
+                    let _ = ready_tx.send(Err(error));
+                    return Ok(());
+                }
+                if ready_tx.send(Ok(())).is_err() {
+                    // SAFETY: polling has not started and this thread owns the async workers.
+                    unsafe { libre_sys::re_thread_async_close() };
+                    return Ok(());
+                }
                 // SAFETY: this thread initialized libre, owns the RE context,
                 // and runs the event loop until cancellation.
                 let status = unsafe { libre_sys::re_main(None) };
                 let result = native_status("re_main", status);
+                // SAFETY: polling has returned and this thread owns the async workers.
+                unsafe { libre_sys::re_thread_async_close() };
                 drop(library);
                 result
             })
@@ -101,8 +115,15 @@ impl EventLoop {
 
     pub fn cancel(&self) {
         if libre_sys::LIBRE_AVAILABLE {
-            // SAFETY: re_cancel is the process-global way to stop re_main.
-            unsafe { libre_sys::re_cancel() };
+            let guard = ThreadGuard::enter();
+            // SAFETY: the callback cancels polling on its owning thread before async shutdown.
+            let status = unsafe {
+                libre_sys::re_thread_async(None, Some(cancel_polling), std::ptr::null_mut())
+            };
+            drop(guard);
+            if status != 0 {
+                eprintln!("libre cancellation wake failed: {status}");
+            }
         }
     }
 
@@ -151,6 +172,28 @@ impl Drop for ThreadGuard {
         if self.active {
             // SAFETY: paired with ThreadGuard::enter on the current thread.
             unsafe { libre_sys::re_thread_leave() };
+        }
+    }
+}
+
+unsafe extern "C" fn cancel_polling(_: std::ffi::c_int, _: *mut std::ffi::c_void) {
+    // SAFETY: libre invokes this callback on its active polling thread.
+    unsafe { libre_sys::re_cancel() };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_loop_can_start_and_stop_repeatedly_without_network_activity() {
+        if !libre_sys::LIBRE_AVAILABLE {
+            return;
+        }
+        for _ in 0..5 {
+            let event_loop = EventLoop::spawn().unwrap();
+            event_loop.cancel();
+            event_loop.join().unwrap();
         }
     }
 }

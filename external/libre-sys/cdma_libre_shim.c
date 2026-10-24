@@ -147,6 +147,27 @@ static void close_handler(int err, const struct sip_msg *msg, void *arg)
 		ctx->handlers->close(ctx->arg, err, scode);
 }
 
+static bool options_handler(const struct sip_msg *msg, void *arg)
+{
+	const uint16_t sip_status_ok = 200;
+
+	if (pl_strcmp(&msg->met, "OPTIONS"))
+		return false;
+
+	sip_reply(arg, msg, sip_status_ok, "OK");
+	return true;
+}
+
+int cdma_libre_sip_options_listen(struct sip_lsnr **listener, struct sip *sip)
+{
+	return sip_listen(listener, sip, true, options_handler, sip);
+}
+
+void cdma_libre_sip_options_deref(struct sip_lsnr *listener)
+{
+	mem_deref(listener);
+}
+
 int cdma_libre_sip_alloc(struct sip **sipp, const char *software,
 			 struct cdma_libre_sip_ctx *ctx)
 {
@@ -458,6 +479,17 @@ int cdma_libre_sip_msg_from_display(const struct sip_msg *msg, char *out,
 	if (!msg)
 		return -1;
 	return copy_pl_str(&msg->from.dname, out, out_len);
+}
+
+int cdma_libre_sip_msg_transaction(const struct sip_msg *msg, char *out,
+                                  size_t out_len)
+{
+    int len;
+    if (!msg || !out || !out_len)
+        return -1;
+    len = re_snprintf(out, out_len, "%r|%r|%u", &msg->callid,
+                      &msg->via.branch, msg->cseq.num);
+    return len >= 0 && (size_t)len < out_len ? len : -1;
 }
 
 int cdma_libre_sip_msg_body(const struct sip_msg *msg, uint8_t *out,

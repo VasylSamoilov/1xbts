@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub(crate) static NATIVE_SIP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 mod libre_backend;
 
 use std::net::SocketAddr;
@@ -16,6 +19,7 @@ pub struct OutboundSipCall {
     pub called_number: String,
     pub caller_number: String,
     pub service_option: u16,
+    pub air_codec: crate::proto::AirCodec,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,6 +34,7 @@ pub enum SipBackendEvent {
         session_id: String,
         sip_status: u16,
         codec: String,
+        telephone_event_payload_type: Option<u8>,
     },
     Failed {
         session_id: String,
@@ -46,6 +51,7 @@ pub enum SipBackendEvent {
         caller_number: String,
         caller_display: String,
         offered_codecs: Vec<String>,
+        telephone_event_payload_type: Option<u8>,
     },
     InboundCancel {
         session_id: String,
@@ -81,6 +87,9 @@ pub enum SipBackendError {
     #[error("native libre/re error: {0}")]
     Libre(#[from] libre::Error),
 
+    #[error(transparent)]
+    Codec(#[from] crate::codec::CodecError),
+
     #[error("media error: {0}")]
     Media(String),
 }
@@ -89,6 +98,13 @@ pub type Result<T> = std::result::Result<T, SipBackendError>;
 
 #[async_trait]
 pub trait SipBackend: Send + Sync + 'static {
+    fn media_stats(&self) -> Vec<crate::media::RtpMediaStats> {
+        Vec::new()
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
     async fn start_outbound_call(
         &self,
         call: OutboundSipCall,

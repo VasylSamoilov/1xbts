@@ -1,3 +1,6 @@
+mod external;
+mod telephone_event;
+
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -111,7 +114,7 @@ pub struct RtpMediaStats {
     pub local_addr: Option<SocketAddr>,
     pub remote_addr: Option<SocketAddr>,
     pub codec: G711Codec,
-    pub voice_codec: VoiceCodec,
+    pub voice_codec: Option<VoiceCodec>,
     pub duration_ms: u128,
     pub idle_ms: u128,
     pub rtp_tx_packets: u64,
@@ -126,14 +129,21 @@ pub struct RtpMediaStats {
     pub erasure_frames: u64,
 }
 
+enum Speech {
+    Cdma {
+        codec: VoiceCodec,
+        decoder: Mutex<GatewayVoiceDecoder>,
+        encoder: Mutex<GatewayVoiceEncoder>,
+    },
+    External(external::ExternalSpeech),
+}
+
 pub struct RtpMediaSession {
     session_id: String,
     socket: Arc<UdpSocket>,
     remote_addr: Mutex<Option<SocketAddr>>,
     codec: Mutex<G711Codec>,
-    voice_codec: VoiceCodec,
-    decoder: Mutex<GatewayVoiceDecoder>,
-    encoder: Mutex<GatewayVoiceEncoder>,
+    speech: Speech,
     gateway_voice_tx: broadcast::Sender<GatewayVoiceFrame>,
     jitter_buffer_ms: u64,
     log_media_frames: bool,
@@ -157,7 +167,7 @@ pub struct RtpMediaSession {
     /// RFC 4733 §2.5.1.2 — captured at the start of an in-flight DTMF event
     /// so every packet of the event carries the same RTP timestamp.
     dtmf_event_timestamp: Mutex<Option<u32>>,
-    telephone_event_payload_type: Option<u8>,
+    telephone_event_payload_type: Mutex<Option<u8>>,
 }
 
 impl RtpMediaSession {
@@ -173,14 +183,84 @@ impl RtpMediaSession {
         gateway_voice_tx: broadcast::Sender<GatewayVoiceFrame>,
         telephone_event_payload_type: Option<u8>,
     ) -> Result<Arc<Self>, String> {
-        let bind_addr: SocketAddr = format!("{listen_addr}:{port}")
-            .parse()
-            .map_err(|err| format!("invalid RTP bind address {listen_addr}:{port}: {err}"))?;
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|err| format!("failed to bind RTP socket {bind_addr}: {err}"))?;
-        let decoder = GatewayVoiceDecoder::new(voice_codec)?;
-        let encoder = GatewayVoiceEncoder::new(voice_codec)?;
+        let speech = Speech::Cdma {
+            codec: voice_codec,
+            decoder: Mutex::new(GatewayVoiceDecoder::new(voice_codec)?),
+            encoder: Mutex::new(GatewayVoiceEncoder::new(voice_codec)?),
+        };
+        Self::bind_speech(
+            session_id,
+            listen_addr,
+            port,
+            initial_codec,
+            speech,
+            jitter_buffer_ms,
+            log_media_frames,
+            log_media_summary,
+            gateway_voice_tx,
+            telephone_event_payload_type,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn bind_with_codec(
+        session_id: String,
+        listen_addr: &str,
+        port: u16,
+        initial_codec: G711Codec,
+        factory: &dyn crate::codec::SpeechCodecFactory,
+        jitter_buffer_ms: u64,
+        log_media_frames: bool,
+        log_media_summary: bool,
+        gateway_voice_tx: broadcast::Sender<GatewayVoiceFrame>,
+        telephone_event_payload_type: Option<u8>,
+    ) -> Result<Arc<Self>, crate::sip::SipBackendError> {
+        const MAX_EXTERNAL_JITTER_MS: u64 =
+            crate::codec::MAX_FRAME_SAMPLES as u64 * 1000 / crate::codec::PCM_SAMPLE_RATE_HZ as u64;
+        if jitter_buffer_ms >= MAX_EXTERNAL_JITTER_MS {
+            return Err(crate::sip::SipBackendError::Config(format!(
+                "external codec jitter_buffer_ms must be less than {MAX_EXTERNAL_JITTER_MS}"
+            )));
+        }
+        let speech = Speech::External(external::ExternalSpeech::new(factory)?);
+        Self::bind_speech(
+            session_id,
+            listen_addr,
+            port,
+            initial_codec,
+            speech,
+            jitter_buffer_ms,
+            log_media_frames,
+            log_media_summary,
+            gateway_voice_tx,
+            telephone_event_payload_type,
+        )
+        .await
+    }
+
+    async fn bind_speech(
+        session_id: String,
+        listen_addr: &str,
+        port: u16,
+        initial_codec: G711Codec,
+        speech: Speech,
+        jitter_buffer_ms: u64,
+        log_media_frames: bool,
+        log_media_summary: bool,
+        gateway_voice_tx: broadcast::Sender<GatewayVoiceFrame>,
+        telephone_event_payload_type: Option<u8>,
+    ) -> Result<Arc<Self>, crate::sip::SipBackendError> {
+        let bind_addr: SocketAddr = format!("{listen_addr}:{port}").parse().map_err(|err| {
+            crate::sip::SipBackendError::Config(format!(
+                "invalid RTP bind address {listen_addr}:{port}: {err}"
+            ))
+        })?;
+        let socket = UdpSocket::bind(bind_addr).await.map_err(|err| {
+            crate::sip::SipBackendError::Media(format!(
+                "failed to bind RTP socket {bind_addr}: {err}"
+            ))
+        })?;
         let ssrc = stable_ssrc(&session_id);
         let now = Instant::now();
 
@@ -189,9 +269,7 @@ impl RtpMediaSession {
             socket: Arc::new(socket),
             remote_addr: Mutex::new(None),
             codec: Mutex::new(initial_codec),
-            voice_codec,
-            decoder: Mutex::new(decoder),
-            encoder: Mutex::new(encoder),
+            speech,
             gateway_voice_tx,
             jitter_buffer_ms,
             log_media_frames,
@@ -213,8 +291,19 @@ impl RtpMediaSession {
             recv_sequence: AtomicU64::new(0),
             ssrc,
             dtmf_event_timestamp: Mutex::new(None),
-            telephone_event_payload_type,
+            telephone_event_payload_type: Mutex::new(telephone_event_payload_type),
         }))
+    }
+
+    pub fn telephone_event_payload_type(&self) -> Option<u8> {
+        *self.telephone_event_payload_type.lock()
+    }
+    pub(crate) fn external_telephone_event_payload_type(&self) -> Option<u8> {
+        if matches!(self.speech, Speech::External(_)) {
+            self.telephone_event_payload_type()
+        } else {
+            None
+        }
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -265,6 +354,10 @@ impl RtpMediaSession {
     }
 
     pub fn set_remote_from_sdp(&self, sdp: &[u8], codec: G711Codec) -> Result<SocketAddr, String> {
+        if matches!(self.speech, Speech::External(_)) {
+            *self.telephone_event_payload_type.lock() = negotiate_telephone_events(sdp);
+        }
+
         let remote = parse_sdp_rtp_endpoint_result(sdp)?;
         *self.remote_addr.lock() = Some(remote);
         *self.codec.lock() = codec;
@@ -282,7 +375,10 @@ impl RtpMediaSession {
             local_addr: self.local_addr(),
             remote_addr: *self.remote_addr.lock(),
             codec: *self.codec.lock(),
-            voice_codec: self.voice_codec,
+            voice_codec: match &self.speech {
+                Speech::Cdma { codec, .. } => Some(*codec),
+                Speech::External(_) => None,
+            },
             duration_ms: self.created_at.elapsed().as_millis(),
             idle_ms: last_activity_at.elapsed().as_millis(),
             rtp_tx_packets: self.rtp_tx_packets.load(Ordering::Relaxed),
@@ -347,12 +443,50 @@ impl RtpMediaSession {
         Ok(())
     }
 
+    pub async fn send_frame(&self, frame: &crate::proto::AirVoiceFrame) -> Result<(), String> {
+        if frame.num_bits as usize != frame.bits.len() {
+            return Err("speech bit count does not match payload".into());
+        }
+        let valid = match &self.speech {
+            Speech::Cdma { .. } => {
+                matches!(
+                    crate::proto::AirCodec::try_from(frame.air_codec),
+                    Ok(crate::proto::AirCodec::Unspecified | crate::proto::AirCodec::Cdma)
+                ) && (frame.samples == 0 || frame.samples == RTP_TIMESTAMP_STEP_8KHZ_20MS)
+            }
+            Speech::External(codec) => {
+                frame.air_codec == codec.codec as i32
+                    && frame.samples as usize == codec.samples
+                    && frame.service_option == 0
+            }
+        };
+        if !valid {
+            return Err("speech codec or duration differs from session".into());
+        }
+        self.send_air_frame(&frame.bits, frame.rate_bps, frame.service_option)
+            .await
+    }
+
     pub async fn send_air_frame(
         &self,
         bits: &[u8],
         rate_bps: u32,
         service_option: u32,
     ) -> Result<(), String> {
+        let Speech::Cdma {
+            codec: voice_codec,
+            decoder,
+            ..
+        } = &self.speech
+        else {
+            if let Speech::External(external) = &self.speech {
+                return external
+                    .queue(bits, rate_bps)
+                    .map_err(|error| error.to_string());
+            }
+            unreachable!("speech variants exhausted");
+        };
+        let voice_codec = *voice_codec;
         let remote = match *self.remote_addr.lock() {
             Some(remote) => remote,
             None => return Ok(()),
@@ -362,18 +496,18 @@ impl RtpMediaSession {
             self.erasure_frames.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        if service_option != 0 && service_option != u32::from(self.voice_codec.service_option()) {
+        if service_option != 0 && service_option != u32::from(voice_codec.service_option()) {
             log::debug!(
                 "VoiceGW media service option differs from session codec session={} frame_so={} session_so={}",
                 self.session_id,
                 service_option,
-                self.voice_codec.service_option()
+                voice_codec.service_option()
             );
         }
-        let voice_rate = voice_rate_for_rate_bps(self.voice_codec, rate_bps)?;
-        let codec_packet = voice_bits_to_packet_bytes(self.voice_codec, bits, rate_bps)?;
+        let voice_rate = voice_rate_for_rate_bps(voice_codec, rate_bps)?;
+        let codec_packet = voice_bits_to_packet_bytes(voice_codec, bits, rate_bps)?;
         let (pcm, sent_silence) = {
-            let mut decoder = self.decoder.lock();
+            let mut decoder = decoder.lock();
             match decoder.decode(voice_rate, &codec_packet) {
                 Ok(pcm) => (pcm, false),
                 Err(err) => {
@@ -382,7 +516,7 @@ impl RtpMediaSession {
                         log::warn!(
                             "VoiceGW voice decode failed; sending RTP silence session={} codec={:?} failures={} rate_bps={} bits={} packet_bytes={}: {}",
                             self.session_id,
-                            self.voice_codec,
+                            voice_codec,
                             failures,
                             rate_bps,
                             bits.len(),
@@ -445,7 +579,7 @@ impl RtpMediaSession {
         end: bool,
         start_of_event: bool,
     ) -> Result<(), String> {
-        let Some(pt) = self.telephone_event_payload_type else {
+        let Some(pt) = self.telephone_event_payload_type() else {
             return Err("telephone-event payload type not configured".to_string());
         };
         let remote = match *self.remote_addr.lock() {
@@ -519,6 +653,10 @@ impl RtpMediaSession {
     }
 
     pub async fn receive_loop(self: Arc<Self>) {
+        if matches!(self.speech, Speech::External(_)) {
+            external::receive_loop(self).await;
+            return;
+        }
         let mut buf = vec![0u8; 2048];
         let mut jitter = RtpJitterBuffer::new(jitter_depth_frames(self.jitter_buffer_ms));
         let mut tick = interval(Duration::from_millis(20));
@@ -598,6 +736,15 @@ impl RtpMediaSession {
         packet: &[u8],
         from: SocketAddr,
     ) -> Result<DecodedVoiceFrame, String> {
+        let Speech::Cdma {
+            codec: voice_codec,
+            encoder,
+            ..
+        } = &self.speech
+        else {
+            return Err("external codec reached CDMA playout".into());
+        };
+        let voice_codec = *voice_codec;
         let parsed = parse_rtp_packet(packet)?;
         let codec = G711Codec::from_payload_type(parsed.payload_type)
             .ok_or_else(|| format!("unsupported RTP payload type {}", parsed.payload_type))?;
@@ -627,17 +774,17 @@ impl RtpMediaSession {
         let mut frame = [0i16; 160];
         frame.copy_from_slice(&pcm[..160]);
         let (rate, packet_data) = {
-            let mut encoder = self.encoder.lock();
+            let mut encoder = encoder.lock();
             encoder
                 .encode(&frame)
                 .map_err(|err| format!("voice encode failed: {err}"))?
         };
-        let bits = voice_packet_bytes_to_bits(self.voice_codec, &packet_data, rate);
+        let bits = voice_packet_bytes_to_bits(voice_codec, &packet_data, rate);
         Ok(DecodedVoiceFrame {
             rtp_sequence: parsed.sequence,
             bits,
             rate: voice_rate_to_proto(rate) as i32,
-            service_option: u32::from(self.voice_codec.service_option()),
+            service_option: u32::from(voice_codec.service_option()),
         })
     }
 
@@ -650,6 +797,9 @@ impl RtpMediaSession {
             rate: frame.rate,
             sequence,
             service_option: frame.service_option,
+            air_codec: 0,
+            samples: 0,
+            rate_bps: 0,
         };
         if let Err(err) = self.gateway_voice_tx.send(event) {
             log::trace!(
@@ -661,20 +811,29 @@ impl RtpMediaSession {
     }
 
     fn publish_silence_gateway_frame(&self) -> Result<(), String> {
+        let Speech::Cdma {
+            codec: voice_codec,
+            encoder,
+            ..
+        } = &self.speech
+        else {
+            return Err("external codec reached CDMA playout".into());
+        };
+        let voice_codec = *voice_codec;
         let frame = [0i16; 160];
         let (rate, packet_data) = {
-            let mut encoder = self.encoder.lock();
+            let mut encoder = encoder.lock();
             encoder
                 .encode(&frame)
                 .map_err(|err| format!("voice silence encode failed: {err}"))?
         };
-        let bits = voice_packet_bytes_to_bits(self.voice_codec, &packet_data, rate);
+        let bits = voice_packet_bytes_to_bits(voice_codec, &packet_data, rate);
         self.gateway_silence_frames.fetch_add(1, Ordering::Relaxed);
         self.publish_decoded_frame(DecodedVoiceFrame {
             rtp_sequence: 0,
             bits,
             rate: voice_rate_to_proto(rate) as i32,
-            service_option: u32::from(self.voice_codec.service_option()),
+            service_option: u32::from(voice_codec.service_option()),
         });
         Ok(())
     }
@@ -1471,4 +1630,36 @@ mod tests {
         assert_eq!(stats.rtp_tx_packets, 1);
         assert_eq!(stats.rtp_rx_packets, 0);
     }
+}
+
+pub(crate) fn negotiate_telephone_events(sdp: &[u8]) -> Option<u8> {
+    let text = std::str::from_utf8(sdp).ok()?;
+    let mut audio = false;
+    let mut payloads = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(media) = line.strip_prefix("m=") {
+            if audio {
+                break;
+            }
+            let fields: Vec<_> = media.split_whitespace().collect();
+            audio = fields.first() == Some(&"audio") && fields.get(2) == Some(&"RTP/AVP");
+            if audio {
+                payloads = fields
+                    .iter()
+                    .skip(3)
+                    .filter_map(|value| value.parse::<u8>().ok())
+                    .collect();
+            }
+        } else if audio && let Some(mapping) = line.strip_prefix("a=rtpmap:") {
+            let (payload, encoding) = mapping.split_once(' ')?;
+            let payload = payload.parse::<u8>().ok()?;
+            if (96..=127).contains(&payload)
+                && payloads.contains(&payload)
+                && encoding.eq_ignore_ascii_case("telephone-event/8000")
+            {
+                return Some(payload);
+            }
+        }
+    }
+    None
 }

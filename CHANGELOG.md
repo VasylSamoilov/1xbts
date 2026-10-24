@@ -1,5 +1,6 @@
 # HEAD
 
+- Add support for non-CDMA voice frames and additional stability improvements.
 - Fixed incoming 13k voice calls to legacy IS-95 phones on PCS (Page Response got no traffic channel).
 - Added support for legacy IS-95 devices on PCS (default `min_p_rev` is now 1).
 - Improved HRPD connection reliability, packet recovery, and reverse power control.

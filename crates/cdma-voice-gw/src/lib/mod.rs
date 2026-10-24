@@ -1,4 +1,6 @@
+pub mod codec;
 pub mod config;
+pub mod embedded;
 pub mod media;
 pub mod service;
 pub mod sip;

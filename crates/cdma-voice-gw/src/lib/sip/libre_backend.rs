@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::config::{CallConfig, LoggingConfig, NatMode, VoiceGatewayConfig};
+use crate::config::{CallConfig, LoggingConfig, NatConfig, NatMode, VoiceGatewayConfig};
 use crate::media::{G711Codec, RtpMediaSession};
 use crate::proto::{AirVoiceFrame, GatewayVoiceFrame, ReleaseReason};
 
@@ -23,6 +23,9 @@ use super::{
 
 pub struct LibreSipBackend {
     config: VoiceGatewayConfig,
+    codec_factory: Option<Arc<dyn crate::codec::SpeechCodecFactory>>,
+    inbound_worker: Mutex<Option<JoinHandle<()>>>,
+    deferred_drops: Arc<Mutex<Vec<JoinHandle<()>>>>,
     sessions: Mutex<HashMap<String, ActiveSession>>,
     inbound_sessions: Arc<Mutex<HashMap<String, InboundSessionState>>>,
     rtp_ports: Arc<Mutex<RtpPortAllocator>>,
@@ -31,15 +34,17 @@ pub struct LibreSipBackend {
     _registration: Option<libre::SipRegistration>,
     session_socket: Arc<libre::SipSessionSocket>,
     _sip_stack: Arc<libre::SipStack>,
-    _event_loop: libre::EventLoop,
     inbound_events: Arc<Mutex<Option<SipBackendEventSender>>>,
     _inbound_listener: libre::InboundListener,
+    _event_loop: Arc<libre::EventLoop>,
 }
 
 struct InboundSessionState {
     session: libre::InboundSipSession,
     _rtp_lease: RtpPortLease,
     media: Arc<RtpMediaSession>,
+    _rtp_task: RtpTask,
+    _media_summary: InboundMediaSummary,
     sdp_answer: String,
     chosen_codec: G711Codec,
     /// CAS-claim ("finalized") — true once any final disposition has been
@@ -52,15 +57,34 @@ struct InboundSessionState {
     /// BYE (→ emit `Released`) from a pre-answer CANCEL or MSC-initiated
     /// teardown.
     answered_with_2xx: Arc<AtomicBool>,
+    _event_loop: Arc<libre::EventLoop>,
+}
+
+struct InboundMediaSummary(Arc<RtpMediaSession>);
+
+impl Drop for InboundMediaSummary {
+    fn drop(&mut self) {
+        self.0.log_summary_once("inbound_session_drop");
+    }
 }
 
 struct InboundDispatcher {
-    invite_tx: mpsc::UnboundedSender<libre::InboundSipMessage>,
+    invite_tx: mpsc::UnboundedSender<(Option<String>, libre::InboundSipMessage)>,
+    pending: Arc<Mutex<HashSet<String>>>,
 }
 
 impl libre::InboundSipSessionHandler for InboundDispatcher {
     fn on_invite(&self, msg: libre::InboundSipMessage) {
-        if let Err(error) = self.invite_tx.send(msg) {
+        let key = msg.transaction_key();
+        if let Some(key) = &key {
+            if !self.pending.lock().insert(key.clone()) {
+                return;
+            }
+        }
+        if let Err(error) = self.invite_tx.send((key.clone(), msg)) {
+            if let Some(key) = key {
+                self.pending.lock().remove(&key);
+            }
             log::warn!("inbound SIP dispatcher receiver dropped: {error}");
         }
     }
@@ -78,7 +102,22 @@ fn send_backend_event(
 
 impl LibreSipBackend {
     pub fn new(config: VoiceGatewayConfig) -> Result<Self> {
+        Self::new_with_optional_codec(config, None)
+    }
+
+    pub fn new_with_codec_factory(
+        config: VoiceGatewayConfig,
+        factory: Arc<dyn crate::codec::SpeechCodecFactory>,
+    ) -> Result<Self> {
+        Self::new_with_optional_codec(config, Some(factory))
+    }
+
+    fn new_with_optional_codec(
+        config: VoiceGatewayConfig,
+        codec_factory: Option<Arc<dyn crate::codec::SpeechCodecFactory>>,
+    ) -> Result<Self> {
         VoiceGatewayConfig::validate(&config).map_err(SipBackendError::Config)?;
+        let nat_mode = config.nat.mode().map_err(SipBackendError::Config)?;
         let transport = libre::Transport::try_from(config.sip.transport.as_str())
             .map_err(SipBackendError::Config)?;
         let listen_addr =
@@ -122,7 +161,7 @@ impl LibreSipBackend {
         let ua_config =
             libre::SipUserAgentConfig::new(listen_addr, transport, config.sip.user_agent.clone());
         preflight_sip_listen_addr(ua_config.listen_addr, ua_config.transport)?;
-        let event_loop = libre::EventLoop::spawn()?;
+        let event_loop = Arc::new(libre::EventLoop::spawn()?);
         let local_addr = libre::SocketAddress::from_socket_addr(ua_config.listen_addr)?;
         let trace_handler = if config.logging.sip_trace {
             Some(Arc::new(SipTraceLogger {
@@ -140,8 +179,10 @@ impl LibreSipBackend {
                 source,
             })?;
         let (inbound_invite_tx, inbound_invite_rx) = mpsc::unbounded_channel();
+        let pending_invites = Arc::new(Mutex::new(HashSet::new()));
         let inbound_dispatcher = Arc::new(InboundDispatcher {
             invite_tx: inbound_invite_tx,
+            pending: pending_invites.clone(),
         });
         let (session_socket, inbound_listener) =
             libre::SipSessionSocket::listen_with_inbound_handler(&sip_stack, inbound_dispatcher)
@@ -200,7 +241,13 @@ impl LibreSipBackend {
         let inbound_events: Arc<Mutex<Option<SipBackendEventSender>>> = Arc::new(Mutex::new(None));
         let sip_stack = Arc::new(sip_stack);
 
+        let deferred_drops = Arc::new(Mutex::new(Vec::new()));
         let worker_deps = InboundWorkerDeps {
+            pending_invites,
+            nat: config.nat.clone(),
+            rtp_latch: RtpLatchConfig::from_nat_mode(nat_mode, &config),
+            deferred_drops: deferred_drops.clone(),
+            codec_factory: codec_factory.clone(),
             inbound_sessions: inbound_sessions.clone(),
             rtp_ports: rtp_ports.clone(),
             gateway_voice_tx: gateway_voice_tx.clone(),
@@ -220,13 +267,17 @@ impl LibreSipBackend {
             log_sip_sdp: config.logging.sip_sdp,
             inbound_decision_timeout_ms: config.sip.inbound_decision_timeout_ms,
             events: inbound_events.clone(),
+            _event_loop: event_loop.clone(),
         };
-        tokio::spawn(run_inbound_worker(inbound_invite_rx, worker_deps));
+        let inbound_worker = tokio::spawn(run_inbound_worker(inbound_invite_rx, worker_deps));
 
         Ok(Self {
             rtp_ports,
             sip_auth,
             config,
+            codec_factory,
+            inbound_worker: Mutex::new(Some(inbound_worker)),
+            deferred_drops,
             sessions: Mutex::new(HashMap::new()),
             inbound_sessions,
             gateway_voice_tx,
@@ -276,7 +327,7 @@ impl LibreSipBackend {
     async fn bind_media_session(
         &self,
         session_id: &str,
-        voice_codec: VoiceCodec,
+        voice_codec: Option<VoiceCodec>,
     ) -> Result<(RtpPortLease, Arc<RtpMediaSession>)> {
         let attempts = self.rtp_ports.lock().capacity();
         let mut last_error = None;
@@ -286,20 +337,37 @@ impl LibreSipBackend {
                 break;
             };
             let port = lease.port();
-            match RtpMediaSession::bind(
-                session_id.to_string(),
-                &self.config.rtp.listen_addr,
-                port,
-                G711Codec::Pcmu,
-                voice_codec,
-                self.config.jitter_buffer_ms,
-                self.config.logging.media_frames,
-                self.config.logging.media_summary,
-                self.gateway_voice_tx.clone(),
-                self.config.rtp.telephone_event_payload_type,
-            )
-            .await
-            {
+            let bound = if let Some(factory) = &self.codec_factory {
+                RtpMediaSession::bind_with_codec(
+                    session_id.to_owned(),
+                    &self.config.rtp.listen_addr,
+                    port,
+                    G711Codec::Pcmu,
+                    factory.as_ref(),
+                    self.config.jitter_buffer_ms,
+                    self.config.logging.media_frames,
+                    self.config.logging.media_summary,
+                    self.gateway_voice_tx.clone(),
+                    self.config.rtp.telephone_event_payload_type,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            } else {
+                RtpMediaSession::bind(
+                    session_id.to_string(),
+                    &self.config.rtp.listen_addr,
+                    port,
+                    G711Codec::Pcmu,
+                    voice_codec.expect("CDMA selection is resolved before media bind"),
+                    self.config.jitter_buffer_ms,
+                    self.config.logging.media_frames,
+                    self.config.logging.media_summary,
+                    self.gateway_voice_tx.clone(),
+                    self.config.rtp.telephone_event_payload_type,
+                )
+                .await
+            };
+            match bound {
                 Ok(media) => return Ok((lease, media)),
                 Err(err) => {
                     log::warn!("failed to bind RTP port {}: {}", port, err);
@@ -318,43 +386,7 @@ impl LibreSipBackend {
         media: &RtpMediaSession,
         rtp_port: u16,
     ) -> Result<AdvertisedRtpEndpoint> {
-        match self.config.nat.mode().map_err(SipBackendError::Config)? {
-            NatMode::Disabled => Ok(AdvertisedRtpEndpoint {
-                addr: self.sdp_address(),
-                port: rtp_port,
-                source: "static",
-            }),
-            NatMode::StunLatch => {
-                let stun_server = self
-                    .config
-                    .nat
-                    .stun_server()
-                    .map_err(SipBackendError::Config)?
-                    .expect("stun_server is required for stun_latch");
-                let timeout = Duration::from_millis(self.config.nat.stun_timeout_ms);
-                let local = media
-                    .local_addr()
-                    .map(|addr| addr.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
-                let mapped = media
-                    .discover_mapped_addr(stun_server, timeout)
-                    .await
-                    .map_err(SipBackendError::Media)?;
-
-                log::info!(
-                    "RTP NAT STUN mapped endpoint local={} stun_server={} mapped={}",
-                    local,
-                    stun_server,
-                    mapped
-                );
-
-                Ok(AdvertisedRtpEndpoint {
-                    addr: mapped.ip().to_string(),
-                    port: mapped.port(),
-                    source: "stun",
-                })
-            }
-        }
+        advertised_rtp_endpoint(&self.config.nat, &self.sdp_address(), media, rtp_port).await
     }
 
     fn build_sdp_offer(&self, endpoint: &AdvertisedRtpEndpoint) -> String {
@@ -388,27 +420,75 @@ impl LibreSipBackend {
         )
     }
 
-    fn prune_closed_sessions(&self) {
-        let mut sessions = self.sessions.lock();
-
-        sessions.retain(|session_id, session| {
-            let keep = !session.control.closed.load(Ordering::SeqCst);
-            if !keep {
-                log::debug!("pruning closed SIP session {}", session_id);
-            }
-            keep
-        });
+    async fn prune_closed_sessions(&self) {
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            let ids: Vec<_> = sessions
+                .iter()
+                .filter(|(_, session)| session.control.closed.load(Ordering::SeqCst))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for mut session in removed {
+            session.stop_tasks().await;
+        }
     }
 }
 
 #[async_trait]
 impl SipBackend for LibreSipBackend {
+    fn media_stats(&self) -> Vec<crate::media::RtpMediaStats> {
+        let mut stats: Vec<_> = self
+            .sessions
+            .lock()
+            .values()
+            .map(|session| session.media.stats())
+            .collect();
+        stats.extend(
+            self.inbound_sessions
+                .lock()
+                .values()
+                .map(|session| session.media.stats()),
+        );
+        stats
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let worker = self.inbound_worker.lock().take();
+        if let Some(worker) = worker {
+            worker.abort();
+            if let Err(error) = worker.await
+                && !error.is_cancelled()
+            {
+                log::error!("SIP inbound worker failed during shutdown: {error}");
+            }
+        }
+        self.inbound_events.lock().take();
+        let sessions = std::mem::take(&mut *self.sessions.lock());
+        let inbound = std::mem::take(&mut *self.inbound_sessions.lock());
+        for (_, mut session) in sessions {
+            session.session.abort();
+            session.stop_tasks().await;
+        }
+        drop(inbound);
+        let deferred = std::mem::take(&mut *self.deferred_drops.lock());
+        for task in deferred {
+            if let Err(error) = task.await {
+                log::warn!("Deferred SIP cleanup failed: {error}");
+            }
+        }
+        Ok(())
+    }
+
     async fn start_outbound_call(
         &self,
         call: OutboundSipCall,
         events: SipBackendEventSender,
     ) -> Result<()> {
-        self.prune_closed_sessions();
+        self.prune_closed_sessions().await;
 
         if self.active_session_count() >= self.config.calls.max_concurrent_calls {
             return Err(SipBackendError::Unavailable(format!(
@@ -420,7 +500,20 @@ impl SipBackend for LibreSipBackend {
         let request_uri = self.request_uri(&call.called_number);
         let caller_id = self.config.sip.effective_caller_id(&call.caller_number);
         let from_uri = self.from_uri(&caller_id);
-        let voice_codec = voice_codec_from_service_option(call.service_option)?;
+        let voice_codec = match (call.air_codec, self.codec_factory.as_ref()) {
+            (
+                crate::proto::AirCodec::IdenVselp8k | crate::proto::AirCodec::IdenVselp4k2,
+                Some(factory),
+            ) if factory.air_codec() == call.air_codec && call.service_option == 0 => None,
+            (crate::proto::AirCodec::Unspecified | crate::proto::AirCodec::Cdma, None) => {
+                Some(voice_codec_from_service_option(call.service_option)?)
+            }
+            _ => {
+                return Err(SipBackendError::Codec(
+                    crate::codec::CodecError::Unsupported(call.air_codec as i32),
+                ));
+            }
+        };
         let (rtp_port, media) = self
             .bind_media_session(&call.session_id, voice_codec)
             .await?;
@@ -505,9 +598,10 @@ impl SipBackend for LibreSipBackend {
     }
 
     async fn release_call(&self, session_id: &str, reason: ReleaseReason) -> Result<()> {
-        self.prune_closed_sessions();
+        self.prune_closed_sessions().await;
 
-        if let Some(session) = self.sessions.lock().remove(session_id) {
+        let removed = { self.sessions.lock().remove(session_id) };
+        if let Some(mut session) = removed {
             log::info!(
                 "releasing libre SIP call: session={} reason={:?}",
                 session_id,
@@ -517,6 +611,7 @@ impl SipBackend for LibreSipBackend {
                 .media
                 .log_summary_once(&format!("bsc_release:{reason:?}"));
             session.session.abort();
+            session.stop_tasks().await;
             return Ok(());
         }
 
@@ -550,7 +645,7 @@ impl SipBackend for LibreSipBackend {
     }
 
     async fn handle_air_frame(&self, frame: AirVoiceFrame) -> Result<()> {
-        self.prune_closed_sessions();
+        self.prune_closed_sessions().await;
 
         let media = self
             .sessions
@@ -573,7 +668,7 @@ impl SipBackend for LibreSipBackend {
         };
 
         media
-            .send_air_frame(&frame.bits, frame.rate_bps, frame.service_option)
+            .send_frame(&frame)
             .await
             .map_err(SipBackendError::Media)
     }
@@ -728,6 +823,25 @@ fn preflight_sip_listen_addr(listen_addr: SocketAddr, transport: libre::Transpor
     }
 }
 
+struct RtpTask(JoinHandle<()>);
+
+impl Drop for RtpTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for LibreSipBackend {
+    fn drop(&mut self) {
+        if let Some(worker) = self.inbound_worker.get_mut().take() {
+            worker.abort();
+        }
+        self.sessions.get_mut().clear();
+        let inbound = std::mem::take(&mut *self.inbound_sessions.lock());
+        drop(inbound);
+    }
+}
+
 struct ActiveSession {
     session: Arc<libre::OutboundSipSession>,
     media: Arc<RtpMediaSession>,
@@ -737,8 +851,30 @@ struct ActiveSession {
     _rtp_port: RtpPortLease,
 }
 
+impl ActiveSession {
+    async fn stop_tasks(&mut self) {
+        self.rtp_task.abort();
+        for task in &self.timeout_tasks {
+            task.abort();
+        }
+        for task in std::mem::take(&mut self.timeout_tasks) {
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                log::warn!("SIP timeout worker failed: {error}");
+            }
+        }
+        if let Err(error) = (&mut self.rtp_task).await
+            && !error.is_cancelled()
+        {
+            log::warn!("SIP media worker failed: {error}");
+        }
+    }
+}
+
 impl Drop for ActiveSession {
     fn drop(&mut self) {
+        self.session.abort();
         self.media.log_summary_once("session_drop");
         self.rtp_task.abort();
         for task in &self.timeout_tasks {
@@ -1045,6 +1181,9 @@ impl libre::OutboundSipSessionHandler for LibreSessionEventHandler {
                         session_id,
                         sip_status,
                         codec,
+                        telephone_event_payload_type: self
+                            .media
+                            .external_telephone_event_payload_type(),
                     },
                     "answered",
                 );
@@ -1462,6 +1601,146 @@ mod tests {
     use tokio::runtime::Handle;
     use tokio::sync::broadcast;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sip_options_reachability_check_returns_ok_without_a_call() {
+        use crate::config::VoiceGatewayConfig;
+        use crate::sip::LibreSipBackend;
+
+        if !libre::native_available() {
+            return;
+        }
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut config = VoiceGatewayConfig::default();
+        config.sip.listen_addr = listen.to_string();
+        let _native = crate::sip::NATIVE_SIP_TEST_LOCK.lock().await;
+        let _backend = LibreSipBackend::new(config).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let request = format!(
+            "OPTIONS sip:site@{listen} SIP/2.0\r\nVia: SIP/2.0/UDP {peer_addr};branch=z9hG4bKoptions;rport\r\nFrom: <sip:hub@localhost>;tag=check\r\nTo: <sip:site@{listen}>\r\nCall-ID: options-check\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        );
+        peer.send_to(request.as_bytes(), listen).await.unwrap();
+        let mut response = [0u8; 4096];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+        let response = std::str::from_utf8(&response[..length]).unwrap();
+        assert!(response.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(response.contains("Call-ID: options-check\r\n"));
+        assert!(response.contains("CSeq: 1 OPTIONS\r\n"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_stun_advertises_mapped_endpoint_and_deduplicates_pending_invites() {
+        use crate::config::VoiceGatewayConfig;
+        use crate::sip::{LibreSipBackend, SipBackend, SipBackendEvent};
+        use crate::stun;
+        use std::time::Duration;
+        use tokio::net::UdpSocket;
+        use tokio::time::timeout;
+
+        if !libre::native_available() {
+            return;
+        }
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let media_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let rtp = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut config = VoiceGatewayConfig::default();
+        config.sip.listen_addr = listen.to_string();
+        config.rtp.port_range = [rtp.port(), rtp.port() + 4];
+        config.calls.max_concurrent_calls = 2;
+        config.rtp.advertise_addr = Some("10.0.0.1".into());
+        config.nat.mode = "stun_latch".into();
+        config.nat.stun_server = Some(stun_peer.local_addr().unwrap().to_string());
+        let _native = crate::sip::NATIVE_SIP_TEST_LOCK.lock().await;
+        let backend = LibreSipBackend::new(config).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        backend.register_inbound_handler(events).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let offer = format!(
+            "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio {} RTP/AVP 0\r\n",
+            media_peer.local_addr().unwrap().port()
+        );
+        let invite = format!(
+            "INVITE sip:1001@{listen} SIP/2.0\r\nVia: SIP/2.0/UDP {peer_addr};branch=z9hG4bKpending;rport\r\nFrom: <sip:1002@localhost>;tag=caller\r\nTo: <sip:1001@{listen}>\r\nCall-ID: pending-stun\r\nCSeq: 1 INVITE\r\nContact: <sip:1002@{peer_addr}>\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{offer}",
+            offer.len()
+        );
+        peer.send_to(invite.as_bytes(), listen).await.unwrap();
+        let mut request = [0u8; 1024];
+        let (length, source) = timeout(Duration::from_secs(3), stun_peer.recv_from(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.port(), rtp.port());
+        assert!(stun::is_stun_message(&request[..length]));
+        for _ in 0..8 {
+            peer.send_to(invite.as_bytes(), listen).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&stun::BINDING_SUCCESS_RESPONSE.to_be_bytes());
+        reply.extend_from_slice(&12u16.to_be_bytes());
+        reply.extend_from_slice(&request[4..20]);
+        reply.extend_from_slice(&stun::MAPPED_ADDRESS.to_be_bytes());
+        reply.extend_from_slice(&8u16.to_be_bytes());
+        reply.extend_from_slice(&[0, 1]);
+        reply.extend_from_slice(&45678u16.to_be_bytes());
+        reply.extend_from_slice(&[203, 0, 113, 7]);
+        stun_peer.send_to(&reply, source).await.unwrap();
+        let event = timeout(Duration::from_secs(3), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SipBackendEvent::InboundInvite { session_id, .. } = event else {
+            panic!("unexpected event: {event:?}");
+        };
+        let mut bytes = [0u8; 4096];
+        let answer = timeout(Duration::from_secs(3), async {
+            loop {
+                let (length, _) = peer.recv_from(&mut bytes).await.unwrap();
+                let answer = String::from_utf8_lossy(&bytes[..length]).into_owned();
+                if answer.starts_with("SIP/2.0 183") {
+                    break answer;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(answer.contains("c=IN IP4 203.0.113.7"));
+        assert!(answer.contains("m=audio 45678 RTP/AVP 0"));
+        let (_, latch_source) = timeout(Duration::from_secs(3), media_peer.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latch_source.port(), rtp.port());
+        assert!(
+            timeout(Duration::from_millis(150), received.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(150), stun_peer.recv_from(&mut bytes))
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.inbound_sessions.lock().len(), 1);
+        backend.inbound_reject(&session_id, 487).await.unwrap();
+        backend.shutdown().await.unwrap();
+    }
+
     #[test]
     fn extracts_static_g711_codecs_from_sdp() {
         assert_eq!(
@@ -1660,10 +1939,56 @@ m=audio 40000 RTP/AVP 0\r\n";
     }
 }
 
-// ---- Inbound SIP support ----
+async fn advertised_rtp_endpoint(
+    nat: &NatConfig,
+    static_address: &str,
+    media: &RtpMediaSession,
+    rtp_port: u16,
+) -> Result<AdvertisedRtpEndpoint> {
+    match nat.mode().map_err(SipBackendError::Config)? {
+        NatMode::Disabled => Ok(AdvertisedRtpEndpoint {
+            addr: static_address.to_owned(),
+            port: rtp_port,
+            source: "static",
+        }),
+        NatMode::StunLatch => {
+            let stun_server = nat
+                .stun_server()
+                .map_err(SipBackendError::Config)?
+                .expect("stun_server is required for stun_latch");
+            let timeout = Duration::from_millis(nat.stun_timeout_ms);
+            let local = media
+                .local_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let mapped = media
+                .discover_mapped_addr(stun_server, timeout)
+                .await
+                .map_err(SipBackendError::Media)?;
+
+            log::info!(
+                "RTP NAT STUN mapped endpoint local={} stun_server={} mapped={}",
+                local,
+                stun_server,
+                mapped
+            );
+
+            Ok(AdvertisedRtpEndpoint {
+                addr: mapped.ip().to_string(),
+                port: mapped.port(),
+                source: "stun",
+            })
+        }
+    }
+}
 
 #[derive(Clone)]
 struct InboundWorkerDeps {
+    pending_invites: Arc<Mutex<HashSet<String>>>,
+    nat: NatConfig,
+    rtp_latch: Option<RtpLatchConfig>,
+    deferred_drops: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    codec_factory: Option<Arc<dyn crate::codec::SpeechCodecFactory>>,
     inbound_sessions: Arc<Mutex<HashMap<String, InboundSessionState>>>,
     rtp_ports: Arc<Mutex<RtpPortAllocator>>,
     gateway_voice_tx: broadcast::Sender<GatewayVoiceFrame>,
@@ -1679,21 +2004,22 @@ struct InboundWorkerDeps {
     log_sip_sdp: bool,
     inbound_decision_timeout_ms: u64,
     events: Arc<Mutex<Option<SipBackendEventSender>>>,
+    _event_loop: Arc<libre::EventLoop>,
 }
 
 async fn run_inbound_worker(
-    mut invite_rx: mpsc::UnboundedReceiver<libre::InboundSipMessage>,
+    mut invite_rx: mpsc::UnboundedReceiver<(Option<String>, libre::InboundSipMessage)>,
     deps: InboundWorkerDeps,
 ) {
-    while let Some(msg) = invite_rx.recv().await {
+    while let Some((key, msg)) = invite_rx.recv().await {
         handle_inbound_invite(&deps, msg).await;
+        if let Some(key) = key {
+            deps.pending_invites.lock().remove(&key);
+        }
     }
 }
 
 async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipMessage) {
-    // 100 Trying is sent by sipsess_accept below on the validated path; early-reject
-    // paths (404/488/503) send their own final response so no provisional is needed.
-
     let session_id = Uuid::new_v4().to_string();
     let raw_ruri = msg.request_uri_user().unwrap_or_default();
     let from_user = msg.from_user().unwrap_or_default();
@@ -1737,7 +2063,15 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
         }
     };
     let local_port = lease.port();
-    let advertised_addr = deps.sdp_address.clone();
+    let endpoint =
+        match advertised_rtp_endpoint(&deps.nat, &deps.sdp_address, &media, local_port).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                log::warn!("inbound RTP NAT discovery failed session={session_id}: {error}");
+                let _ = libre::sip_treply(&deps.sip_stack, &msg, 503, "Service Unavailable");
+                return;
+            }
+        };
 
     if deps.log_sip_sdp {
         log::debug!(
@@ -1747,21 +2081,27 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
     }
 
     let sdp_answer = build_sdp_answer(
-        &advertised_addr,
-        local_port,
+        &endpoint.addr,
+        endpoint.port,
         chosen_codec,
-        deps.telephone_event_payload_type,
+        if deps.codec_factory.is_some() {
+            crate::media::negotiate_telephone_events(&body)
+        } else {
+            deps.telephone_event_payload_type
+        },
     );
     if let Err(error) = media.set_remote_from_sdp(&body, chosen_codec) {
         log::warn!("inbound: failed to set RTP remote from offer session={session_id}: {error}");
     }
 
-    // Accept-with-183 up front so libre's close_h fires on CANCEL.
-    // libre's sipsess_accept rejects scode<101; 183 keeps the trunk from playing
-    // ringback before MS is actually alerting (180 is sent later via progress()).
+    // libre requires a provisional response above 100 to track CANCEL.
     let answered = Arc::new(AtomicBool::new(false));
     let answered_with_2xx = Arc::new(AtomicBool::new(false));
     let session_handler = Arc::new(InboundSessionHandler {
+        deferred_drops: deps.deferred_drops.clone(),
+        notify_established: deps.codec_factory.is_some(),
+        telephone_event_payload_type: media.external_telephone_event_payload_type(),
+        codec: g711_codec_name(chosen_codec).to_owned(),
         session_id: session_id.clone(),
         sessions: deps.inbound_sessions.clone(),
         events: deps.events.clone(),
@@ -1769,9 +2109,6 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
         answered_with_2xx: answered_with_2xx.clone(),
         runtime: Handle::current(),
     });
-    // Send SDP in the 183 so the trunk has an RTP target up front; MSC may
-    // push early-media (ringback) before the 200 OK. The same SDP is echoed
-    // verbatim by inbound_answer; no renegotiation.
     let session = match libre::InboundSipSession::accept(
         deps.session_socket.as_ref(),
         &msg,
@@ -1791,6 +2128,9 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
         }
     };
     drop(msg);
+    if let Some(latch) = deps.rtp_latch {
+        spawn_rtp_latch(&Handle::current(), session_id.clone(), media.clone(), latch);
+    }
 
     deps.inbound_sessions.lock().insert(
         session_id.clone(),
@@ -1798,14 +2138,15 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
             session,
             _rtp_lease: lease,
             media: media.clone(),
+            _rtp_task: RtpTask(tokio::spawn(media.clone().receive_loop())),
+            _media_summary: InboundMediaSummary(media.clone()),
             sdp_answer,
             chosen_codec,
             answered,
             answered_with_2xx,
+            _event_loop: deps._event_loop.clone(),
         },
     );
-
-    tokio::spawn(media.receive_loop());
 
     let offered_names: Vec<String> = offered
         .iter()
@@ -1872,6 +2213,7 @@ async fn handle_inbound_invite(deps: &InboundWorkerDeps, msg: libre::InboundSipM
             caller_number: from_user,
             caller_display: from_display,
             offered_codecs: offered_names,
+            telephone_event_payload_type: media.external_telephone_event_payload_type(),
         },
         "inbound_invite",
     );
@@ -1888,20 +2230,37 @@ async fn bind_inbound_media(
             break;
         };
         let port = lease.port();
-        match RtpMediaSession::bind(
-            session_id.to_string(),
-            &deps.rtp_listen_addr,
-            port,
-            G711Codec::Pcmu,
-            VoiceCodec::EvrcA,
-            deps.jitter_buffer_ms,
-            deps.log_media_frames,
-            deps.log_media_summary,
-            deps.gateway_voice_tx.clone(),
-            deps.telephone_event_payload_type,
-        )
-        .await
-        {
+        let bound = if let Some(factory) = &deps.codec_factory {
+            RtpMediaSession::bind_with_codec(
+                session_id.to_owned(),
+                &deps.rtp_listen_addr,
+                port,
+                G711Codec::Pcmu,
+                factory.as_ref(),
+                deps.jitter_buffer_ms,
+                deps.log_media_frames,
+                deps.log_media_summary,
+                deps.gateway_voice_tx.clone(),
+                deps.telephone_event_payload_type,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            RtpMediaSession::bind(
+                session_id.to_string(),
+                &deps.rtp_listen_addr,
+                port,
+                G711Codec::Pcmu,
+                VoiceCodec::EvrcA,
+                deps.jitter_buffer_ms,
+                deps.log_media_frames,
+                deps.log_media_summary,
+                deps.gateway_voice_tx.clone(),
+                deps.telephone_event_payload_type,
+            )
+            .await
+        };
+        match bound {
             Ok(media) => return Ok((lease, media)),
             Err(err) => {
                 log::warn!("inbound: RTP bind on port {port} failed: {err}");
@@ -2033,6 +2392,10 @@ fn sip_reason_phrase(code: u16) -> &'static str {
 }
 
 struct InboundSessionHandler {
+    deferred_drops: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    notify_established: bool,
+    telephone_event_payload_type: Option<u8>,
+    codec: String,
     session_id: String,
     sessions: Arc<Mutex<HashMap<String, InboundSessionState>>>,
     events: Arc<Mutex<Option<SipBackendEventSender>>>,
@@ -2045,6 +2408,20 @@ struct InboundSessionHandler {
 
 impl libre::InboundSipSessionEventHandler for InboundSessionHandler {
     fn on_established(&self, sip_status: u16) {
+        if self.notify_established
+            && let Some(events) = self.events.lock().clone()
+        {
+            send_backend_event(
+                &events,
+                SipBackendEvent::Answered {
+                    session_id: self.session_id.clone(),
+                    sip_status,
+                    codec: self.codec.clone(),
+                    telephone_event_payload_type: self.telephone_event_payload_type,
+                },
+                "inbound_established",
+            );
+        }
         log::info!(
             "inbound SIP session {} established status={}",
             self.session_id,
@@ -2067,9 +2444,12 @@ impl libre::InboundSipSessionEventHandler for InboundSessionHandler {
         // happens after we return to libre and after this callback frame exits.
         let removed = self.sessions.lock().remove(&session_id);
         if let Some(state) = removed {
-            self.runtime.spawn(async move {
+            let task = self.runtime.spawn(async move {
                 drop(state);
             });
+            let mut deferred = self.deferred_drops.lock();
+            deferred.retain(|task| !task.is_finished());
+            deferred.push(task);
         }
         let was_answered = self.answered_with_2xx.load(Ordering::SeqCst);
         log::info!(
