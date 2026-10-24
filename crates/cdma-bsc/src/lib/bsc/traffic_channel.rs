@@ -210,7 +210,6 @@ pub(crate) struct TrafficChannelInfo {
     pub(crate) power_control_delay_pcgs: u64,
     pub(crate) last_forward_enqueue_at: Option<Instant>,
     pub(crate) channel_state: ChannelState,
-    pub(crate) assignment_correlation_id: Option<u32>,
     /// Reverse regular-PDU duplicate status per C.S0004-E 3.2.1.1.2.2.
     ///
     /// When a new reverse regular PDU with MSG_SEQ=n is processed, the BS marks
@@ -302,7 +301,6 @@ impl TrafficChannelInfo {
             channel_state: ChannelState::Assigned {
                 assigned_at: Instant::now(),
             },
-            assignment_correlation_id: None,
             reverse_regular_msg_seq_rcvd_ack: [false; 8],
             reverse_regular_msg_seq_rcvd_noack: [false; 8],
             forward_msg_seq_ack: 0,
@@ -439,21 +437,15 @@ impl TrafficChannelInfo {
     pub(crate) fn traffic_lifecycle_action(
         &self,
         ms_ack_timeout: Duration,
-        assignment_delivery_timeout: Duration,
         now: Instant,
     ) -> TrafficChannelAction {
-        let assigned_timeout = if self.assignment_correlation_id.is_some() {
-            assignment_delivery_timeout
-        } else {
-            ms_ack_timeout
-        };
         match self.channel_state {
             ChannelState::Assigned { assigned_at }
-                if now.duration_since(assigned_at) >= assigned_timeout =>
+                if now.duration_since(assigned_at) >= ms_ack_timeout =>
             {
                 TrafficChannelAction::Teardown {
                     reason: "traffic assignment timeout",
-                    timeout_ms: assigned_timeout.as_millis() as u64,
+                    timeout_ms: ms_ack_timeout.as_millis() as u64,
                 }
             }
             ChannelState::WaitingMsAck { bs_ack_sent_at }
@@ -479,15 +471,9 @@ impl TrafficChannelInfo {
     pub(crate) fn next_traffic_lifecycle_deadline(
         &self,
         ms_ack_timeout: Duration,
-        assignment_delivery_timeout: Duration,
     ) -> Option<Instant> {
-        let assigned_timeout = if self.assignment_correlation_id.is_some() {
-            assignment_delivery_timeout
-        } else {
-            ms_ack_timeout
-        };
         match self.channel_state {
-            ChannelState::Assigned { assigned_at } => Some(assigned_at + assigned_timeout),
+            ChannelState::Assigned { assigned_at } => Some(assigned_at + ms_ack_timeout),
             ChannelState::WaitingMsAck { bs_ack_sent_at } => Some(bs_ack_sent_at + ms_ack_timeout),
             ChannelState::Releasing {
                 release_guard_started_at,
@@ -615,22 +601,6 @@ impl TrafficChannelInfo {
         self.set_channel_state(ChannelState::Assigned {
             assigned_at: Instant::now(),
         });
-    }
-
-    pub(crate) fn track_assignment_delivery(&mut self, correlation_id: Option<u32>) {
-        self.assignment_correlation_id = correlation_id;
-    }
-
-    pub(crate) fn acknowledge_assignment_delivery(&mut self, correlation_id: u32) -> bool {
-        if self.assignment_correlation_id != Some(correlation_id) {
-            return false;
-        }
-        self.assignment_correlation_id = None;
-        let ChannelState::Assigned { assigned_at } = &mut self.channel_state else {
-            return false;
-        };
-        *assigned_at = Instant::now();
-        true
     }
 
     pub(crate) fn mark_waiting_service_response(&mut self) {

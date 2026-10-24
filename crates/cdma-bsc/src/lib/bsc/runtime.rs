@@ -62,6 +62,14 @@ impl Bsc {
                 }
             };
 
+            let held_bs_ack_due = self.access_tx.next_held_bs_ack_due();
+            let held_bs_ack_sleep = async {
+                match held_bs_ack_due {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+
             tokio::select! {
                 Some(event) = recv_unbounded_or_pending(access_rx.as_mut()) => {
                     let event = self.enrich_uplink_event(event);
@@ -109,6 +117,10 @@ impl Bsc {
                 _ = retry_sleep => {
                     self.handle_page_retry();
                 }
+                _ = held_bs_ack_sleep => {
+                    self.access_tx
+                        .send_due_bs_acks(tokio::time::Instant::now());
+                }
                 _ = voice_poll_sleep => {
                     self.poll_voice_calls().await;
                 }
@@ -130,18 +142,6 @@ impl Bsc {
         }
     }
 
-    /// How long an assignment may sit undelivered on `cell`. The budget is the
-    /// cell's own paging retransmission window plus the MS acknowledgment
-    /// wait, so the BSC gives up no earlier than the BTS stops resending.
-    fn assignment_delivery_timeout(
-        &self,
-        cell: Option<cdma_common::events::AccessCellId>,
-        ms_ack_timeout: Duration,
-    ) -> Duration {
-        let paging_retry = &self.config.bts.params(cell).paging_retry;
-        Duration::from_millis(paging_retry.ack_timeout_ms) + ms_ack_timeout
-    }
-
     pub(crate) fn next_traffic_lifecycle_deadline(
         &self,
         ms_ack_timeout: Duration,
@@ -149,11 +149,8 @@ impl Bsc {
         self.mobiles
             .iter()
             .filter_map(|ms| {
-                let assignment_delivery_timeout =
-                    self.assignment_delivery_timeout(ms.serving_cell, ms_ack_timeout);
-                ms.traffic_channel().and_then(|tc| {
-                    tc.next_traffic_lifecycle_deadline(ms_ack_timeout, assignment_delivery_timeout)
-                })
+                ms.traffic_channel()
+                    .and_then(|tc| tc.next_traffic_lifecycle_deadline(ms_ack_timeout))
             })
             .min()
             .map(tokio::time::Instant::from_std)
@@ -165,11 +162,8 @@ impl Bsc {
             .mobiles
             .iter()
             .filter_map(|ms| {
-                let assignment_delivery_timeout =
-                    self.assignment_delivery_timeout(ms.serving_cell, ms_ack_timeout);
                 let tc = ms.traffic_channel()?;
-                match tc.traffic_lifecycle_action(ms_ack_timeout, assignment_delivery_timeout, now)
-                {
+                match tc.traffic_lifecycle_action(ms_ack_timeout, now) {
                     TrafficChannelAction::Teardown { reason, timeout_ms } => Some((
                         ms.serving_cell?,
                         tc.walsh_code,

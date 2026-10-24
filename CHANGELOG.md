@@ -1,5 +1,6 @@
 # HEAD
 
+- Faster call and data setup for IS-2000 mobiles.
 - Improved 1x access probe decode performance.
 - Add support for non-CDMA voice frames and additional stability improvements.
 - Fixed incoming 13k voice calls to legacy IS-95 phones on PCS (Page Response got no traffic channel).

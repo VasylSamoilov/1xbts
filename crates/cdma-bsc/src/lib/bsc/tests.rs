@@ -54,17 +54,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Widen the enrolled cell's paging retransmission window. The budget is
-/// BTS-owned and reaches the BSC through enrollment, so a test that needs a
-/// longer window re-enrolls the cell with one.
-fn set_cell_paging_ack_timeout(bsc: &Bsc, ack_timeout_ms: u64) {
-    for entry in bsc.config.bts.entries() {
-        let mut params = (*entry.params()).clone();
-        params.paging_retry.ack_timeout_ms = ack_timeout_ms;
-        entry.set_enrolled(params, None, None);
-    }
-}
-
 fn test_msc_client() -> Arc<dyn crate::a1_edge::MscClient> {
     Arc::new(crate::bsc::test_utils::AutoAssignmentMscClient::new())
 }
@@ -3657,7 +3646,6 @@ async fn assigned_timeout_tears_down_packet_traffic_channel() {
     tc.channel_state = ChannelState::Assigned {
         assigned_at: Instant::now() - Duration::from_millis(5001),
     };
-    tc.assignment_correlation_id = None;
 
     bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
         .await;
@@ -3677,7 +3665,6 @@ async fn assigned_lifecycle_does_not_teardown_before_timeout() {
     tc.channel_state = ChannelState::Assigned {
         assigned_at: Instant::now() - Duration::from_millis(4999),
     };
-    tc.assignment_correlation_id = None;
 
     bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
         .await;
@@ -3686,86 +3673,6 @@ async fn assigned_lifecycle_does_not_teardown_before_timeout() {
         bsc.mobiles[0].traffic_channel.is_some(),
         "traffic channel should remain before assignment timeout"
     );
-}
-
-#[tokio::test]
-async fn ecam_l2_ack_restarts_traffic_transition_timeout() {
-    const ASSIGNMENT_CORRELATION_ID: u32 = 77;
-    let (mut bsc, _traffic_rx, _walsh_code) =
-        test_bsc_with_active_traffic_channel(SERVICE_OPTION_PACKET_DATA_RC3).await;
-
-    let before_ack = Instant::now();
-    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
-    tc.channel_state = ChannelState::Assigned {
-        assigned_at: before_ack - Duration::from_millis(4900),
-    };
-    tc.assignment_correlation_id = Some(ASSIGNMENT_CORRELATION_ID);
-
-    bsc.handle_pch_transfer_ack(PchTransferAckEvent {
-        correlation_id: Some(ASSIGNMENT_CORRELATION_ID),
-        cause: None,
-        bts_l2_termination: Some(true),
-    })
-    .await;
-
-    let tc = bsc.mobiles[0].traffic_channel.as_ref().unwrap();
-    assert_eq!(tc.assignment_correlation_id, None);
-    match tc.channel_state {
-        ChannelState::Assigned { assigned_at } => assert!(assigned_at >= before_ack),
-        _ => panic!("expected Assigned state"),
-    }
-
-    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
-        .await;
-    assert!(bsc.mobiles[0].traffic_channel.is_some());
-}
-
-#[tokio::test]
-async fn pending_ecam_delivery_outlives_traffic_transition_timeout() {
-    const ASSIGNMENT_CORRELATION_ID: u32 = 78;
-    let (mut bsc, _traffic_rx, _walsh_code) =
-        test_bsc_with_active_traffic_channel(SERVICE_OPTION_PACKET_DATA_RC3).await;
-    set_cell_paging_ack_timeout(&bsc, 15_000);
-
-    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
-    tc.channel_state = ChannelState::Assigned {
-        assigned_at: Instant::now() - Duration::from_millis(5001),
-    };
-    tc.assignment_correlation_id = Some(ASSIGNMENT_CORRELATION_ID);
-
-    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
-        .await;
-    assert!(bsc.mobiles[0].traffic_channel.is_some());
-
-    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
-    tc.channel_state = ChannelState::Assigned {
-        assigned_at: Instant::now() - Duration::from_millis(20_001),
-    };
-    bsc.poll_traffic_channel_lifecycle(Duration::from_millis(5000))
-        .await;
-    assert!(bsc.mobiles[0].traffic_channel.is_none());
-}
-
-#[tokio::test]
-async fn ecam_l2_delivery_failure_tears_down_pending_assignment() {
-    const ASSIGNMENT_CORRELATION_ID: u32 = 79;
-    let (mut bsc, _traffic_rx, _walsh_code) =
-        test_bsc_with_active_traffic_channel(SERVICE_OPTION_PACKET_DATA_RC3).await;
-
-    let tc = bsc.mobiles[0].traffic_channel.as_mut().unwrap();
-    tc.channel_state = ChannelState::Assigned {
-        assigned_at: Instant::now(),
-    };
-    tc.assignment_correlation_id = Some(ASSIGNMENT_CORRELATION_ID);
-
-    bsc.handle_pch_transfer_ack(PchTransferAckEvent {
-        correlation_id: Some(ASSIGNMENT_CORRELATION_ID),
-        cause: Some(OAMP_INTERVENTION),
-        bts_l2_termination: None,
-    })
-    .await;
-
-    assert!(bsc.mobiles[0].traffic_channel.is_none());
 }
 
 #[tokio::test]
@@ -4271,7 +4178,7 @@ async fn origination_retry_reuses_pending_traffic_channel() {
                 && message.layer2_ack_request_results.is_some()
         })
         .count();
-    assert_eq!(assignment_ack_req_count, 2);
+    assert_eq!(assignment_ack_req_count, 0);
 }
 
 #[tokio::test]
@@ -4882,7 +4789,8 @@ async fn so12_p_rev3_origination_assigns_rc2_packet_traffic() {
     assert_eq!(traffic_rx_pool.lock()[0].assigned_rev_rc, 2);
     assert_eq!(
         pch_message_types(&bts_client),
-        vec![MessageId::Order, MessageId::ChannelAssignment]
+        vec![MessageId::ChannelAssignment],
+        "the Channel Assignment carries the Origination acknowledgment"
     );
 }
 
@@ -5118,6 +5026,8 @@ async fn so32768_origination_is_accepted_without_renegotiation() {
     origination.rev_supported_rcs = vec![1];
 
     bsc.inject_access_event(origination).await;
+    bsc.access_tx
+        .send_due_bs_acks(tokio::time::Instant::now() + super::access::BS_ACK_HOLD);
 
     let messages = bts_client.pch_messages.lock();
     let release_orders: Vec<_> = messages
@@ -5415,6 +5325,13 @@ async fn supported_packet_origination_so_is_not_rejected_when_assignment_falls_b
     origination.service_option = Some(SERVICE_OPTION_PACKET_DATA);
 
     bsc.inject_access_event(origination).await;
+    bsc.access_tx.send_due_bs_acks(tokio::time::Instant::now());
+    assert!(
+        bts_client.pch_messages.lock().is_empty(),
+        "the BS Ack is held until the hold expires"
+    );
+    bsc.access_tx
+        .send_due_bs_acks(tokio::time::Instant::now() + super::access::BS_ACK_HOLD);
 
     assert_eq!(bsc.mobiles.tracked_count(), 1);
     assert!(

@@ -812,17 +812,6 @@ impl Bsc {
 
         let key = SmsAckKey::PchCorrelation(correlation_id);
         if ack.bts_l2_termination == Some(true) {
-            if let Some((addr, _cell, walsh_code)) =
-                self.mobiles.acknowledge_assignment_delivery(correlation_id)
-            {
-                info!(
-                    "BSC: ECAM L2 acknowledgment received for {} walsh={} correlation_id={}, restarting traffic transition timeout",
-                    format_ms_address(&addr),
-                    walsh_code,
-                    correlation_id,
-                );
-                return;
-            }
             if self
                 .paging
                 .pending_sms_page_correlation_matches(correlation_id)
@@ -879,20 +868,6 @@ impl Bsc {
         }
 
         if let Some(cause) = ack.cause {
-            if let Some((addr, cell, walsh_code)) = self
-                .mobiles
-                .pending_assignment_for_correlation(correlation_id)
-            {
-                warn!(
-                    "BSC: ECAM L2 delivery failed for {} walsh={} correlation_id={} cause=0x{:02X}, tearing down",
-                    format_ms_address(&addr),
-                    walsh_code,
-                    correlation_id,
-                    cause,
-                );
-                self.teardown_traffic_channel(cell, walsh_code).await;
-                return;
-            }
             if let Some(pending) = self.paging.take_sms_page_by_correlation(correlation_id) {
                 self.clear_pending_page_records_for(&pending.page_address);
                 warn!(

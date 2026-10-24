@@ -25,9 +25,9 @@ use crate::addressing::{
 };
 
 use super::{
-    AccessCellId, Bsc, BtsCellParams, MobileRegistryService, MsState, ServiceNegotiationMode,
-    TrafficChannelInfo, TrafficPowerOverrideAction, TrafficPowerOverrideRequest, VoiceLegRole,
-    VoiceService, traffic_channel_power_snapshot,
+    Bsc, BtsCellParams, MobileRegistryService, MsState, ServiceNegotiationMode, TrafficChannelInfo,
+    TrafficPowerOverrideAction, TrafficPowerOverrideRequest, VoiceLegRole, VoiceService,
+    traffic_channel_power_snapshot,
 };
 
 #[derive(Default)]
@@ -99,17 +99,6 @@ impl TrafficAssignmentService {
 }
 
 impl Bsc {
-    fn track_assignment_delivery(
-        &mut self,
-        cell: AccessCellId,
-        walsh_code: u8,
-        correlation_id: Option<u32>,
-    ) {
-        self.mobiles.update_tc(cell, walsh_code, |_, tc| {
-            tc.track_assignment_delivery(correlation_id);
-        });
-    }
-
     pub(crate) async fn try_assign_access_sms_traffic(
         &mut self,
         fwd_address: &MsAddress,
@@ -121,7 +110,6 @@ impl Bsc {
         }
 
         let cell_params = self.serving_params(fwd_address);
-        let cell = cell_params.cell;
         let bts_client = self.serving_client(fwd_address);
         let ack_deadline = self.access_ack_deadline(event);
 
@@ -154,11 +142,10 @@ impl Bsc {
                 super::access::access_response_tx_time(event),
                 ack_deadline,
             ) {
-                Ok(correlation_id) => {
+                Ok(()) => {
                     self.mobiles.update(fwd_address, |ms| {
                         ms.mark_traffic_channel_assigned(walsh_code);
                     });
-                    self.track_assignment_delivery(cell, walsh_code, correlation_id);
                 }
                 Err(e) => {
                     log::warn!(
@@ -304,9 +291,6 @@ impl Bsc {
             super::access::access_response_tx_time(event),
             ack_deadline,
         );
-        if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
-        }
         if let Err(e) = assignment {
             log::warn!(
                 "BSC: failed to send Channel Assignment for {}: {}",
@@ -470,9 +454,6 @@ impl Bsc {
             None,
             None,
         );
-        if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
-        }
         if let Err(e) = assignment {
             log::warn!(
                 "BSC: oversize escalation: failed to send Channel Assignment for {}: {}",
@@ -707,9 +688,6 @@ impl Bsc {
             super::access::access_response_tx_time(event),
             ack_deadline,
         );
-        if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
-        }
         if let Err(e) = assignment {
             log::warn!(
                 "BSC: failed to send packet-data Channel Assignment for {}: {}",
@@ -746,7 +724,6 @@ impl Bsc {
         a1_call_id: Option<u64>,
     ) -> Result<(), Error> {
         let cell_params = self.serving_params(fwd_address);
-        let cell = cell_params.cell;
         let bts_client = self.serving_client(fwd_address);
         let Some(esn) = self.mobiles.get(fwd_address).map(|ms| ms.esn.unwrap_or(0)) else {
             return Err("mobile no longer registered".into());
@@ -867,9 +844,6 @@ impl Bsc {
             requested_tx_time,
             tx_deadline,
         );
-        if let Ok(correlation_id) = &assignment {
-            self.track_assignment_delivery(cell, walsh_code, *correlation_id);
-        }
         if let Err(e) = assignment {
             let bearer = self.config.msc_voice_bearer.clone();
             self.mobiles.update(fwd_address, |ms| {
@@ -915,7 +889,7 @@ impl TrafficAssignmentService {
         assigned_rcs: Option<(u8, u8)>,
         _requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
         _tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
-    ) -> Result<Option<u32>, Error> {
+    ) -> Result<(), Error> {
         let pilot_offset = cell_params.pilot_offset;
         let overhead = &cell_params.overhead;
         let (
@@ -1102,18 +1076,12 @@ impl TrafficAssignmentService {
 
         let sdu = message.to_sdu();
 
-        let ack_req = msg_id != MessageId::ChannelAssignment;
-        let correlation_id = access_tx.send_directed_fpch(
-            Some(cell_params.cell),
-            addr,
-            msg_id,
-            message,
-            sdu,
-            ack_req,
-        )?;
+        // The BSC learns the assignment arrived when the mobile appears on the
+        // reverse traffic channel, so neither message requests a Layer 2 ack.
+        access_tx.send_directed_fpch(Some(cell_params.cell), addr, msg_id, message, sdu, false)?;
 
         info!(
-            "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={}, ack_req={})",
+            "BSC: sending {} (assign_mode=0b{:03b}, walsh={}, ack_seq={})",
             if msg_id == MessageId::ExtChannelAssignment {
                 "Extended Channel Assignment Message"
             } else {
@@ -1122,9 +1090,8 @@ impl TrafficAssignmentService {
             assign_mode,
             code_chan,
             ack_msg_seq,
-            ack_req,
         );
-        Ok(ack_req.then_some(correlation_id))
+        Ok(())
     }
 }
 

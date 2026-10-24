@@ -46,11 +46,24 @@ pub(crate) struct AccessService;
 /// is cleared before processing the next access PDU.
 pub(crate) const ACCESS_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Must stay well inside the mobile's access acknowledgment timeout.
+pub(crate) const BS_ACK_HOLD: Duration = Duration::from_millis(100);
+
+struct HeldBsAck {
+    cell: Option<AccessCellId>,
+    addr: MsAddress,
+    ack_msg_seq: u8,
+    due: tokio::time::Instant,
+    requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
+    tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
+}
+
 /// Forward common-channel transmit side. Every send names the cell it is
 /// destined for. `None` resolves to the sole enrolled cell.
 #[derive(Clone)]
 pub(crate) struct AccessTx {
     pub(crate) bts: Arc<BtsRegistry>,
+    held_bs_acks: Arc<parking_lot::Mutex<Vec<HeldBsAck>>>,
 }
 
 pub(crate) enum AccessDuplicateDecision {
@@ -60,7 +73,83 @@ pub(crate) enum AccessDuplicateDecision {
 
 impl AccessTx {
     pub(crate) fn new(bts: Arc<BtsRegistry>) -> Self {
-        Self { bts }
+        Self {
+            bts,
+            held_bs_acks: Arc::default(),
+        }
+    }
+
+    /// Any directed F-PCH message to the mobile within the hold carries the
+    /// acknowledgment, and the order is dropped.
+    pub(crate) fn hold_bs_ack_order(
+        &self,
+        cell: Option<AccessCellId>,
+        addr: &MsAddress,
+        ack_msg_seq: u8,
+        requested_tx_time: Option<cdma_common::time::CdmaSystemTime>,
+        tx_deadline: Option<cdma_common::time::CdmaSystemTime>,
+    ) {
+        debug!(
+            "BSC: holding Base Station Acknowledgment Order (ack_seq={}) for {} up to {} ms",
+            ack_msg_seq,
+            format_ms_address(addr),
+            BS_ACK_HOLD.as_millis(),
+        );
+        let mut held = self.held_bs_acks.lock();
+        held.retain(|ack| ack.addr != *addr);
+        held.push(HeldBsAck {
+            cell,
+            addr: addr.clone(),
+            ack_msg_seq,
+            due: tokio::time::Instant::now() + BS_ACK_HOLD,
+            requested_tx_time,
+            tx_deadline,
+        });
+    }
+
+    pub(crate) fn next_held_bs_ack_due(&self) -> Option<tokio::time::Instant> {
+        self.held_bs_acks.lock().iter().map(|ack| ack.due).min()
+    }
+
+    pub(crate) fn send_due_bs_acks(&self, now: tokio::time::Instant) {
+        let due: Vec<HeldBsAck> = {
+            let mut held = self.held_bs_acks.lock();
+            let (due, waiting) = std::mem::take(&mut *held)
+                .into_iter()
+                .partition(|ack| ack.due <= now);
+            *held = waiting;
+            due
+        };
+        for ack in due {
+            info!(
+                "BSC: no directed message to {} within {} ms, sending held BS Ack",
+                format_ms_address(&ack.addr),
+                BS_ACK_HOLD.as_millis(),
+            );
+            if let Err(e) = self.send_bs_ack_order(
+                ack.cell,
+                &ack.addr,
+                ack.ack_msg_seq,
+                ack.requested_tx_time,
+                ack.tx_deadline,
+            ) {
+                warn!("BSC: failed to send held BS Ack: {}", e);
+            }
+        }
+    }
+
+    fn release_held_bs_ack(&self, addr: &MsAddress, wire_msg_type: u8) {
+        let mut held = self.held_bs_acks.lock();
+        let Some(pos) = held.iter().position(|ack| ack.addr == *addr) else {
+            return;
+        };
+        let ack = held.swap_remove(pos);
+        info!(
+            "BSC: BS Ack (ack_seq={}) for {} carried by directed message type 0x{:02X}",
+            ack.ack_msg_seq,
+            format_ms_address(addr),
+            wire_msg_type,
+        );
     }
 
     pub(crate) fn send_directed_fpch(
@@ -76,6 +165,7 @@ impl AccessTx {
             .wire_type(cdma_common::lac::message_types::WireChannel::ForwardCommon)
             .unwrap_or(0);
         let correlation_id = self.send_pch_for_directed(cell, addr, wire_msg_type, &sdu, ack_req);
+        self.release_held_bs_ack(addr, wire_msg_type);
         Ok(correlation_id)
     }
 
@@ -1009,16 +1099,13 @@ impl AccessService {
                 None
             };
             if let Some(a1_kind) = a1_kind {
-                if let Err(e) = bsc.access_tx.send_bs_ack_order(
+                bsc.access_tx.hold_bs_ack_order(
                     event.cell,
                     &fwd_address,
                     last_msg_seq,
                     access_response_tx_time(event),
                     bsc.access_ack_deadline(event),
-                ) {
-                    warn!("BSC: failed to send BS Ack for A1 origination: {}", e);
-                    return;
-                }
+                );
                 let called_number =
                     (!origination_digits.is_empty()).then_some(origination_digits.as_str());
                 if bsc
@@ -1099,15 +1186,13 @@ impl AccessService {
 
             let session_id =
                 bsc.start_msc_controlled_mo_session(&fwd_address, target_so, digits.clone());
-            if let Err(e) = bsc.access_tx.send_bs_ack_order(
+            bsc.access_tx.hold_bs_ack_order(
                 event.cell,
                 &fwd_address,
                 last_msg_seq,
                 access_response_tx_time(event),
                 bsc.access_ack_deadline(event),
-            ) {
-                warn!("BSC: failed to send BS Ack for MO A1 origination: {}", e);
-            }
+            );
             let called_number = (!digits.is_empty()).then_some(digits.as_str());
             if bsc
                 .send_complete_layer3_for_origination(
