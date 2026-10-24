@@ -35,6 +35,7 @@
       "mn_ha_spi": 1234,
       "mn_ha_secret_base64": "c2VjcmV0",
       "allow_unverified_mn_aaa": true,
+      "mn_ha_fallback_to_simple_ip": true,
       "home_address_pool": null
     }
   },
