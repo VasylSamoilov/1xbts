@@ -21,32 +21,14 @@ fn degraded(label: &str, detail: impl std::fmt::Display) {
 }
 
 pub(crate) fn apply_tx(settings: &RealtimeSettings) {
-    apply_current(
-        "bts-tx",
-        settings,
-        settings.tx_priority,
-        settings.tx_cpu,
-        true,
-    );
+    apply_current("bts-tx", settings, settings.tx_priority, settings.tx_cpu);
 }
 
 pub(crate) fn apply_rx(settings: &RealtimeSettings) {
-    apply_current(
-        "bts-rx",
-        settings,
-        settings.rx_priority,
-        settings.rx_cpu,
-        true,
-    );
+    apply_current("bts-rx", settings, settings.rx_priority, settings.rx_cpu);
 }
 
-fn apply_current(
-    label: &str,
-    settings: &RealtimeSettings,
-    priority: i32,
-    cpu: Option<usize>,
-    hard_rt: bool,
-) {
+fn apply_current(label: &str, settings: &RealtimeSettings, priority: i32, cpu: Option<usize>) {
     if !settings.enabled {
         info!("{label}: real-time scheduling disabled");
         return;
@@ -54,18 +36,16 @@ fn apply_current(
 
     #[cfg(not(target_os = "linux"))]
     let _ = priority;
-    #[cfg(not(target_os = "macos"))]
-    let _ = hard_rt;
 
     #[cfg(target_os = "linux")]
     apply_linux(label, priority, cpu);
 
     #[cfg(target_os = "macos")]
-    apply_macos(label, hard_rt, cpu);
+    apply_macos(label, cpu);
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (priority, cpu, hard_rt);
+        let _ = (priority, cpu);
         degraded(label, "real-time scheduling is unsupported on this OS");
     }
 }
@@ -147,11 +127,11 @@ fn apply_linux(label: &str, priority: i32, cpu: Option<usize>) {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos(label: &str, hard_rt: bool, cpu: Option<usize>) {
+fn apply_macos(label: &str, cpu: Option<usize>) {
     if cpu.is_some() {
         warn!("{label}: CPU affinity is not available through the macOS pthread API");
     }
-    if hard_rt && apply_macos_time_constraint(label) {
+    if apply_macos_time_constraint(label) {
         return;
     }
     apply_macos_qos(label);
@@ -292,172 +272,114 @@ fn apply_macos_time_constraint(label: &str) -> bool {
     }
 }
 
+/// Raises the current thread while a radio driver spawns its workers, so they
+/// inherit the elevated scheduling, and restores it on drop.
+///
+/// Linux threads inherit `SCHED_FIFO` and CPU affinity from their creator. macOS
+/// threads created by `pthread_create` start at `QOS_CLASS_DEFAULT` whatever the
+/// creator runs at, so the guard does nothing there.
 pub(crate) struct DriverPriorityGuard {
     #[cfg(target_os = "linux")]
-    original_policy: i32,
-    #[cfg(target_os = "linux")]
-    original_param: libc::sched_param,
-    #[cfg(target_os = "linux")]
-    original_affinity: libc::cpu_set_t,
-    #[cfg(target_os = "macos")]
-    original_qos: libc::qos_class_t,
-    #[cfg(target_os = "macos")]
-    original_relative_priority: i32,
-    active: bool,
+    saved: Option<LinuxSchedState>,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxSchedState {
+    label: &'static str,
+    policy: i32,
+    param: libc::sched_param,
+    affinity: libc::cpu_set_t,
 }
 
 impl DriverPriorityGuard {
-    pub(crate) fn enter(label: &str, settings: &RealtimeSettings) -> Self {
-        if !settings.enabled {
-            return Self::inactive();
-        }
-
+    pub(crate) fn enter(label: &'static str, settings: &RealtimeSettings) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let mut original_policy = 0;
-            let mut original_param = libc::sched_param { sched_priority: 0 };
-            let mut original_affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            let read = unsafe {
-                libc::pthread_getschedparam(
-                    libc::pthread_self(),
-                    &mut original_policy,
-                    &mut original_param,
-                )
-            };
-            if read != 0 {
-                degraded(
-                    label,
-                    format!("could not read original scheduling (errno={read})"),
-                );
-                return Self::inactive();
-            }
-            let affinity_read = unsafe {
-                libc::pthread_getaffinity_np(
-                    libc::pthread_self(),
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &mut original_affinity,
-                )
-            };
-            if affinity_read != 0 {
-                degraded(
-                    label,
-                    format!("could not read original CPU affinity (errno={affinity_read})"),
-                );
-                return Self::inactive();
-            }
-            apply_current(
-                label,
-                settings,
-                settings.driver_priority,
-                settings.driver_cpu,
-                false,
-            );
             Self {
-                original_policy,
-                original_param,
-                original_affinity,
-                active: true,
+                saved: settings
+                    .enabled
+                    .then(|| enter_linux(label, settings))
+                    .flatten(),
             }
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         {
-            let mut original_qos = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
-            let mut original_relative_priority = 0;
-            // SAFETY: Both output pointers refer to live storage for the native QoS query.
-            let read = unsafe {
-                libc::pthread_get_qos_class_np(
-                    libc::pthread_self(),
-                    &mut original_qos,
-                    &mut original_relative_priority,
-                )
-            };
-            if read != 0 {
-                degraded(label, format!("could not read original QoS (errno={read})"));
-                return Self::inactive();
-            }
-            apply_current(label, settings, settings.driver_priority, None, false);
-            Self {
-                original_qos,
-                original_relative_priority,
-                active: true,
-            }
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = label;
-            Self::inactive()
-        }
-    }
-
-    fn inactive() -> Self {
-        Self {
-            #[cfg(target_os = "linux")]
-            original_policy: 0,
-            #[cfg(target_os = "linux")]
-            original_param: libc::sched_param { sched_priority: 0 },
-            #[cfg(target_os = "linux")]
-            original_affinity: unsafe { std::mem::zeroed() },
-            #[cfg(target_os = "macos")]
-            original_qos: libc::qos_class_t::QOS_CLASS_UNSPECIFIED,
-            #[cfg(target_os = "macos")]
-            original_relative_priority: 0,
-            active: false,
+            let _ = (label, settings);
+            Self {}
         }
     }
 }
 
+#[cfg(target_os = "linux")]
+fn enter_linux(label: &'static str, settings: &RealtimeSettings) -> Option<LinuxSchedState> {
+    let mut policy = 0;
+    let mut param = libc::sched_param { sched_priority: 0 };
+    let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let read =
+        unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
+    if read != 0 {
+        degraded(
+            label,
+            format!("could not read original scheduling (errno={read})"),
+        );
+        return None;
+    }
+    let affinity_read = unsafe {
+        libc::pthread_getaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut affinity,
+        )
+    };
+    if affinity_read != 0 {
+        degraded(
+            label,
+            format!("could not read original CPU affinity (errno={affinity_read})"),
+        );
+        return None;
+    }
+    apply_current(
+        label,
+        settings,
+        settings.driver_priority,
+        settings.driver_cpu,
+    );
+    Some(LinuxSchedState {
+        label,
+        policy,
+        param,
+        affinity,
+    })
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for DriverPriorityGuard {
     fn drop(&mut self) {
-        if !self.active {
+        let Some(saved) = self.saved.take() else {
             return;
+        };
+        let ret = unsafe {
+            libc::pthread_setschedparam(libc::pthread_self(), saved.policy, &saved.param)
+        };
+        if ret != 0 {
+            degraded(
+                saved.label,
+                format!("failed to restore scheduling (errno={ret})"),
+            );
         }
-        #[cfg(target_os = "linux")]
-        {
-            let ret = unsafe {
-                libc::pthread_setschedparam(
-                    libc::pthread_self(),
-                    self.original_policy,
-                    &self.original_param,
-                )
-            };
-            if ret != 0 {
-                degraded(
-                    "radio-driver-init",
-                    format!("failed to restore scheduling (errno={ret})"),
-                );
-            }
-            let affinity_ret = unsafe {
-                libc::pthread_setaffinity_np(
-                    libc::pthread_self(),
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &self.original_affinity,
-                )
-            };
-            if affinity_ret != 0 {
-                degraded(
-                    "radio-driver-init",
-                    format!("failed to restore CPU affinity (errno={affinity_ret})"),
-                );
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let restore_qos = match self.original_qos {
-                libc::qos_class_t::QOS_CLASS_UNSPECIFIED => libc::qos_class_t::QOS_CLASS_DEFAULT,
-                qos => qos,
-            };
-            // SAFETY: These QoS settings were read from this thread before changing its priority.
-            let ret = unsafe {
-                libc::pthread_set_qos_class_self_np(restore_qos, self.original_relative_priority)
-            };
-            if ret != 0 {
-                degraded(
-                    "radio-driver-init",
-                    format!("failed to restore QoS (ret={ret})"),
-                );
-            }
+        let affinity_ret = unsafe {
+            libc::pthread_setaffinity_np(
+                libc::pthread_self(),
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &saved.affinity,
+            )
+        };
+        if affinity_ret != 0 {
+            degraded(
+                saved.label,
+                format!("failed to restore CPU affinity (errno={affinity_ret})"),
+            );
         }
     }
 }
