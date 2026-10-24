@@ -562,7 +562,7 @@ impl HrpdReverseFingerSpawnStrategy for HrpdAccessFrameSpawnStrategy {
         let replay_end_sample = buffer_abs_signed + buffer.len() as i64;
         let id = self.next_finger_id;
         self.next_finger_id += 1;
-        info!(
+        debug!(
             "HRPD access frame FFT rake: spawning preamble finger id={} snr={:.2}x/{:.2}dB preamble_start={} packet_start={} acn={} sample_delay={}{:+.2} lag_coh={:.3} spec_coh={:.3}",
             id,
             hit.snr,
@@ -963,7 +963,7 @@ impl HrpdAccessFrameFinger {
                     )],
                 )];
                 {
-                    info!(
+                    debug!(
                         "HRPD access frame finger {}: decoded packet_start={} mode={} fragments={} timing_idx={}/{} decode_attempts={} sample_delay={}{:+.2} lag_coh={:.3} spec_coh={:.3}",
                         self.base.id,
                         packet_start_chip,

@@ -1271,7 +1271,7 @@ impl Bts {
                         }
                     }
                     for request in hrpd_pending_signaling.drain(..) {
-                        info!(
+                        debug!(
                             "HRPD forward signaling enqueue: channel={:?} protocol=0x{:02x} target={:?} payload_octets={}",
                             request.channel,
                             request.protocol_type,

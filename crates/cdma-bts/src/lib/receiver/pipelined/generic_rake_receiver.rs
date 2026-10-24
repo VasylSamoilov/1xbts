@@ -922,13 +922,13 @@ impl<C: Correlator> GenericRakeReceiver<C> {
             }
             let desc = finger.describe();
             if desc.is_empty() {
-                info!(
+                debug!(
                     "GenericRakeReceiver: spawning finger {} (total active: {})",
                     finger.id(),
                     self.fingers.len() + 1,
                 );
             } else {
-                info!(
+                debug!(
                     "GenericRakeReceiver: spawning finger {} (total active: {}) [{}]",
                     finger.id(),
                     self.fingers.len() + 1,
@@ -1188,7 +1188,7 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                 || af.finger.should_retire()
                 || self.prune_policy.should_prune(&af.finger);
             if should_drop {
-                info!(
+                debug!(
                     "GenericRakeReceiver: pruning finger {} (decoded_access_message={}, idle_blocks={}, idle_chips={}, validated={}, crc_misses={}, post_walsh_no_event_chips={}, post_walsh_no_event_ms={}, post_walsh_misses={}, signal_lost_chips={}) [{}]",
                     af.finger.id(),
                     af.decoded_access_message,
@@ -1208,7 +1208,7 @@ impl<C: Correlator> GenericRakeReceiver<C> {
                     if !m.is_empty() {
                         let pairs: Vec<String> =
                             m.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                        info!("  {} metrics: {}", stage.name(), pairs.join(" "));
+                        debug!("  {} metrics: {}", stage.name(), pairs.join(" "));
                     }
                 }
                 removed_ids.push(af.finger.id());

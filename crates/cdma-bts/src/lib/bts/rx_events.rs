@@ -5,7 +5,7 @@ use cdma_common::{
     paging::{imsi_11_12_to_digits, imsi_s_to_digits_checked, mcc_to_digits},
     time,
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::lac::message_types::MessageId;
 use crate::receiver::{
@@ -306,7 +306,7 @@ pub(super) fn build_traffic_event(
     let pdu_summary = rdsch.summary();
     let valid_ack = true;
 
-    info!(
+    debug!(
         "rx: traffic event on walsh={} payload_bits={} rdsch={}",
         walsh_code,
         payload_bits.len(),

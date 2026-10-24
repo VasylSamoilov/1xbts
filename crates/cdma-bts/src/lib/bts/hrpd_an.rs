@@ -30,7 +30,7 @@ use cdma_common::hrpd::air as hrpd_air;
 use cdma_pcf::spawn_hrpd_pcf_a9_service;
 #[cfg(test)]
 use cdma_pdsn::spawn_pdsn_a11_service;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::Mutex;
 
 // HRPD default-packet protocol/RLP codes and A9/A8 orchestration constants.
@@ -1544,7 +1544,7 @@ async fn hrpd_an_access_task(
             }
         }
         if count > 0 {
-            info!("HRPD AN: queued {count} forward signaling message(s)");
+            debug!("HRPD AN: queued {count} forward signaling message(s)");
         }
         let count = outcome.forward_traffic.len();
         for packet in outcome.forward_traffic {

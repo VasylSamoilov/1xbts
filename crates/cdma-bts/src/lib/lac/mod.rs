@@ -655,7 +655,7 @@ impl Layer2Lac {
                         .map(|chip| (chip_cursor as i128 - chip as i128) as f64 / 1228.8);
                     let tx_minus_deadline_ms = deadline_chip
                         .map(|chip| (chip_cursor as i128 - chip as i128) as f64 / 1228.8);
-                    info!(
+                    debug!(
                         "lac_fpch_pdu_done: tag={} tx_chip={} slot_num={} sdu_bits={} req_chip={:?} deadline_chip={:?} turnaround_us={:?} deadline_margin_us={:?} tx_minus_req_ms={:?} tx_minus_deadline_ms={:?}",
                         front.message.mcsb.message_id.tag(),
                         chip_cursor,
@@ -952,7 +952,7 @@ impl Layer2Lac {
                             .map(|ts| cdma_common::time::chips_since_epoch(ts, 1_228_800));
                         let indication_chip =
                             cdma_common::time::chips_since_epoch(indication.system_time, 1_228_800);
-                        info!(
+                        debug!(
                             "lac_fpch_avail: queued_pdus={} chip={} tag={} sendable_now={} req_chip={:?} deadline_chip={:?} indication_chip={} frame_start_sent={} queue={}",
                             queued_count,
                             indication.chip_cursor,
@@ -1209,7 +1209,7 @@ impl Layer2Lac {
                 let pdu = utility_assemble_f_csch(&data_request)?;
                 if data_request.mcsb.address.is_some() {
                     let pdu_hex = pdu.to_packed_bytes();
-                    info!(
+                    debug!(
                         "LAC assemble_pdu: directed f-csch msg_id={:?} msg_type=0x{:02X} addr={:?} ack_seq={} msg_seq={} ack_req={} valid_ack={} pdu={:02X?} ({} bits, sdu={} bits)",
                         data_request.mcsb.message_id,
                         pdu_hex.first().copied().unwrap_or(0),
@@ -1226,7 +1226,7 @@ impl Layer2Lac {
                     && data_request.mcsb.length_bits > 24
                 {
                     let pdu_hex = pdu.to_packed_bytes();
-                    info!(
+                    debug!(
                         "LAC assemble_pdu: broadcast f-csch GPM msg_type=0x{:02X} sdu_bits={} pdu={:02X?} ({} bits)",
                         pdu_hex.first().copied().unwrap_or(0),
                         data_request.sdu.len(),

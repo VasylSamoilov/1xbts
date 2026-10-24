@@ -1,5 +1,5 @@
 use cdma_common::{bits::Bitstream, error::Error, time};
-use log::{info, trace};
+use log::{debug, trace};
 
 use crate::{
     channels::{
@@ -175,7 +175,7 @@ pub(super) fn handle_paging_frame(
         },
     });
     if from_mac && fragment.mcsb.address.is_some() {
-        info!(
+        debug!(
             "bts_fpch_tx: tag={} size={} half_frames={} tx_chip={} tx_hw_tick={}",
             fragment.mcsb.message_id.tag(),
             fragment.size,

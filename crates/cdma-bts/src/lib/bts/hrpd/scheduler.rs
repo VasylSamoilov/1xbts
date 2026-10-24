@@ -448,7 +448,7 @@ impl HrpdForwardScheduler {
         if let Some(sequence_number) = pkt.rtc_ack_sequence_number
             && self.has_pending_rtc_ack(pkt.mac_index, sequence_number)
         {
-            log::info!(
+            log::debug!(
                 "rx_hrpd_traffic[m{}]: coalescing duplicate RTCAck seq={} already queued or active",
                 pkt.mac_index,
                 sequence_number
@@ -991,7 +991,7 @@ impl HrpdForwardScheduler {
                     );
                 }
                 if let Some(sequence_number) = scheduled_rtc_ack_seq {
-                    log::info!(
+                    log::debug!(
                         "rx_hrpd_traffic[m{}]: scheduling RTCAck packet_id={} seq={} start_slot={} drc=0x{:x} payload_bits={} slots={} exact_drc={} latest_drc={}",
                         state.packet.mac_index,
                         packet_id,

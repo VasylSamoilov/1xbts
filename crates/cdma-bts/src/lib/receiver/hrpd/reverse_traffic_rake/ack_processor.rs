@@ -307,7 +307,7 @@ impl HrpdReverseTrafficAckProcessor {
             .issue_last_pilot_amplitude
             .map(|amp| format!("{amp:.2e}"))
             .unwrap_or_else(|| "n/a".to_string());
-        log::warn!(
+        log::debug!(
             "rx_hrpd_traffic[m{}]: harq_ack_issues window_start_slot={} window_slots={} missing={} nak={} pilot_unlocked={} short_frame={} last_frame_slot={} pending={} pilot_amp={} pilot_coh={:.3}",
             mac_index,
             start_slot,
@@ -532,12 +532,7 @@ impl PipelineProcessor for HrpdReverseTrafficAckProcessor {
                         AckSymbol::Gated => {}
                     }
                 }
-                log::log!(
-                    if symbol == AckSymbol::Nak {
-                        log::Level::Info
-                    } else {
-                        log::Level::Trace
-                    },
+                log::trace!(
                     "HRPD ACK decode: slot={slot_idx} soft={:.3} threshold={:.3} symbol={symbol:?} terminal={}",
                     soft_profile[slot_idx as usize],
                     decoder.threshold(),

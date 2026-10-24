@@ -4941,7 +4941,7 @@ fn build_traffic_event(
     let pdu_summary = rdsch.summary();
     let valid_ack = true;
 
-    info!(
+    debug!(
         "rx: traffic event on walsh={} payload_bits={} rdsch={}",
         walsh_code,
         payload_bits.len(),

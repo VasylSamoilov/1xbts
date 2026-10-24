@@ -2190,7 +2190,7 @@ impl PnLcFinger {
             // Pilot timing is part of the live RC3 tracking loop.  Keep its
             // one-line-per-second state visible at the normal log level so a
             // field run shows the discriminator and applied slews directly.
-            info!(
+            trace!(
                 "EPL_TRACK[finger={}] sec#{} windows={} N={} chips={} mode=pilot | \
                  env: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  env_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
@@ -2242,7 +2242,7 @@ impl PnLcFinger {
             let recent_frames = u64::from(self.epl_nonpilot_fer_frames);
             let recent_invalid = u64::from(self.epl_nonpilot_fer_bits.count_ones());
 
-            info!(
+            trace!(
                 "EPL_TRACK[finger={}] sec#{} windows={} N={} chips={} mode=coh4 | \
                  env: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \
                  env_win: E={:.3e} P={:.3e} L={:.3e} (E-L)/P={:+.4} | \

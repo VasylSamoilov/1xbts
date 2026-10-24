@@ -1241,7 +1241,7 @@ impl HrpdAirController {
                     match self.parse_stream0_default_signaling_for_uati(*uati, payload) {
                         Stream0ParseOutcome::Complete(parsed) => {
                             if let Some(ack_sequence_number) = parsed.ack_sequence_number {
-                                log::info!(
+                                log::debug!(
                                     "HRPD AN: received reverse Stream0 SLP-D ACK UATI=0x{uati:08x} ack_seq={ack_sequence_number}"
                                 );
                                 let acked_labels = Self::mark_reliable_stream0_acknowledged(
@@ -1318,7 +1318,7 @@ impl HrpdAirController {
                                                     sequence_number,
                                                 )
                                         {
-                                            log::info!(
+                                            log::debug!(
                                                 "HRPD AN: ACKing reliable reverse Stream-0 signaling UATI=0x{uati:08x} ack_seq={sequence_number}"
                                             );
                                             outcome.forward_traffic.push(packet);
@@ -1689,7 +1689,7 @@ impl HrpdAirController {
                                 && let Some(packet) =
                                     self.build_slp_d_ack_packet_for_uati(at, *uati, sequence_number)
                             {
-                                log::info!(
+                                log::debug!(
                                     "HRPD AN: ACKing reliable reverse Stream-0 signaling UATI=0x{uati:08x} ack_seq={sequence_number}"
                                 );
                                 outcome.forward_traffic.push(packet);
@@ -2464,7 +2464,7 @@ impl HrpdAirController {
             None,
         ) {
             pending.rtc_ack_needs_send = true;
-            log::info!(
+            log::debug!(
                 "HRPD AN: prequeueing setup RTCAck UATI=0x{traffic_uati:08x} MAC={mac_index}; scheduler will bind exact governing DRC"
             );
             outcome.forward_traffic.push(packet);
@@ -3095,25 +3095,25 @@ impl HrpdAirController {
             return;
         };
         if let Some(trace) = &pending.session_config_trace {
-            log::info!(
+            log::debug!(
                 "HRPD AN: config trace UATI=0x{uati:08x} reason={reason} session_tx=0x{:02x} session_req={} session_rsp={}",
                 trace.transaction_id,
                 bytes_to_hex(&trace.request_attrs),
                 bytes_to_hex(&trace.response_attrs)
             );
         } else {
-            log::info!(
+            log::debug!(
                 "HRPD AN: config trace UATI=0x{uati:08x} reason={reason} no SessionConfigurationRequest recorded"
             );
         }
         if pending.protocol_config_traces.is_empty() {
-            log::info!(
+            log::debug!(
                 "HRPD AN: config trace UATI=0x{uati:08x} reason={reason} no per-protocol ConfigurationRequest recorded"
             );
             return;
         }
         for trace in &pending.protocol_config_traces {
-            log::info!(
+            log::debug!(
                 "HRPD AN: config trace UATI=0x{uati:08x} reason={reason} protocol=0x{:02x}/{} tx=0x{:02x} req={} rsp={}",
                 trace.protocol_type,
                 stream0_protocol_name(trace.protocol_type),
@@ -3427,7 +3427,7 @@ impl HrpdAirController {
             pending.in_use_forward_traffic_mac_subtype,
         ) {
             Ok(payload_bits) => {
-                log::info!(
+                log::debug!(
                     "HRPD AN: queueing Stream0 SLP-D ACK UATI=0x{uati:08x} MAC={mac_index} ack_seq={sequence_number} drc_index=0x{drc_index:x} physical_subtype=0x{:04x} ftc_mac_subtype=0x{:04x} payload_bits={physical_packet_bits}",
                     pending.in_use_physical_layer_subtype,
                     pending.in_use_forward_traffic_mac_subtype,
@@ -4968,7 +4968,7 @@ impl HrpdAirController {
             .retain(|packet| packet.sequence_number != ack_sequence_number);
         let removed = before.saturating_sub(pending.reliable_stream0_tx.len());
         if removed > 0 {
-            log::info!(
+            log::debug!(
                 "HRPD AN: Stream0 reliable forward ACKed UATI=0x{uati:08x} ack_seq={ack_sequence_number} labels={labels:?} removed={removed} pending={}",
                 pending.reliable_stream0_tx.len()
             );
@@ -5473,7 +5473,7 @@ impl HrpdAirController {
             return;
         };
         if !pending.rtc_ack_delivered {
-            log::info!(
+            log::debug!(
                 "HRPD AN: RTCAck physically ACKed UATI=0x{uati:08x}; marking RTCAck delivered"
             );
         }

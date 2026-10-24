@@ -2153,7 +2153,7 @@ impl HrpdAnA8Actor {
                             self.pending_traffic_setup.remove(&uati);
                         }
                         let Some(session) = self.sessions.get_mut(&uati) else {
-                            info!(
+                            debug!(
                                 "HRPD AN A8: traffic setup pending for unregistered UATI=0x{uati:08x} pending={pending}"
                             );
                             continue;
@@ -2164,7 +2164,7 @@ impl HrpdAnA8Actor {
                             hrpd_a8_note_traffic_setup_pending(session);
                         }
                         if session.traffic_setup_pending != was_pending {
-                            info!(
+                            debug!(
                                 "HRPD AN A8: traffic setup pending UATI=0x{uati:08x} pending={} buffered_chunks={}",
                                 session.traffic_setup_pending,
                                 session.pending_downlink.len()

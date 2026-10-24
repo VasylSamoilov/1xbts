@@ -1256,7 +1256,7 @@ impl Bsc {
             // pilot strengths. Drive the forward power-control outer loop with
             // the FCH portion (errors_detected / pwr_meas_frames).
             if let Some(AccessMessage::PowerMeasurementReport(ref m)) = event.decoded_l3 {
-                info!(
+                debug!(
                     "BSC: received PMRM on R-TCH walsh={} errors={} frames={} last_hdm_seq={} pilots={:?}",
                     walsh_code,
                     m.errors_detected,
@@ -1300,7 +1300,12 @@ impl Bsc {
                             )
                         })
                         .collect();
-                    info!(
+                    log::log!(
+                        if updated {
+                            log::Level::Info
+                        } else {
+                            log::Level::Debug
+                        },
                         "BSC: [forward power walsh={}] PMRM fer={:.2}% \
                          (errors={} frames={}) Δ={} fast_start={} \
                          pilots_ec_io=[{}] → gain_offset={:+.2} dB applied={} (linear={:.5})",

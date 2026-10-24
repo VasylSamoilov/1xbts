@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use cdma_abis::control::typed::{
     A3ConnectInformation, BurstCommitMessage, BurstRequestMessage, BurstResponseMessage, CellId,
@@ -247,7 +247,7 @@ impl AbisAgent {
         let Some(corr_id) = corr_id else {
             return Vec::new();
         };
-        info!(
+        debug!(
             "abis_agent: L2 ack notify correlation_id={} ack_seq={}",
             corr_id, ack_seq
         );
@@ -888,7 +888,7 @@ impl AbisAgent {
         let correlation_id = pch.correlation_id.map(|c| c.0);
         let ack_notify = pch.abis_ack_notify.is_some();
 
-        info!(
+        debug!(
             "abis_agent: PCH transfer accepted assignment={} corr={:?} l2_ack_req={} ack_notify={} mobiles={} aim_type={:?} aim_bytes={}",
             is_assignment,
             correlation_id,

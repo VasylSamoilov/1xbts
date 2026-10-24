@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -17,7 +18,7 @@ const HRPD_ERASURE_STEP_UP_DB: f32 = 0.25;
 const HRPD_OUTER_LOOP_MIN_SUCCESSES: u64 = 10;
 const HRPD_TUNE_AWAY_RETURN_SUCCESSES: u8 = 10;
 const HRPD_PER_WINDOW_PACKETS: usize = 500;
-const HRPD_OUTER_SUMMARY_PACKETS: u64 = 64;
+const HRPD_OUTER_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HrpdTransmissionMode {
@@ -134,6 +135,7 @@ struct AssignmentState {
     packets_late_success: u64,
     tune_away_active: bool,
     return_successes_remaining: u8,
+    last_summary_at: Instant,
 }
 
 impl AssignmentState {
@@ -148,6 +150,7 @@ impl AssignmentState {
             packets_excluded: 0,
             packets_tune_away_excluded: 0,
             packets_late_success: 0,
+            last_summary_at: Instant::now(),
             tune_away_active: false,
             return_successes_remaining: 0,
         }
@@ -342,10 +345,14 @@ impl HrpdPowerControlHandle {
         let previous_target = state.target_db;
         state.observe(observation);
         let snapshot = state.snapshot(self.key);
+        let now = Instant::now();
+        let report_summary =
+            now.duration_since(state.last_summary_at) >= HRPD_OUTER_SUMMARY_INTERVAL;
+        if report_summary {
+            state.last_summary_at = now;
+        }
         drop(registry);
         let target_changed = (snapshot.target_db - previous_target).abs() > f32::EPSILON;
-        let report_summary =
-            snapshot.packets_total != 0 && snapshot.packets_total % HRPD_OUTER_SUMMARY_PACKETS == 0;
         match observation.outcome {
             HrpdPacketOutcome::Erasure if target_changed => log::info!(
                 "hrpd_power[m{}]: packet outcome=erasure uati=0x{:08x} payload={:?} mode={} decoded_subpacket={:?} target_subpackets={:?} late={} target={:.3}->{:.3}dB per={:.2}% ({}/{}) saturated_high={}",

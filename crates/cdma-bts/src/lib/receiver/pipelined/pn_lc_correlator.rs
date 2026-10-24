@@ -40,7 +40,7 @@ pub use finger::PnLcFinger;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use log::{debug, info, trace};
+use log::{debug, trace};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
@@ -2333,7 +2333,7 @@ impl Correlator for PnLcCorrelator {
         let before = self.active_fingers.len();
         self.active_fingers.retain(|f| f.id != finger_id);
         if self.active_fingers.len() < before {
-            info!(
+            debug!(
                 "PnLcCorrelator: finger {} removed, releasing delay suppression",
                 finger_id
             );

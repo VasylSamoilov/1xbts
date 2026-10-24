@@ -5,7 +5,7 @@ use cdma_common::hrpd::air::{
     DEFAULT_ROUTE_UPDATE_PROTOCOL_TYPE, HrpdForwardChannel, HrpdForwardSignalingRequest,
     HrpdTrafficChannelAssignment, HrpdUatiAssignment,
 };
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 use num::complex::Complex32;
 use serde::{Deserialize, Serialize, de};
 use std::net::SocketAddr;
@@ -1146,7 +1146,7 @@ impl HrpdForwardSlotModulator {
             });
             self.last_cycle_loaded = None;
             self.active_mac_overhead_pending = false;
-            info!(
+            debug!(
                 "HRPD overhead active MAC update: active_macs=[] qc_rpc_count=0 ftv=[] reverse_rate_rpc_count=1"
             );
             return;
@@ -1175,7 +1175,7 @@ impl HrpdForwardSlotModulator {
             rate_limit: vec![5; rpc_count as usize],
         });
         if let (Some(qc), Some(rr)) = (&self.quick_config, &self.reverse_rate) {
-            info!(
+            debug!(
                 "HRPD overhead active MAC update: active_macs=[{}] min_mac={} qc_rpc_count={} ftv=[{}] reverse_rate_rpc_count={} limits=[{}]",
                 format_mac_list(&active_mac_indices),
                 min_mac,
@@ -1415,7 +1415,7 @@ impl HrpdForwardSlotModulator {
                 if loaded {
                     if active_mac_overhead_was_pending && has_quick_config {
                         self.active_mac_overhead_in_flight = true;
-                        info!(
+                        debug!(
                             "HRPD active MAC public data queued in QuickConfig slot={} cycle={} messages=[{}]",
                             slot_index,
                             cycle_index,
@@ -1449,7 +1449,7 @@ impl HrpdForwardSlotModulator {
         let hold_traffic_for_active_mac_overhead =
             self.active_mac_overhead_pending && !is_control && !self.scheduler.has_active_packets();
         if hold_traffic_for_active_mac_overhead && !self.active_mac_overhead_hold_logged {
-            log::info!(
+            log::debug!(
                 "HRPD forward traffic hold: waiting for active MAC public data before starting queued traffic slot={}",
                 slot_index
             );

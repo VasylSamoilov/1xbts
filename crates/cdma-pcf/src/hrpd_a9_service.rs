@@ -6,7 +6,7 @@ use std::{
 
 use cdma_a8::HrpdA9ClientConfig;
 use cdma_common::error::Error;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::{PcfEvent, PcfSessionId, PcfSessionPhase, spawn_hrpd_pcf_bearer_relay};
 
@@ -363,7 +363,7 @@ async fn refresh_hrpd_a11_session_after_a8_retarget(
     )
     .await
     {
-        Ok(a11_key) => info!(
+        Ok(a11_key) => debug!(
             "HRPD PCF A11: refreshed retargeted session={session_id:?} key={a11_key:?}; A10 packet state is available for resumed traffic"
         ),
         Err(err) => {
@@ -878,7 +878,7 @@ pub async fn spawn_hrpd_pcf_a9_service(
                         cause: cached_connect.cause,
                         pdsn_ip_address: cached_connect.pdsn_ip_address,
                     };
-                    info!(
+                    debug!(
                         "HRPD PCF A9: retargeting cached ConnectA8 session={:?} key=0x{key:08x} con_ref {} -> {}",
                         session_id, cached_connect.con_ref.0, connect.con_ref.0
                     );
@@ -932,7 +932,7 @@ pub async fn spawn_hrpd_pcf_a9_service(
                     state.connected.remove(&key);
                     warn!("{err}");
                 } else {
-                    info!(
+                    debug!(
                         "HRPD PCF A9: resent cached ConnectA8 session={:?} key=0x{key:08x}",
                         session_id
                     );

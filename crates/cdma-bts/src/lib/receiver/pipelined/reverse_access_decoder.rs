@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use cdma_common::bits::Bitstream;
-use log::{info, trace};
+use log::{debug, info, trace};
 use num_complex::Complex32;
 
 use crate::phy::coding::block_interleaver::{BitReversalInterleaver, SR1_PARAMS_576};
@@ -680,7 +680,7 @@ impl ReverseAccessDecoder {
             if let Some(success) =
                 self.try_reassembly_at_offset(candidate.reassembly_bit_offset, &mut stats)
             {
-                info!(
+                debug!(
                     "reverse_access_decoder: locked symbol_offset={} candidate_frame_idx={} completion_frame_idx={} scored_bit_offset={} chip_start={} crc_frame_bit_offset={} crc_frame_symbol_offset={} crc_frame_chip_start={} crc_frame_mod256={} crc_frame_pn_mod32768={} crc_mode={} crc_repeat_pair_score={}/{} repeat_pair_score={}/{} collapsed_ones={} max_pair_score={}",
                     candidate.sym_mod,
                     candidate.frame_idx,

@@ -324,7 +324,7 @@ impl PagingSupplierState {
             if let Some(corr_id) = correlation_id {
                 self.pending_ack_notifies
                     .insert((ack_addr_type, ack_addr_bytes.clone(), msg_seq), corr_id);
-                info!(
+                debug!(
                     "BTS paging supplier: ack-notify registered msg_seq={} correlation_id={}",
                     msg_seq, corr_id
                 );
@@ -350,7 +350,7 @@ impl PagingSupplierState {
                 overhead_imsi_11_12: self.overhead_imsi_11_12,
             },
         };
-        info!(
+        debug!(
             "BTS paging supplier: queuing directed SDU msg_id={:?} wire_type=0x{:02X} msg_seq={} ack_seq={} ack_req={} valid_ack={} addr={:?} sdu_bytes={:02X?} ({} bits)",
             message_id,
             air_interface_message.message_type,

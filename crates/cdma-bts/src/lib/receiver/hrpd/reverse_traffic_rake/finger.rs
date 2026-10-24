@@ -1704,7 +1704,7 @@ impl HrpdReverseTrafficFinger {
         } else {
             f64::from(stats.turbo_iterations) / f64::from(stats.turbo_attempts)
         };
-        info!(
+        trace!(
             "rx_hrpd_traffic[m{}]: subtype2_subframe_summary uati=0x{:08x} window_start_slot={} window_slots={} total={} low_coherence={} no_rri={} null_rri={} low_margin={} invalid={} non_null_rri={} decoded={} delivered={} mac_parse_failed={} turbo_attempts={} turbo_iterations_avg={:.2} turbo_iterations_max={} arq_on_time={} arq_late={} arq_tx_hits={} arq_latest_tx_slot={}",
             self.config.mac_index,
             self.config.uati,
@@ -2082,7 +2082,7 @@ impl HrpdReverseTrafficFinger {
                     .min(HRPD_TIMING_REACQUIRE_UNRELIABLE_SLOTS);
             }
             if self.timing_unreliable_slots >= HRPD_TIMING_REACQUIRE_UNRELIABLE_SLOTS {
-                info!(
+                trace!(
                     "rx_hrpd_traffic[m{}]: timing_reacquiring uati=0x{:08x} slot={} delay={}+{:+.2} coherence={:.3} raw={:.1}dBFS raw_ref={:.1}dBFS",
                     self.config.mac_index,
                     self.config.uati,
@@ -2115,7 +2115,7 @@ impl HrpdReverseTrafficFinger {
             if self.timing_reacquire_confirm_slots >= HRPD_TIMING_REACQUIRE_CONFIRM_SLOTS {
                 self.timing_state = HrpdTrafficTimingState::Tracking;
                 self.timing_reacquire_confirm_slots = 0;
-                info!(
+                trace!(
                     "rx_hrpd_traffic[m{}]: timing_reacquired uati=0x{:08x} slot={} delay={}+{:+.2} coherence={:.3} raw={:.1}dBFS raw_ref={:.1}dBFS",
                     self.config.mac_index,
                     self.config.uati,
@@ -2288,7 +2288,7 @@ impl HrpdReverseTrafficFinger {
                 self.power_control_tune_away_active = false;
             }
             if self.rpc_unreliable_streak_slots > 0 && self.rpc_unreliable_reported {
-                info!(
+                trace!(
                     "rx_hrpd_traffic[m{}]: rpc_recovered uati=0x{:08x} measured_slot={} previous_start_slot={:?} previous_slots={} coh={:.3} projected_snr={:.2}dB pilot_sinr={:.2}dB fitted={:.2}dB control={:.2}dB slope={:+.3}dB/observation residual={:+.2}dB raw={:.1}dBFS raw_ref={:.1}dBFS",
                     self.config.mac_index,
                     self.config.uati,
@@ -2333,7 +2333,7 @@ impl HrpdReverseTrafficFinger {
             .saturating_sub(self.last_good_pilot_chip)
             .saturating_mul(1000)
             / HRPD_CHIP_RATE_HZ;
-        warn!(
+        debug!(
             "rx_hrpd_traffic[m{}]: rpc_unreliable_streak uati=0x{:08x} start_slot={:?} measured_slot={} slots={} last_good_age_ms={} coh={:.3} projected_snr={:.2}dB pilot_sinr={:.2}dB amp_step={:.2}dB raw={:.1}dBFS raw_ref={:.1}dBFS latest={:.2}dB fitted={:.2}dB slope={:+.3}dB/observation residual={:+.2}dB",
             self.config.mac_index,
             self.config.uati,
@@ -3016,7 +3016,7 @@ impl RakeFinger for HrpdReverseTrafficFinger {
                             if refined_safe {
                                 if self.timing_refine_reports < HRPD_TIMING_TRACK_REPORTS_MAX {
                                     self.timing_refine_reports += 1;
-                                    info!(
+                                    debug!(
                                         "rx_hrpd_traffic[m{}]: timing_refined uati=0x{:08x} frame_chip={} delay={}+{:+.2}->{}+{:+.2} coh={:.3}->{:.3} snr={:.2}->{:.2}dB radius={:.1}",
                                         self.config.mac_index,
                                         self.config.uati,
@@ -3046,7 +3046,7 @@ impl RakeFinger for HrpdReverseTrafficFinger {
                         && self.timing_refine_reports < HRPD_TIMING_TRACK_REPORTS_MAX
                     {
                         self.timing_refine_reports += 1;
-                        info!(
+                        debug!(
                             "rx_hrpd_traffic[m{}]: timing_search_no_relock uati=0x{:08x} frame_chip={} current_delay={}+{:+.2} current_coh={:.3} current_snr={:.2}dB best_delay={}+{:+.2} best_coh={:.3} best_snr={:.2}dB radius={:.1}",
                             self.config.mac_index,
                             self.config.uati,

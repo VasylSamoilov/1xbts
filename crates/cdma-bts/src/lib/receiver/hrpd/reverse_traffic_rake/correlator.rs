@@ -898,7 +898,7 @@ impl HrpdReverseFingerSpawnStrategy for HrpdReverseTrafficSpawnStrategy {
             finger.signal_lost_chips = 0;
         }
         self.acquisition_deadline.clear();
-        info!(
+        debug!(
             "rx_hrpd_traffic[m{}]: reverse pilot acquisition complete on finger {}; pausing traffic rake searches while this finger remains active",
             self.assignment.mac_index, finger_id
         );
