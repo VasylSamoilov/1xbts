@@ -1,5 +1,6 @@
 # HEAD
 
+- Added support for PCM16 8kHz audio to cdma-voice-gw.
 - Faster call and data setup for IS-2000 mobiles.
 - Improved 1x access probe decode performance.
 - Add support for non-CDMA voice frames and additional stability improvements.

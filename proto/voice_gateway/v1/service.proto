@@ -29,6 +29,8 @@ enum AirCodec {
   AIR_CODEC_IDEN_VSELP_8K = 2;
   // Three native 126-bit frames per 90 ms unit, with each field least-significant-bit first.
   AIR_CODEC_IDEN_VSELP_4K2 = 3;
+  // Signed 16-bit PCM at 8 kHz, most-significant bit first, one byte per bit.
+  AIR_CODEC_PCM16_8K = 4;
 }
 
 // CDMA voice frame rate carried by gateway-to-MSC media frames.

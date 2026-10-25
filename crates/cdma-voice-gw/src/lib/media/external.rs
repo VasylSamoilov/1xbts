@@ -38,7 +38,10 @@ pub(super) struct ExternalSpeech {
 impl ExternalSpeech {
     pub fn new(factory: &dyn SpeechCodecFactory) -> Result<Self, CodecError> {
         let codec = factory.air_codec();
-        if !matches!(codec, AirCodec::IdenVselp8k | AirCodec::IdenVselp4k2) {
+        if !matches!(
+            codec,
+            AirCodec::IdenVselp8k | AirCodec::IdenVselp4k2 | AirCodec::Pcm168k
+        ) {
             return Err(CodecError::Unsupported(codec as i32));
         }
         let encoder = factory.create()?;
@@ -317,7 +320,9 @@ mod tests {
 
     impl<const N: usize> SpeechCodecFactory for Factory<N> {
         fn air_codec(&self) -> AirCodec {
-            if N == DISPATCH_SAMPLES {
+            if N == RTP_FRAME_SAMPLES {
+                AirCodec::Pcm168k
+            } else if N == DISPATCH_SAMPLES {
                 AirCodec::IdenVselp4k2
             } else {
                 AirCodec::IdenVselp8k
@@ -326,6 +331,16 @@ mod tests {
         fn create(&self) -> Result<Box<dyn SpeechCodec>, CodecError> {
             Ok(Box::new(Codec::<N>(self.0.clone())))
         }
+    }
+    #[test]
+    fn pcm_adapter_uses_twenty_millisecond_frames() {
+        let factory = Factory::<RTP_FRAME_SAMPLES>(Default::default());
+        let adapter = ExternalSpeech::new(&factory).unwrap();
+        assert_eq!(adapter.codec, AirCodec::Pcm168k);
+        assert_eq!(adapter.samples, RTP_FRAME_SAMPLES);
+        let frame = adapter.encode(&[0; RTP_FRAME_SAMPLES]).unwrap();
+        adapter.queue(&frame.bits, frame.rate_bps).unwrap();
+        assert_eq!(adapter.outgoing.lock().len(), RTP_FRAME_SAMPLES);
     }
     impl<const N: usize> SpeechCodec for Codec<N> {
         fn frame_samples(&self) -> usize {

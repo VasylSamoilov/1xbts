@@ -268,7 +268,9 @@ async fn handle_control_event(
             };
             let service_option = match if matches!(
                 air_codec,
-                crate::proto::AirCodec::IdenVselp8k | crate::proto::AirCodec::IdenVselp4k2
+                crate::proto::AirCodec::IdenVselp8k
+                    | crate::proto::AirCodec::IdenVselp4k2
+                    | crate::proto::AirCodec::Pcm168k
             ) && start.service_option == 0
             {
                 Ok(0)

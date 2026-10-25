@@ -502,7 +502,9 @@ impl SipBackend for LibreSipBackend {
         let from_uri = self.from_uri(&caller_id);
         let voice_codec = match (call.air_codec, self.codec_factory.as_ref()) {
             (
-                crate::proto::AirCodec::IdenVselp8k | crate::proto::AirCodec::IdenVselp4k2,
+                crate::proto::AirCodec::IdenVselp8k
+                | crate::proto::AirCodec::IdenVselp4k2
+                | crate::proto::AirCodec::Pcm168k,
                 Some(factory),
             ) if factory.air_codec() == call.air_codec && call.service_option == 0 => None,
             (crate::proto::AirCodec::Unspecified | crate::proto::AirCodec::Cdma, None) => {
